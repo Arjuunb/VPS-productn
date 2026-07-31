@@ -1,0 +1,145 @@
+"""Order fill models for the paper engine.
+
+The paper engine fills perfectly by default. ``RealisticFill`` makes fills pay
+the cost of trading — half-spread + slippage + latency drift moves the fill
+price against you, orders can partially fill, and a small fraction are rejected.
+
+Injected into ``PaperExecutionEngine`` so the live paper engine can run with
+realistic execution; the default ``PerfectFill`` keeps existing behaviour (and
+tests) unchanged.
+"""
+from __future__ import annotations
+
+import os
+import random
+
+
+class PerfectFill:
+    name = "perfect"
+
+    def apply(self, action: str, price: float, size: float, **_) -> dict:
+        return {"price": price, "size": size, "rejected": False,
+                "filled_fraction": 1.0, "cost_pct": 0.0}
+
+    def fee_pct(self, *, maker: bool = False) -> float:
+        """Commission as a fraction of notional. Ideal fills pay no fee."""
+        return 0.0
+
+    def status(self) -> dict:
+        return {"model": self.name, "note": "Ideal fills — no spread/slippage/rejection/fees."}
+
+
+class RealisticFill:
+    name = "realistic"
+
+    def __init__(self, *, spread_pct: float = 0.0004, slippage_pct: float = 0.0003,
+                 latency_pct: float = 0.0001, partial_fill_prob: float = 0.0,
+                 partial_fraction: float = 0.6, reject_prob: float = 0.0,
+                 taker_fee_pct: float = 0.0004, maker_fee_pct: float = 0.0002, seed: int = 1):
+        self.spread_pct = float(spread_pct)
+        self.slippage_pct = float(slippage_pct)
+        self.latency_pct = float(latency_pct)
+        self.partial_fill_prob = float(partial_fill_prob)
+        self.partial_fraction = float(partial_fraction)
+        self.reject_prob = float(reject_prob)
+        # Commission, as a fraction of notional, charged each side. Defaults are
+        # Binance-like spot rates; makers (resting limits) pay the lower fee.
+        self.taker_fee_pct = float(taker_fee_pct)
+        self.maker_fee_pct = float(maker_fee_pct)
+        self._rnd = random.Random(int(seed))
+
+    @property
+    def cost_pct(self) -> float:
+        return self.spread_pct / 2 + self.slippage_pct + self.latency_pct
+
+    def fee_pct(self, *, maker: bool = False) -> float:
+        """Commission as a fraction of notional for this fill's liquidity role."""
+        return self.maker_fee_pct if maker else self.taker_fee_pct
+
+    def apply(self, action: str, price: float, size: float, *,
+              allow_reject: bool = True, allow_partial: bool = True,
+              maker: bool = False) -> dict:
+        """``action`` ∈ {buy, sell}. Buys fill higher, sells fill lower.
+        ``maker`` fills (resting limit orders) execute AT the limit price —
+        no spread crossing, no slippage; that is the point of maker entries."""
+        cost = 0.0 if maker else self.cost_pct
+        if allow_reject and self.reject_prob and self._rnd.random() < self.reject_prob:
+            return {"price": price, "size": 0.0, "rejected": True,
+                    "filled_fraction": 0.0, "cost_pct": cost}
+        fill_price = price * (1 + cost) if action == "buy" else price * (1 - cost)
+        frac = 1.0
+        if allow_partial and self.partial_fill_prob and self._rnd.random() < self.partial_fill_prob:
+            frac = self.partial_fraction
+        return {"price": round(fill_price, 8), "size": round(size * frac, 10),
+                "rejected": False, "filled_fraction": frac, "cost_pct": cost}
+
+    def status(self) -> dict:
+        return {"model": self.name, "spread_pct": self.spread_pct, "slippage_pct": self.slippage_pct,
+                "latency_pct": self.latency_pct, "partial_fill_prob": self.partial_fill_prob,
+                "reject_prob": self.reject_prob, "round_trip_cost_pct": round(self.cost_pct * 2 * 100, 4),
+                "taker_fee_pct": self.taker_fee_pct, "maker_fee_pct": self.maker_fee_pct,
+                "round_trip_fee_pct": round(self.taker_fee_pct * 2 * 100, 4),
+                "note": "Spread + slippage + latency move the fill against you; a commission is "
+                        "charged each side; orders may partial-fill or reject."}
+
+
+def unified_fees():
+    """A fill model whose per-side cost EQUALS the research backtest's.
+
+    TradeCore audit R1: live paper fills perfectly (zero cost) by default while
+    every backtest charges fee + slippage, so a strategy always looks rosier
+    live than in the test that validated it. This closes that gap by charging
+    exactly what the backtest charges, sourced from bot.tradecore.costs so the
+    two can never drift apart:
+
+        per side = DEFAULT_FEE_PCT (commission) + DEFAULT_SLIPPAGE_PCT (price)
+
+    The commission is booked by the paper engine via ``fee_pct``; the slippage
+    moves the fill price via ``cost_pct``. Spread and latency are left at zero
+    because the backtest models neither — matching it means matching it, not
+    being conservative in a different direction.
+    """
+    from bot.tradecore.costs import DEFAULT_FEE_PCT, DEFAULT_SLIPPAGE_PCT
+    return RealisticFill(
+        spread_pct=0.0,
+        slippage_pct=DEFAULT_SLIPPAGE_PCT,
+        latency_pct=0.0,
+        partial_fill_prob=0.0,
+        reject_prob=0.0,
+        taker_fee_pct=DEFAULT_FEE_PCT,
+        maker_fee_pct=DEFAULT_FEE_PCT / 2,
+    )
+
+
+def _flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def from_env():
+    """Build a fill model from env.
+
+    ``HUB_FILL_MODEL=realistic`` — full friction (spread/slippage/latency, and
+    optionally partial fills + rejections). An explicit choice, so it wins.
+
+    ``HUB_UNIFIED_FEES=1`` — charge exactly what the research backtest charges,
+    so live paper and backtest agree (TradeCore R1). Default OFF: enabling it
+    CHANGES live paper P&L, so it is an opt-in decision, never a silent one.
+    """
+    if os.environ.get("HUB_FILL_MODEL", "").lower() in ("realistic", "real", "1", "true"):
+        return RealisticFill(
+            spread_pct=float(os.environ.get("HUB_FILL_SPREAD_PCT", 0.0004)),
+            slippage_pct=float(os.environ.get("HUB_FILL_SLIPPAGE_PCT", 0.0003)),
+            partial_fill_prob=float(os.environ.get("HUB_FILL_PARTIAL_PROB", 0.0)),
+            reject_prob=float(os.environ.get("HUB_FILL_REJECT_PROB", 0.0)),
+            taker_fee_pct=float(os.environ.get("HUB_FILL_TAKER_FEE_PCT", 0.0004)),
+            maker_fee_pct=float(os.environ.get("HUB_FILL_MAKER_FEE_PCT", 0.0002)))
+    if _flag("HUB_UNIFIED_FEES"):
+        return unified_fees()
+    return PerfectFill()
+
+
+def backtest_cost_pct_per_side() -> float:
+    """What the research backtest charges per side — the number live paper must
+    match for the two to be comparable."""
+    from bot.tradecore.costs import DEFAULT_FEE_PCT, DEFAULT_SLIPPAGE_PCT
+    return DEFAULT_FEE_PCT + DEFAULT_SLIPPAGE_PCT

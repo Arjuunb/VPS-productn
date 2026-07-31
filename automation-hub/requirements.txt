@@ -1,0 +1,25 @@
+# Automation Hub web app (Phase 1)
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9   # form handling for login / create-bot
+
+# Kyros Phase 1 ledger: defaults to local SQLite (stdlib, no install needed).
+# Set SUPABASE_URL + SUPABASE_KEY (env) to use Supabase as the source of truth.
+# The client is installed so flipping to Supabase needs no rebuild — just env vars.
+supabase>=2.0
+
+# Real market data for the autonomous engine (HUB_USE_LIVE_DATA=1). Without it
+# the engine falls back to bundled/synthetic data.
+ccxt>=4.3.0
+
+# HTTP client used by the historical-data sync (Binance REST), the sentiment /
+# Fear & Greed feed, and the Evolution market-context widgets. Required for the
+# real-data features to work on deploy (the engine fails closed without it).
+requests>=2.31
+anthropic>=0.69
+
+# The trading engine itself is the parent package (pure stdlib):
+#   pip install -e ..            # installs the `bot` package
+# Optional live venues:
+#   pip install -e "..[crypto]"  # ccxt (Binance/Bybit)
+#   pip install -e "..[stocks]"  # alpaca-py

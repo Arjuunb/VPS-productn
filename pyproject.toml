@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tradexa-trading-bot"
+version = "0.3.0"
+description = "Tradexa — a stdlib-only multi-asset trading bot: event-driven backtester, risk engine, live runner, HTML reports, and a live dashboard."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Arjun Bhatta" }]
+keywords = ["trading", "backtesting", "quant", "crypto", "stocks", "forex"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+# The core (backtester, risk, metrics, reporting, dashboard, CLI) is pure
+# stdlib. Third-party packages are only needed for live venues / config / tests.
+dependencies = []
+
+[project.optional-dependencies]
+crypto = ["ccxt>=4.3.0"]
+stocks = ["alpaca-py>=0.30.0"]
+forex = ["oandapyV20>=0.7.2"]
+config = ["pyyaml>=6.0"]
+hub = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "python-multipart>=0.0.9"]
+live = ["ccxt>=4.3.0", "alpaca-py>=0.30.0", "oandapyV20>=0.7.2", "pyyaml>=6.0"]
+dev = ["pytest>=8.0", "pyyaml>=6.0", "fastapi>=0.110", "httpx>=0.27", "python-multipart>=0.0.9"]
+
+[project.scripts]
+bot = "bot.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Arjuunb/Tradexa-Trading-Bot"
+Repository = "https://github.com/Arjuunb/Tradexa-Trading-Bot"
+
+[tool.setuptools.packages.find]
+# `tradexa*` is NOT optional. The Docker image runs `pip install -e .` and then
+# starts uvicorn from automation-hub/, so an unlisted top-level package is
+# invisible to the running backend no matter that it sits in the same repo.
+# While only "bot*" was listed, every `import tradexa...` in the backend failed
+# in the deployed container: the risk-engine veto silently fell back to
+# "unavailable" and the sizing import to its inline copy. Tests never caught it
+# because conftest.py appends the repo root to sys.path, so the package resolves
+# under pytest and only under pytest. test_packaging.py now guards this.
+include = ["bot*", "tradexa*"]

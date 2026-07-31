@@ -1,0 +1,43 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+.pytest_cache/
+report.html
+
+# Python build artifacts
+*.egg-info/
+build/
+dist/
+.vercel/
+
+# Automation Hub local state
+*.db
+automation-hub/logs/*.json
+
+# React builds bundled into the backend image (built in Docker, never committed)
+automation-hub/webui/
+automation-hub/landing/
+tradexa-landing/vite.config.js
+tradexa-landing/vite.config.d.ts
+
+# trading_bot UI runtime
+trading_bot/ui_prefs.db
+trading_bot/**/__pycache__/
+
+# real market-data cache (populated at runtime)
+automation-hub/logs/market_data.db
+# runtime backup snapshots (services/backup.py)
+automation-hub/logs/backups/
+automation-hub/**/market_data.db
+
+logs/providers.json
+automation-hub/logs/providers.json
+
+# Stray Playwright output (tests run from repo root by mistake)
+/test-results/
