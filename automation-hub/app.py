@@ -37,6 +37,9 @@ from dashboard import widgets as w  # noqa: E402
 from dashboard.overview import render_overview  # noqa: E402
 from database.models import BotConfig, BotMode, RiskRules  # noqa: E402
 from database.store import SqliteStore  # noqa: E402
+from core_engine.observer import CoreV2ShadowObserver  # noqa: E402
+from core_engine.persistence import ShadowDecisionStore  # noqa: E402
+from routers.core_v2 import create_router as create_core_v2_router  # noqa: E402
 
 # The API version prefix, declared before the app so the OpenAPI docs can live
 # under it (see below). The router mount further down reuses this constant.
@@ -76,6 +79,9 @@ except Exception:  # noqa: BLE001 — never let settings persistence break boot
     pass
 store.seed_admin(settings.username, settings.password)
 manager = BotManager(store=store)
+# V2 records are kept in a distinct table in the durable decisions database.
+# They are shadow observations, not legacy decisions and never execution input.
+core_v2_store = ShadowDecisionStore(settings.decisions_db)
 
 # M-7: fail closed on insecure defaults in production. render.yaml generates a
 # strong HUB_SECRET, so a default here on a cloud host means misconfiguration —
@@ -119,6 +125,11 @@ elif settings.admin_key == settings.webhook_secret:
 # always reflect live webhook activity.
 import webhook_api  # noqa: E402
 from webhook_api import router as webhook_router  # noqa: E402
+_core_v2_mode = _sec_os.environ.get("HUB_CORE_V2_MODE", "off").lower()
+if _core_v2_mode == "shadow":
+    webhook_api.engine.core_v2_observer = CoreV2ShadowObserver(core_v2_store)
+elif _core_v2_mode not in ("off", ""):
+    raise RuntimeError("HUB_CORE_V2_MODE must be 'off' or 'shadow'; V2 execution is unavailable")
 app.include_router(webhook_router)
 # DSP Sprint 1c: expose the SAME JSON API under a versioned /api/v1 namespace,
 # with the legacy root paths preserved (aliased) so nothing breaks. New clients
@@ -126,6 +137,7 @@ app.include_router(webhook_router)
 # endpoints defined directly on `app` stay at root for now (they move into a
 # router in a later slice), so /api/v1 covers the router-based API surface.
 app.include_router(webhook_router, prefix="/api/" + API_VERSION)
+app.include_router(create_core_v2_router(core_v2_store))
 
 
 @app.get("/api/" + API_VERSION)

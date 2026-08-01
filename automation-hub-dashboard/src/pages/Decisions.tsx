@@ -28,6 +28,13 @@ interface Report {
   scores: Record<string, number | string | boolean | null> & { total?: number; label?: string };
   reasons: string[]; recommendation: string;
 }
+interface V2EngineHealth {
+  mode: "shadow";
+  execution_enabled: false;
+  total_decisions: number;
+  sampled_decisions: number;
+  engine_status_counts: Record<string, Record<string, number>>;
+}
 
 const DECISIONS = ["all", "BUY", "SELL", "WAIT", "SKIP"] as const;
 const decTone = (d: string) =>
@@ -137,6 +144,7 @@ export default function DecisionsPage({ focusId }: { focusId?: string } = {}) {
   const qs = new URLSearchParams({ limit: "150" });
   if (decision !== "all") qs.set("decision", decision);
   const cycles = useLive<{ cycles: CycleRow[]; total: number }>(`/engine/cycles?${qs}`, 5000);
+  const v2Health = useLive<V2EngineHealth>("/api/v2/health/engines", 10000);
   const offline = cycles.error && !cycles.data;
 
   const rows = useMemo(() => {
@@ -174,6 +182,19 @@ export default function DecisionsPage({ focusId }: { focusId?: string } = {}) {
           <span className="dim">Backend not reachable (<span className="mono">{API_BASE}</span>). Reports fill in as the engine processes candles.</span>
         </div>
       )}
+
+      <Card title="Core Engine V2 Shadow Diagnostics" subtitle="Evidence is recorded alongside paper cycles for comparison only; V2 cannot execute trades.">
+        {v2Health.data ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+            <Badge text="SHADOW ONLY" tone="amber" />
+            <span className="mono">{v2Health.data.total_decisions} observations</span>
+            <span className="dim">{Object.keys(v2Health.data.engine_status_counts).length} evidence engines observed</span>
+            <span className="dim">Execution: disabled</span>
+          </div>
+        ) : (
+          <span className="dim">No V2 shadow observations yet. Set <code>HUB_CORE_V2_MODE=shadow</code> to observe closed paper-engine bars.</span>
+        )}
+      </Card>
 
       <Card title="Audit & Compliance Pack" subtitle="config + decision archive + trade record + alerts, SHA-256 integrity-stamped">
         <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>

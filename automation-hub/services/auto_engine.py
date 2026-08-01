@@ -138,6 +138,9 @@ class AutoStrategyEngine:
         self.decisions = None
         # Explainable Trading: per-cycle Decision Report store (data.cycle_store)
         self.reports = None
+        # V2 observer is attached only when HUB_CORE_V2_MODE=shadow. It is
+        # evidence-only and must never influence legacy routing.
+        self.core_v2_observer = None
         # Trading mode: 'full' (auto-execute), 'semi' (queue entries for human
         # approval), 'signal' (alert only). Persisted via runtime settings.
         self.trading_mode = "full"
@@ -425,6 +428,25 @@ class AutoStrategyEngine:
         outcome: Optional[dict] = None
         if signal is not None:
             outcome = self._on_signal(sym, signal, strategy)
+        if self.core_v2_observer is not None:
+            try:
+                self.core_v2_observer.observe(
+                    symbol=sym, timeframe=self.timeframe,
+                    bars=list(getattr(strategy, "bars", []) or []),
+                    as_of=bar.timestamp, source=self.last_source or "paper-engine",
+                    signal=signal, strategy_id=self.strategy_label,
+                    risk_context=(self.pipeline._risk_context({
+                        "symbol": sym, "side": "BUY" if signal and signal.type == SignalType.LONG else "SELL",
+                        "entry": signal.entry if signal else bar.close,
+                        "stop": signal.stop_loss if signal else None,
+                        "target": signal.take_profit if signal else None,
+                        "confidence": getattr(signal, "confidence", 1.0) if signal else 1.0,
+                        "timestamp": bar.timestamp.isoformat(),
+                    }) if signal is not None else None),
+                    risk_engine=self.pipeline.risk_engine)
+            except Exception as exc:  # noqa: BLE001 — shadow never blocks paper trading
+                self.ledger.log(level="warning", stage="core_v2", symbol=sym,
+                                message=f"V2 shadow observation failed: {type(exc).__name__}: {exc}")
         # 4. Explainable Trading: one complete Decision Report per cycle —
         #    including WAIT candles — so the bot never acts (or holds back)
         #    silently. Reporting must never affect trading.
