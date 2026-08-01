@@ -829,6 +829,16 @@ market_store = HistoricalStore(settings.market_db)
 from data.backfill import BackfillJob  # noqa: E402
 backfill_job = BackfillJob(market_store)
 
+# Paper Trading V2: strict provider-backed cache and persistent candle-driven
+# broker.  This is additive; the established signal-driven ``paper`` engine
+# remains the compatibility path until callers opt into /paper-v2.
+from data.market_data_v2 import MarketDataService, MarketDataUpdateJob  # noqa: E402
+from execution.paper_broker_v2 import PaperBrokerV2  # noqa: E402
+v2_market_data = MarketDataService(settings.market_data_v2_dir)
+paper_broker_v2 = PaperBrokerV2(settings.paper_broker_v2_db,
+                                starting_balance=settings.starting_cash)
+v2_market_update_job = MarketDataUpdateJob(v2_market_data)
+
 # ------------------------------------------------- market-context providers
 from services.market_context import ProviderSettings  # noqa: E402
 provider_settings = ProviderSettings(settings.providers_path)
@@ -1064,6 +1074,7 @@ import routers.engine  # noqa: E402
 import routers.health  # noqa: E402
 import routers.journal  # noqa: E402
 import routers.paper  # noqa: E402
+import routers.paper_v2  # noqa: E402
 import routers.risk  # noqa: E402
 import routers.settings  # noqa: E402
 import routers.symbols  # noqa: E402
@@ -1075,6 +1086,7 @@ router.include_router(routers.engine.router)
 router.include_router(routers.health.router)
 router.include_router(routers.journal.router)
 router.include_router(routers.paper.router)
+router.include_router(routers.paper_v2.router)
 router.include_router(routers.risk.router)
 router.include_router(routers.settings.router)
 router.include_router(routers.symbols.router)

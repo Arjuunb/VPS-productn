@@ -24,6 +24,10 @@ export default function PaperTradingPage() {
   const engine = useLive<EngineStatus>("/engine/status", 2000);
   const logs = useLive<LogRow[]>("/ledger/logs?limit=40", 2500);
   const alertsFeed = useLive<AlertRow[]>("/ledger/alerts?limit=20", 4000);
+  // V2 is an additive, strict broker path.  Keep the legacy account panel
+  // intact while surfacing whether its real-candle cache is ready to use.
+  const v2Account = useLive<any>("/paper-v2/account", 4000);
+  const v2Data = useLive<any>("/market-data-v2/status/BTCUSDT?timeframe=1h", 8000);
 
   const offline = account.error && !account.data;
   const [openJournal, setOpenJournal] = useState<string | null>(null);
@@ -105,6 +109,17 @@ export default function PaperTradingPage() {
       </Card>
 
       <ModeApprovals />
+
+      <Card title="Paper Broker V2 · Real-Data Readiness" subtitle="strict candle-driven simulator · no synthetic prices">
+        <div className="stat-row" style={{ marginBottom: 10 }}>
+          <StatCard label="V2 Equity" value={money(v2Account.data?.equity)} sub={`Free margin ${money(v2Account.data?.free_margin)}`} />
+          <StatCard label="Cached BTC 1H" value={String(v2Data.data?.integrity?.candles ?? 0)} sub={v2Data.data?.last_candle ? `Last ${hhmmss(v2Data.data.last_candle)}` : "Download real history to enable V2"} tone={v2Data.data?.available ? "green" : "amber"} />
+          <StatCard label="Data Quality" value={v2Data.data?.available ? (v2Data.data?.integrity?.missing_ranges?.length ? "Gaps found" : "Validated") : "Unavailable"} sub={v2Data.data?.available ? `${v2Data.data?.metadata?.provider ?? "provider pending"} · UTC` : "No fallback candles"} tone={v2Data.data?.available && !v2Data.data?.integrity?.missing_ranges?.length ? "green" : "amber"} />
+        </div>
+        <p className="dim" style={{ margin: 0 }}>
+          V2 orders can only be processed from cached provider OHLCV. Use the API data download endpoint first; existing paper-engine workflows remain unchanged during migration.
+        </p>
+      </Card>
 
       <Card title="Open Positions">
         <div className="tablewrap">

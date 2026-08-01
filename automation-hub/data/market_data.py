@@ -75,6 +75,22 @@ def get_bars(symbol: str, n: int = 1500, timeframe: str = "1h",
     fallbacks entirely (production / replay: never fake data). ``since_ms``
     (epoch ms) selects history from a specific start time.
     """
+    # Paper Trading V2 migration switch. Every established consumer imports
+    # this facade, so enabling it moves Paper/Replay/Simulation/Backtest/AI/
+    # Journal/Analytics to the one strict provider-backed cache without a
+    # risky flag-day import rewrite. No cache entry means unavailable -- it
+    # must never continue to a synthetic development fallback in this mode.
+    if os.environ.get("HUB_MARKET_DATA_V2", "").lower() in ("1", "true", "yes", "on"):
+        try:
+            from config import settings
+            from data.market_data_v2 import MarketDataService
+            bars = MarketDataService(settings.market_data_v2_dir).bars(symbol, timeframe, limit=n)
+            if bars:
+                return bars, "market-data-v2 (real cache)"
+        except Exception:  # noqa: BLE001 -- strict mode reports an honest unavailable state below
+            pass
+        return [], "unavailable (Market Data V2 cache required)"
+
     # 0. non-crypto assets (stocks / ETFs / indices / forex / commodities from
     # the symbol catalog): real candles via Yahoo (no key). Fail-closed — if
     # Yahoo is unreachable these return EMPTY with an honest source string;

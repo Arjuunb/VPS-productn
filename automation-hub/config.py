@@ -118,6 +118,12 @@ class Settings:
     # Historical market-data cache (real Binance candles)
     market_db: str = field(default_factory=lambda: os.environ.get(
         "HUB_MARKET_DB", str(DATA_DIR / "market_data.db")))
+    # Paper Trading V2 keeps provider candles in inspectable per-asset files
+    # (market_data/crypto, market_data/stocks, ...), separate from legacy cache.
+    market_data_v2_dir: str = field(default_factory=lambda: os.environ.get(
+        "HUB_MARKET_DATA_DIR", str(DATA_DIR / "market_data")))
+    paper_broker_v2_db: str = field(default_factory=lambda: os.environ.get(
+        "HUB_PAPER_BROKER_V2_DB", str(DATA_DIR / "paper_broker_v2.db")))
     # Decision-journal database (full explainable record of every trade)
     journal_db: str = field(default_factory=lambda: os.environ.get(
         "HUB_JOURNAL_DB", str(DATA_DIR / "journal.db")))
