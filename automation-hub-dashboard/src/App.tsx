@@ -18,6 +18,7 @@ const AlertsPage = lazy(() => import("./pages/Alerts"));
 const SettingsPage = lazy(() => import("./pages/Settings"));
 const BotDetail = lazy(() => import("./pages/BotDetail"));
 const MarketsPage = lazy(() => import("./pages/Markets"));
+const MarketDataManagerPage = lazy(() => import("./pages/MarketDataManager"));
 const SymbolExplorerPage = lazy(() => import("./pages/SymbolExplorer"));
 const SimulationPage = lazy(() => import("./pages/Simulation"));
 const ReplayPage = lazy(() => import("./pages/Replay"));
@@ -84,6 +85,7 @@ export default function App() {
   const renderPage = () => {
     switch (active) {
       case "Markets": return <MarketsPage />;
+      case "Market Data": return <MarketDataManagerPage />;
       case "Symbols": return <SymbolExplorerPage />;
       case "Strategies": return <StrategiesPage />;
       case "Backtesting": return <BacktestingPage />;

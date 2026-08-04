@@ -5,6 +5,9 @@ venv/
 .env
 .env.*
 !.env.example
+*.pem
+letsencrypt/
+certbot-webroot/
 *.log
 .DS_Store
 .pytest_cache/

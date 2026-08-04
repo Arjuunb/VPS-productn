@@ -12,6 +12,7 @@ import { signedMoney } from "../../lib/format";
 const NAV_LUCIDE: Record<string, LucideIcon> = {
   Dashboard: LayoutDashboard,
   Markets: CandlestickChart,
+  "Market Data": Activity,
   Symbols: Search,
   Strategies: Layers,
   Backtesting: FlaskConical,

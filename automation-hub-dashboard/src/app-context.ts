@@ -26,7 +26,7 @@ export const NAV_GROUPS: { title: string | null; items: string[] }[] = [
   { title: "Trading", items: ["Strategy Studio", "Fleet Manager", "Paper Trading", "Replay", "Backtesting", "Optimization Lab", "Grid & DCA", "Live Trading"] },
   { title: "Performance", items: ["Portfolio", "Allocation", "Analytics", "AI Intelligence"] },
   { title: "Records", items: ["Journal", "Decision Archive", "Memory"] },
-  { title: "System", items: ["Risk Manager", "Bot Health", "Logs", "Settings"] },
+  { title: "System", items: ["Market Data", "Risk Manager", "Bot Health", "Logs", "Settings"] },
 ];
 
 export const NAV_LABELS: string[] = NAV_GROUPS.flatMap((g) => g.items);

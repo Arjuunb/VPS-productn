@@ -9,6 +9,7 @@ invented price.
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import threading
 import time
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from bot.types import Bar
+from data.market_data_reliability import CanonicalCandle, CanonicalSymbol, ProviderRegistry, ResilientRequester
 
 TIMEFRAMES = ("1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d")
 TF_MS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
@@ -76,6 +78,9 @@ class MarketDataService:
         self.request_json = request_json or self._request_json
         self._lock = threading.RLock()
         self._perpetuals: tuple[float, list[str]] = (0.0, [])
+        self.registry = ProviderRegistry()
+        self._requesters = {p: ResilientRequester(self.request_json, self.registry, p)
+                            for p in self.registry.providers}
 
     @staticmethod
     def _request_json(url: str, params: dict) -> object:
@@ -131,6 +136,12 @@ class MarketDataService:
             PRIMARY KEY(timeframe, open_time))""")
         c.execute("""CREATE TABLE IF NOT EXISTS metadata (
             key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
+        # Additive migration from V2 cache schema 2: provenance exists both in
+        # dataset metadata and alongside every persisted candle.
+        for column, kind in (("provider", "TEXT"), ("market_type", "TEXT"), ("is_closed", "INTEGER"),
+                             ("received_at", "TEXT"), ("source_quality", "TEXT")):
+            try: c.execute(f"ALTER TABLE candles ADD COLUMN {column} {kind}")
+            except sqlite3.OperationalError: pass
         return c
 
     def _meta(self, c: sqlite3.Connection) -> dict:
@@ -154,25 +165,47 @@ class MarketDataService:
     def upsert(self, symbol: str, timeframe: str, rows: list[tuple], *, provider: str) -> dict:
         if timeframe not in TIMEFRAMES:
             raise ValueError(f"unsupported timeframe '{timeframe}'")
-        valid = sorted({int(r[0]): tuple(r[:6]) for r in rows if self._valid(tuple(r[:6]))}.values())
+        canonical = CanonicalSymbol.parse(symbol, "crypto" if self.asset_for(symbol) == "crypto" else "")
+        received = datetime.now(timezone.utc).isoformat()
+        now_ms = int(time.time() * 1000)
+        valid = []
+        for r in rows:
+            if not self._valid(tuple(r[:6])): continue
+            # Provider endpoints often include the currently-forming bar. It
+            # cannot be a deterministic historical candle yet, so reject it.
+            if int(r[0]) + TF_MS[timeframe] > now_ms: continue
+            candle = CanonicalCandle(canonical.value, timeframe, int(r[0]), *map(float, r[1:6]), provider,
+                                     self.asset_for(symbol), True, received)
+            candle.validate(); valid.append(tuple(r[:6]))
+        valid = sorted({int(r[0]): r for r in valid}.values())
         if not valid:
             raise ValueError("provider returned no valid OHLCV candles")
         asset = self.asset_for(symbol)
         with self._lock:
             c = self._conn(symbol, asset)
             try:
-                c.executemany("INSERT OR REPLACE INTO candles VALUES (?,?,?,?,?,?,?)",
-                              [(timeframe, *r) for r in valid])
+                c.executemany("INSERT OR REPLACE INTO candles(timeframe,open_time,open,high,low,close,volume,provider,market_type,is_closed,received_at,source_quality) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                              [(timeframe, *r, provider, asset, 1, received, "verified") for r in valid])
                 report = self._integrity_conn(c, timeframe, asset)
-                self._set_meta(c, symbol=normalize_symbol(symbol), asset_class=asset,
+                checksum = self._checksum_conn(c, timeframe)
+                self._set_meta(c, symbol=normalize_symbol(symbol), canonical_symbol=canonical.value, asset_class=asset,
                                provider=provider, downloaded_at=datetime.now(timezone.utc).isoformat(),
                                last_updated=datetime.now(timezone.utc).isoformat(),
-                               missing_ranges=report["missing_ranges"], schema_version=2)
+                               missing_ranges=report["missing_ranges"], schema_version=3, checksum=checksum,
+                               dataset_version=f"v3:{checksum[:16]}", quality_status=report["status"])
                 c.commit()
             finally:
                 c.close()
         return {"symbol": normalize_symbol(symbol), "timeframe": timeframe,
                 "stored": len(valid), "provider": provider, "integrity": report}
+
+    @staticmethod
+    def _checksum_rows(rows: list[tuple]) -> str:
+        return hashlib.sha256(json.dumps(rows, separators=(",", ":"), default=str).encode()).hexdigest()
+
+    def _checksum_conn(self, c: sqlite3.Connection, timeframe: str) -> str:
+        rows = c.execute("SELECT open_time,open,high,low,close,volume FROM candles WHERE timeframe=? ORDER BY open_time", (timeframe,)).fetchall()
+        return self._checksum_rows(rows)
 
     def _rows(self, symbol: str, timeframe: str, *, limit: Optional[int] = None) -> list[tuple]:
         try:
@@ -189,10 +222,17 @@ class MarketDataService:
     def bars(self, symbol: str, timeframe: str, *, limit: int = 1500) -> list[Bar]:
         if timeframe not in TIMEFRAMES:
             raise ValueError(f"unsupported timeframe '{timeframe}'")
+        state = self.status(symbol, timeframe)
+        if not state.get("available"):
+            if state.get("integrity", {}).get("candles", 0) == 0:
+                return []
+            raise ValueError("verified market-data cache required; download the dataset")
         return [Bar(datetime.fromtimestamp(r[0] / 1000, timezone.utc), *map(float, r[1:]))
                 for r in self._rows(symbol, timeframe, limit=limit)]
 
     def latest(self, symbol: str, timeframe: str = "1h") -> Optional[dict]:
+        if not self.status(symbol, timeframe).get("available"):
+            return None
         rows = self._rows(symbol, timeframe, limit=1)
         if not rows:
             return None
@@ -214,7 +254,7 @@ class MarketDataService:
                     missing.append({"from": _iso(a[0] + step), "to": _iso(b[0] - step)})
         return {"candles": len(rows), "corrupt": corrupt, "duplicates": 0,
                 "timezone": "UTC", "ascending": all(a[0] < b[0] for a, b in zip(rows, rows[1:])),
-                "missing_ranges": missing}
+                "missing_ranges": missing, "status": "incomplete" if missing else "corrupted" if corrupt else "healthy"}
 
     def status(self, symbol: str, timeframe: str = "1h") -> dict:
         asset = self.asset_for(symbol)
@@ -225,12 +265,45 @@ class MarketDataService:
             meta = self._meta(c)
             integrity = self._integrity_conn(c, timeframe, asset)
             last = c.execute("SELECT MAX(open_time) FROM candles WHERE timeframe=?", (timeframe,)).fetchone()[0]
+            checksum = self._checksum_conn(c, timeframe)
         finally:
             c.close()
-        return {"available": integrity["candles"] > 0, "symbol": normalize_symbol(symbol),
+        checksum_ok = bool(meta.get("checksum")) and meta.get("checksum") == checksum
+        quarantined = None
+        if not checksum_ok:
+            # Never keep a checksum-invalid SQLite file in the active cache.
+            # It is moved aside for forensic inspection; a subsequent explicit
+            # download rebuilds the dataset from the recorded provider.
+            path = self._db_path(symbol, asset)
+            if path.exists():
+                quarantined_path = path.with_suffix(path.suffix + f".corrupt.{int(time.time())}")
+                path.replace(quarantined_path)
+                quarantined = str(quarantined_path)
+        fresh = max(0, int(time.time() - last / 1000)) if last else None
+        stale = fresh is not None and fresh > TF_MS.get(timeframe, 0) * 2 / 1000
+        return {"available": integrity["candles"] > 0 and checksum_ok, "symbol": normalize_symbol(symbol),
                 "asset_class": asset, "timeframe": timeframe, "last_candle": _iso(last),
-                "freshness_seconds": max(0, int(time.time() - last / 1000)) if last else None,
+                "freshness_seconds": fresh, "stale": stale, "checksum_ok": checksum_ok,
+                "quarantined_cache": quarantined, "needs_download": not checksum_ok,
+                "quality_score": 100 if checksum_ok and not stale and integrity["status"] == "healthy" else 60 if checksum_ok else 0,
                 "metadata": meta, "integrity": integrity}
+
+    def quality(self, symbol: str, timeframe: str = "1h") -> dict:
+        state = self.status(symbol, timeframe)
+        return {"symbol": state["symbol"], "timeframe": timeframe, "quality_score": state.get("quality_score", 0),
+                "status": state.get("integrity", {}).get("status", "unavailable"), "stale": state.get("stale"),
+                "checksum_ok": state.get("checksum_ok"), "gaps": state.get("integrity", {}).get("missing_ranges", []),
+                "duplicates": state.get("integrity", {}).get("duplicates", 0), "corrupt": state.get("integrity", {}).get("corrupt", 0)}
+
+    def delete_cache(self, symbol: str, timeframe: str) -> dict:
+        path = self._db_path(symbol)
+        if not path.exists(): return {"deleted": False, "reason": "cache not found"}
+        with self._lock:
+            c = self._conn(symbol)
+            try:
+                cur = c.execute("DELETE FROM candles WHERE timeframe=?", (timeframe,)); c.commit()
+            finally: c.close()
+        return {"deleted": True, "symbol": normalize_symbol(symbol), "timeframe": timeframe, "rows": cur.rowcount}
 
     def _crypto_rows(self, symbol: str, timeframe: str, *, start_ms: Optional[int], limit: int,
                      end_ms: Optional[int] = None) -> list[tuple]:
@@ -242,7 +315,7 @@ class MarketDataService:
         error = None
         for host in _FUTURES_HOSTS:
             try:
-                payload = self.request_json(host + "/fapi/v1/klines", params)
+                payload = self._requesters["binance-futures"](host + "/fapi/v1/klines", params)
                 return [(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])) for r in payload]
             except Exception as exc:  # try public mirror before reporting failure
                 error = exc
@@ -273,7 +346,7 @@ class MarketDataService:
         from data.yahoo_bars import yahoo_symbol_for
         ticker = yahoo_symbol_for(symbol) or _YAHOO_ALIASES.get(normalize_symbol(symbol)) or normalize_symbol(symbol)
         interval, range_ = _YAHOO_INTERVALS[timeframe]
-        data = self.request_json(_YAHOO.format(symbol=ticker), {"interval": interval, "range": range_})
+        data = self._requesters["yahoo-finance"](_YAHOO.format(symbol=ticker), {"interval": interval, "range": range_})
         try:
             result = data["chart"]["result"][0]
             quote = result["indicators"]["quote"][0]
@@ -343,7 +416,7 @@ class MarketDataService:
             if cached and time.time() - cached_at < ttl_seconds:
                 return list(cached)
         try:
-            payload = self.request_json(_FUTURES_HOSTS[0] + "/fapi/v1/exchangeInfo", {})
+            payload = self._requesters["binance-futures"](_FUTURES_HOSTS[0] + "/fapi/v1/exchangeInfo", {})
             pairs = sorted({x["symbol"] for x in payload.get("symbols", [])
                             if x.get("status") == "TRADING" and x.get("quoteAsset") == "USDT"
                             and x.get("contractType") == "PERPETUAL"})
