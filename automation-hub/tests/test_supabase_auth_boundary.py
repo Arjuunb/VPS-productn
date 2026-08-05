@@ -39,7 +39,30 @@ def test_regular_supabase_user_cannot_read_shared_legacy_engine(monkeypatch):
     assert "hub_supabase_access" in session.headers["set-cookie"]
     assert client.get("/auth/me").json()["id"] == principal.id
     assert client.get("/paper/trades").status_code == 403
+    assert client.post("/engine/timeframe?timeframe=1h").status_code == 403
     assert client.patch("/auth/me", headers={"Origin": "https://evil.example"}, json={"full_name": "Attack"}).status_code == 403
+
+
+def test_verified_supabase_admin_can_control_engine_without_browser_secret(monkeypatch, tmp_path):
+    principal = Principal(id="33333333-3333-3333-3333-333333333333", email="admin@example.com",
+                          email_confirmed=True, full_name="Admin", role="admin")
+    monkeypatch.setattr(hub_app.settings, "auth_mode", "supabase")
+    monkeypatch.setattr(hub_app.settings, "admin_key", "test-admin-control-key")
+    monkeypatch.setattr(hub_app.settings, "settings_path", str(tmp_path / "runtime_settings.json"))
+    monkeypatch.setattr(hub_app.supabase_auth, "principal", lambda _token: principal)
+    client = TestClient(hub_app.app)
+
+    session = client.post("/auth/supabase/session", headers={"Authorization": "Bearer access"}, json={"remember": False})
+    assert session.status_code == 200
+
+    import webhook_api
+    original_timeframe = webhook_api.engine.timeframe
+    try:
+        response = client.post("/engine/timeframe?timeframe=1h")
+        assert response.status_code == 200
+        assert response.json()["timeframe"] == "1h"
+    finally:
+        webhook_api.engine.timeframe = original_timeframe
 
 
 def test_unverified_supabase_account_cannot_create_dashboard_session(monkeypatch):

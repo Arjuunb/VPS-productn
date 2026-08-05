@@ -306,6 +306,7 @@ async def _require_auth(request: Request, call_next):
     # never let a regular SaaS user read or control that owner's account. Their
     # verified account/profile routes remain available under /auth/ and the
     # protected settings SPA under /settings/.
+    principal = None
     if settings.auth_mode == "supabase":
         principal = _supabase_principal(request)
         legacy_engine_path = not (path.startswith("/auth/") or path.startswith("/settings/")
@@ -324,10 +325,16 @@ async def _require_auth(request: Request, call_next):
         # A browser session is an authenticated operator.  Supply the internal
         # control credential only to downstream endpoint handlers; it is never
         # rendered into React configuration or sent over the network by clients.
-        # Legacy handlers use an internal control-header bridge. Never grant it
-        # to a Supabase customer: a user session must not become the shared
-        # deployment-wide operator credential.
-        if _user(request) and not hdr and settings.auth_mode == "legacy":
+        # Legacy handlers consume the control credential as a header. Bridge it
+        # internally for a legacy owner or a verified Supabase administrator;
+        # it is never exposed to JavaScript or transmitted by the browser.
+        # A regular Supabase customer never receives this bridge, preserving the
+        # fail-closed boundary around the deployment-wide legacy engine.
+        is_control_operator = (
+            (_user(request) and settings.auth_mode == "legacy")
+            or (settings.auth_mode == "supabase" and principal is not None and principal.is_admin)
+        )
+        if is_control_operator and not hdr:
             request.scope["headers"] = list(request.scope["headers"]) + [
                 (b"x-webhook-secret", settings.admin_key.encode("utf-8"))]
         return await call_next(request)
