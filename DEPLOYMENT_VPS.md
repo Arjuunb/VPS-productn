@@ -173,3 +173,57 @@ only retained for a deliberately disabled emergency recovery mode.
 Never commit `.env`, Supabase keys, SMTP passwords, OAuth private keys, or
 certificate material. A production startup fails closed if Supabase Auth is
 selected without its URL and anon key.
+
+## Migrate existing VPS SQLite history to Supabase
+
+Do this only after the Supabase Auth SQL above is working and before restarting
+an existing VPS into an empty Supabase ledger. The migration is idempotent and
+never deletes local SQLite data, but a backup is still mandatory.
+
+1. In the Supabase SQL editor, run the full contents of these files in this
+   order (the first creates the ledger/settings tables; the second safely adds
+   the Auth ownership/RLS policy to newly-created tables):
+
+   ```sh
+   sed -n '1,999p' automation-hub/data/ledger_schema.sql
+   sed -n '1,999p' supabase/migrations/0001_saas_auth.sql
+   ```
+
+2. Verify the server-only key wiring without printing any secrets:
+
+   ```sh
+   docker compose exec -T app python - <<'PY'
+   import os
+   print("SUPABASE_URL set:", bool(os.environ.get("SUPABASE_URL")))
+   print("SUPABASE_KEY set:", bool(os.environ.get("SUPABASE_KEY")))
+   print("SUPABASE_KEY matches service role:", os.environ.get("SUPABASE_KEY") == os.environ.get("SUPABASE_SERVICE_ROLE_KEY"))
+   PY
+   ```
+
+3. Back up the named volume, build the migration tool, inspect its dry run,
+   then briefly stop the engine so its SQLite ledger has a stable final
+   snapshot. The one-off migration container uses the same `.env` and durable
+   volume; it performs UPSERTs only.
+
+   ```sh
+   mkdir -p /root/tradexa-backups
+   docker run --rm -v vps-productn_tradexa-data:/data:ro -v /root/tradexa-backups:/backup alpine:3.20 \
+     sh -c 'tar czf /backup/tradexa-data-$(date +%F-%H%M%S).tgz -C /data .'
+
+   docker compose build app
+   docker compose run --rm --no-deps app python /app/automation-hub/scripts/migrate_sqlite_to_supabase.py
+   docker compose stop app
+   docker compose run --rm --no-deps app python /app/automation-hub/scripts/migrate_sqlite_to_supabase.py --apply
+   docker compose up -d app
+   ```
+
+4. Confirm Supabase is now the active backend and the health check is clean:
+
+   ```sh
+   docker compose logs --tail=100 app
+   curl -fsS https://trade-logx.com/health
+   ```
+
+   Startup must say `ledger backend = SupabaseLedger (Supabase active: True)`.
+   The health JSON must report both `settings_supabase.connected` and
+   `ledger_supabase.connected` as `true`.
