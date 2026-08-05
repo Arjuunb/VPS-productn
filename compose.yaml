@@ -56,12 +56,13 @@ services:
       - certbot-webroot:/var/www/certbot
     # Renewal is intentionally decoupled from the initial request. Nginx
     # watches the certificate mtime and reloads after a successful renewal.
+    # A foreground sleep avoids Compose/shell escaping around "$!" waits.
     entrypoint: ["/bin/sh", "-c"]
     command: >-
       trap 'exit 0' TERM INT;
       while :; do
-        certbot renew --webroot -w /var/www/certbot --quiet;
-        sleep 43200 & wait $$!;
+        certbot renew --webroot -w /var/www/certbot --quiet || true;
+        sleep 43200;
       done
     restart: unless-stopped
     security_opt: ["no-new-privileges:true"]
