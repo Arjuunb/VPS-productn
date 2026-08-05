@@ -193,6 +193,9 @@ def _make_strategy(symbol: str):
     if s == "ensemble":
         from strategies.ensemble_strategy import ConfirmationEnsemble
         return ConfirmationEnsemble(symbol)
+    if s == "liquidity_sweep":
+        from strategies.liquidity_sweep_strategy import LiquiditySweepStrategy
+        return LiquiditySweepStrategy(symbol)
     from strategies.brain_strategy import DecisionBrain
     return DecisionBrain(symbol)
 
@@ -775,6 +778,8 @@ _STRATEGY_CATALOG = [
     {"key": "ema", "label": "EMA Crossover", "desc": "Simple fast/slow EMA cross"},
     {"key": "smc", "label": "SMC (Smart Money)",
      "desc": "Liquidity sweep + CHoCH/BOS + FVG in line with higher-timeframe bias"},
+    {"key": "liquidity_sweep", "label": "Liquidity Sweep",
+     "desc": "Stop-hunt wick beyond a prior range, candle reclaim, ATR-defined invalidation"},
 ]
 
 # Reconcile the engine label with a persisted strategy choice: the overrides
@@ -874,6 +879,9 @@ def _build_builtin(key: str, symbol: str):
     if key == "ema":
         from strategies.ema_strategy import EMAStrategy
         return EMAStrategy(symbol)
+    if key == "liquidity_sweep":
+        from strategies.liquidity_sweep_strategy import LiquiditySweepStrategy
+        return LiquiditySweepStrategy(symbol)
     from strategies.brain_strategy import DecisionBrain
     return DecisionBrain(symbol)
 

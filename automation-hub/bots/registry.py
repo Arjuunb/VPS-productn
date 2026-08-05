@@ -9,12 +9,14 @@ from strategies.base_strategy import HubStrategy
 from strategies.ema_strategy import EMAStrategy
 from strategies.rsi_strategy import RSIStrategy
 from strategies.smc_strategy import SMCStrategy
+from strategies.liquidity_sweep_strategy import LiquiditySweepStrategy
 
 # key -> (class, human label, ready?)
 STRATEGIES: dict[str, tuple[type[HubStrategy], str, bool]] = {
     "ema": (EMAStrategy, "EMA Trend Bot", True),
     "rsi": (RSIStrategy, "RSI Scalper", True),
     "smc": (SMCStrategy, "SMC (Smart Money)", True),
+    "liquidity_sweep": (LiquiditySweepStrategy, "Liquidity Sweep", True),
 }
 
 # key -> (human label, asset class, ready?)

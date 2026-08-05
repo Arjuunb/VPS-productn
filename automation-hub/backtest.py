@@ -44,6 +44,9 @@ def make_strategy(name: str, threshold: float, rr: float):
     if name == "smc":
         from strategies.smc_strategy import SMCStrategy
         return SMCStrategy("BT", rr_target=rr)
+    if name == "liquidity_sweep":
+        from strategies.liquidity_sweep_strategy import LiquiditySweepStrategy
+        return LiquiditySweepStrategy("BT", rr_target=rr)
     return DecisionBrain("BT", conviction_threshold=threshold, rr_target=rr)
 
 

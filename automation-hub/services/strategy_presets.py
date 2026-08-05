@@ -26,9 +26,7 @@ PRESETS: dict = {
                  "rules": [{"type": "ema_cross", "fast": 8, "slow": 30, "dir": "above"}]},
     "EMA 20/50": {"kind": "custom", "side": "long",
                   "rules": [{"type": "ema_cross", "fast": 20, "slow": 50, "dir": "above"}]},
-    "Liquidity Sweep": {"kind": "custom", "side": "long",
-                        "rules": [{"type": "liquidity_sweep", "lookback": 20, "dir": "down"},
-                                  {"type": "choch", "dir": "up"}]},
+    "Liquidity Sweep": {"kind": "builtin", "key": "liquidity_sweep"},
     "Custom Strategy": {"kind": "custom_user"},
 }
 STRATEGY_OPTIONS = list(PRESETS)
@@ -49,8 +47,8 @@ REGISTRY = [
      "timeframes": ["5m", "15m"], "description": "Fast EMA 8 over EMA 30 cross"},
     {"id": "ema_20_50", "name": "EMA 20/50", "version": "1.0", "kind": "custom",
      "timeframes": ["1h", "4h"], "description": "EMA 20 over EMA 50 cross"},
-    {"id": "liquidity_sweep", "name": "Liquidity Sweep", "version": "1.0", "kind": "custom",
-     "timeframes": ["5m", "15m"], "description": "Stop-hunt sweep + change of character"},
+    {"id": "liquidity_sweep", "name": "Liquidity Sweep", "version": "1.0", "kind": "builtin",
+     "timeframes": ["5m", "15m", "1h", "4h"], "description": "Stop-hunt wick + confirmed reclaim + ATR invalidation"},
     {"id": "custom", "name": "Custom Strategy", "version": "1.0", "kind": "custom_user",
      "timeframes": [], "description": "User-built rule strategy"},
 ]
