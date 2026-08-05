@@ -80,5 +80,6 @@ def test_smc_in_compare_endpoint(client):
 
 
 def test_smc_listed_in_catalog(client):
-    keys = [s["key"] for s in client.get("/strategy/list").json()["strategies"]]
-    assert "smc" in keys
+    catalog = {s["key"]: s for s in client.get("/strategy/list").json()["strategies"]}
+    assert catalog["smc"]["label"] == "Supply/Demand"
+    assert catalog["liquidity_sweep"]["label"] == "Liquidity Sweep"

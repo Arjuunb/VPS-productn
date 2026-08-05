@@ -69,7 +69,8 @@ const STRATS = ["Decision Brain", "Trend Following", "Supply/Demand", "EMA 8/30"
 // the terminal defaults to the strategy the engine is actually running.
 const ENGINE_STRAT_MAP: Record<string, string> = {
   "Decision Brain": "Decision Brain", "Supertrend": "Trend Following",
-  "SMC (Smart Money)": "Supply/Demand", "EMA Crossover": "EMA 8/30",
+  "SMC (Smart Money)": "Supply/Demand", "Supply/Demand": "Supply/Demand",
+  "Liquidity Sweep": "Liquidity Sweep", "EMA Crossover": "EMA 8/30",
   "Donchian Breakout": "Decision Brain", "Confirmation Ensemble": "Decision Brain",
 };
 // The reverse: presets that map to a real built-in engine strategy, so selecting
@@ -77,7 +78,8 @@ const ENGINE_STRAT_MAP: Record<string, string> = {
 const STRAT_TO_ENGINE: Record<string, { key: string; label: string }> = {
   "Decision Brain": { key: "brain", label: "Decision Brain" },
   "Trend Following": { key: "supertrend", label: "Supertrend" },
-  "Supply/Demand": { key: "smc", label: "SMC (Smart Money)" },
+  "Supply/Demand": { key: "smc", label: "Supply/Demand" },
+  "Liquidity Sweep": { key: "liquidity_sweep", label: "Liquidity Sweep" },
   "EMA 8/30": { key: "ema", label: "EMA Crossover" },
 };
 // Fallback only — used if the backend didn't send a viz spec. Normally the chart

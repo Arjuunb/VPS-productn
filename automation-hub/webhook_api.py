@@ -776,8 +776,8 @@ _STRATEGY_CATALOG = [
     {"key": "ensemble", "label": "Confirmation Ensemble",
      "desc": "Trades only when 2 of 3 agree (EMA + Supertrend + Donchian)"},
     {"key": "ema", "label": "EMA Crossover", "desc": "Simple fast/slow EMA cross"},
-    {"key": "smc", "label": "SMC (Smart Money)",
-     "desc": "Liquidity sweep + CHoCH/BOS + FVG in line with higher-timeframe bias"},
+    {"key": "smc", "label": "Supply/Demand",
+     "desc": "SMC supply/demand zones: liquidity sweep + CHoCH/BOS + FVG with higher-timeframe bias"},
     {"key": "liquidity_sweep", "label": "Liquidity Sweep",
      "desc": "Stop-hunt wick beyond a prior range, candle reclaim, ATR-defined invalidation"},
 ]
