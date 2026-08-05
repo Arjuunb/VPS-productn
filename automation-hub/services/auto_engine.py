@@ -144,6 +144,11 @@ class AutoStrategyEngine:
         # Trading mode: 'full' (auto-execute), 'semi' (queue entries for human
         # approval), 'signal' (alert only). Persisted via runtime settings.
         self.trading_mode = "full"
+        # Measured deterioration can only reduce paper entry risk. It never
+        # modifies exits or sizes up a trade, and can be disabled explicitly
+        # for A/B research with HUB_STRATEGY_HEALTH_GUARD=0.
+        self.strategy_health_guard = _os.environ.get("HUB_STRATEGY_HEALTH_GUARD", "1").lower() not in ("0", "false", "off")
+        self._strategy_health: dict[str, dict] = {}
         # services.approvals.ApprovalStore — the semi-auto approval queue.
         self.approvals = None
         self._seq = itertools.count(1)
@@ -245,6 +250,8 @@ class AutoStrategyEngine:
             "entry_mode": self.entry_mode,
             "pending_orders": len(self._pending),
             "missed_entries": self.stats_missed_entries,
+            "strategy_health_guard": self.strategy_health_guard,
+            "strategy_health": self._strategy_health,
             **self.stats,
         }
 
@@ -681,6 +688,12 @@ class AutoStrategyEngine:
             return {"kind": "hold"}
         self.stats["signals"] += 1
         side = "BUY" if signal.type == SignalType.LONG else "SELL"
+        health_factor = self._health_factor(sym) if pos is None else 1.0
+        # Preserve the exact per-symbol context that guarded this new entry.
+        # It is written into the decision journal only after a fill, never used
+        # as a second sizing input and never applied to exits.
+        recent_losses = self._symbol_loss_streak(sym) if pos is None else 0
+        health_summary = dict(self._strategy_health.get(sym) or {}) if pos is None else {}
         # Decision Brain gate (parity with every backtest): score the setup with
         # the same TradeBrain the simulators use, build the unified decision
         # object, and persist it — accepted OR rejected — BEFORE any trade.
@@ -688,11 +701,15 @@ class AutoStrategyEngine:
         v = None
         if (self.min_quality_score > 0 and signal.stop_loss and pos is None
                 and len(bars) >= 60):
+            # TradeBrain already contains a well-defined per-symbol
+            # losing-streak penalty/cooldown. Feed it closed paper results so
+            # the forward engine follows the same protection as simulations;
+            # never use another symbol's results to block this setup.
             v = self._quality_brain.evaluate(
                 bars, len(bars) - 1,
                 side="long" if signal.type == SignalType.LONG else "short",
                 entry=signal.entry, stop=signal.stop_loss,
-                target=signal.take_profit)
+                target=signal.take_profit, recent_losses=recent_losses)
         decision = None
         decision_id = None
         if pos is None:                      # entries only; flips/closes pass through
@@ -753,10 +770,22 @@ class AutoStrategyEngine:
             "reason": getattr(signal, "reason", ""),
             "context_size_factor": self.context.size_factor(
                 sym, "long" if signal.type == SignalType.LONG else "short"),
+            "health_size_factor": health_factor,
+            "journal_engine": {
+                "closed_symbol_loss_streak": recent_losses,
+                "strategy_health": health_summary.get("status", "Not evaluated"),
+                "strategy_health_sample": health_summary.get("sample", 0),
+            },
             # real decision context for the trade journal
             "brain_score": getattr(signal, "brain_score", None),
             "snapshot": getattr(signal, "snapshot", None),
             "brain_checklist": getattr(signal, "checklist", None),
+            # The separately-scored TradeBrain verdict is the final quality
+            # gate used for this entry. Preserve it with the fill so the trade
+            # journal can explain the accepted setup without re-computing from
+            # later market data.
+            "journal_quality_gate": v.to_dict() if v is not None else None,
+            "journal_decision_id": decision_id,
             "strategy": self.strategy_label,
             "timeframe": self.timeframe,
             "mode": "live" if self.live else "paper",
@@ -823,6 +852,55 @@ class AutoStrategyEngine:
             return {"kind": "rejected", "stage": res.stage, "reason": res.reason,
                     "decision": decision, "verdict": v}
         return {"kind": "noop", "decision": decision, "verdict": v}
+
+    def _health_factor(self, sym: str) -> float:
+        """Return a bounded, evidence-based new-entry risk multiplier.
+
+        Health is assessed per symbol from closed paper trades. The monitor has
+        its own minimum-sample protection, so a short record leaves risk
+        unchanged. This is telemetry plus a defensive throttle, not a strategy
+        optimiser and never a source of leverage.
+        """
+        if not self.strategy_health_guard:
+            return 1.0
+        try:
+            from services.strategy_health import StrategyHealthMonitor, entry_risk_factor
+            trades = [{**t, "r": (t.get("rr") if t.get("rr") is not None else 0.0)}
+                      for t in self.paper.history() if t.get("symbol") == sym]
+            health = StrategyHealthMonitor().evaluate(trades)
+            factor = entry_risk_factor(health)
+            summary = {"status": health.status, "factor": factor,
+                       "sample": health.recent.n, "warnings": [w.detail for w in health.warnings]}
+            prior = self._strategy_health.get(sym)
+            self._strategy_health[sym] = summary
+            if prior != summary and factor < 1.0:
+                self.ledger.log(level="warning", stage="strategy_health", symbol=sym,
+                                message=(f"{sym}: {health.status} paper record — new-entry risk "
+                                         f"reduced to {factor * 100:.0f}% (sample {health.recent.n})"))
+            return factor
+        except Exception as exc:  # noqa: BLE001 — health telemetry cannot stop paper trading
+            self.ledger.log(level="warning", stage="strategy_health", symbol=sym,
+                            message=f"{sym}: health guard unavailable ({type(exc).__name__}); no risk change")
+            return 1.0
+
+    def _symbol_loss_streak(self, sym: str) -> int:
+        """Return the current closed-paper loss streak for one symbol.
+
+        The quality gate is intentionally scoped to the instrument that
+        produced the losses. A BTC sequence must not suppress an independent
+        ETH setup, and open/unrealised positions do not count. On a transient
+        ledger read failure we fail open here; the existing risk pipeline
+        remains responsible for its separate account-wide kill switches.
+        """
+        try:
+            from risk.daily_limits import consecutive_losses
+            trades = [t for t in self.paper.history() if t.get("symbol") == sym]
+            return consecutive_losses(trades)
+        except Exception as exc:  # noqa: BLE001 — telemetry must not break paper execution
+            self.ledger.log(level="warning", stage="brain", symbol=sym,
+                            message=(f"{sym}: closed-trade streak unavailable "
+                                     f"({type(exc).__name__}); quality gate has no streak input"))
+            return 0
 
     def execute_approved(self, idea: dict) -> dict:
         """Route a HUMAN-APPROVED trade idea through the SAME risk pipeline a

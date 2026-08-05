@@ -16,6 +16,10 @@ type PaperValidation = {
     max_drawdown_pct: number; avg_rr: number; sharpe_ratio: number; sortino_ratio: number };
   best_symbol: NamedVal; worst_symbol: NamedVal; best_strategy: NamedVal; worst_strategy: NamedVal;
   skipped_total: number; skipped_by_category: { category: string; count: number }[];
+  criteria: { minimum_profit_factor: number; max_drawdown_pct: number;
+    forward_data: boolean; execution_model: string };
+  stability: { available: boolean; passed: boolean;
+    windows: { index: number; trades: number; net_pnl: number; profit_factor: number; passed: boolean }[] };
   safety: { live_allowed: boolean; hard_locked: boolean; passed: number; total: number };
   live_review: { eligible: boolean; stage: string; reasons: string[]; note: string };
 };
@@ -59,6 +63,12 @@ function PaperValidationPanel() {
         <div className="risk-item"><span className="dim">Skipped trades</span><b>{v.skipped_total}</b></div>
       </div>
 
+      <div className="risk-list" style={{ marginTop: 8 }}>
+        <div className="risk-item"><span className="dim">Forward market data</span><b className={v.criteria.forward_data ? "pos" : "neg"}>{v.criteria.forward_data ? "CONNECTED" : "REPLAY / NOT CONNECTED"}</b></div>
+        <div className="risk-item"><span className="dim">Execution model</span><b className={v.criteria.execution_model === "perfect" ? "neg" : "pos"}>{v.criteria.execution_model}</b></div>
+        <div className="risk-item"><span className="dim">Chronological stability</span><b className={v.stability.passed ? "pos" : "neg"}>{v.stability.passed ? "PASS" : "NOT YET PROVEN"}</b></div>
+      </div>
+
       {v.skipped_by_category.length > 0 && (
         <div className="row-actions" style={{ justifyContent: "flex-start", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
           <span className="dim" style={{ fontSize: 12 }}>Rejections:</span>
@@ -67,7 +77,7 @@ function PaperValidationPanel() {
       )}
 
       <div style={{ marginTop: 10 }}>
-        <div className="dim" style={{ fontSize: 11, marginBottom: 4 }}>Live-review eligibility (needs sample size + proven edge + safety guards — never one metric):</div>
+        <div className="dim" style={{ fontSize: 11, marginBottom: 4 }}>Live-review eligibility needs 100+ forward paper trades, PF ≥ {v.criteria.minimum_profit_factor.toFixed(2)}, drawdown ≤ {v.criteria.max_drawdown_pct.toFixed(0)}%, realistic fills, stable chronological windows, and safety guards. It never enables live execution.</div>
         <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.6 }}>
           {v.live_review.reasons.map((r, i) => (
             <li key={i} style={{ fontSize: 12 }} className={eligible ? "pos" : "dim"}>{r}</li>

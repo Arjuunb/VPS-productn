@@ -30,6 +30,16 @@ qualified. Analysis needs ≥40 bars; below that it says so instead of guessing.
   (`review.coach`): strengths and weaknesses composed from the *actual entry
   reads recorded at entry*, one lesson, and a letter rating (A+…F). No invented
   insight — every line traces to a recorded read or the real outcome.
+- Every opened trade includes an **entry sizing receipt** in its decision
+  journal (`risk_check.entry_sizing`): base versus effective risk, calculated,
+  capped, and filled size/notional, plus only the sizing modifiers that were
+  active. The autonomous engine also records that symbol's closed-loss streak
+  and health state at the decision. It is evidence of the real submitted paper
+  order, not a forecast or a second sizing system.
+- When the autonomous engine's quality gate was active, the journal also
+  stores its accepted score, regime, passed/failed reads, and Decision Archive
+  reference at entry. A later journal view never recalculates these values from
+  changed candles.
 
 ## Storage & honesty
 

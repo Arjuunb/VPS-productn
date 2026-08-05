@@ -117,9 +117,16 @@ def test_pipeline_records_full_journal_on_open_and_close():
     assert j["sections"]["market_snapshot"]["rsi"] == 58
     assert any(g["rule"] == "daily_loss" or g["rule"] == "exposure"
                for g in j["sections"]["checklist"]["risk_gates"])
+    sizing = j["sections"]["risk_check"]["entry_sizing"]
+    assert sizing["base_risk_pct"] == 1.0
+    assert sizing["effective_risk_pct"] == 0.9  # confidence=0.8 reduces entry risk
+    assert sizing["filled_size"] == pytest.approx(j["size"])
+    assert sizing["filled_notional"] == round(j["entry"] * j["size"], 2)
+    assert sizing["modifiers"]["confidence"] == 0.8
     # honesty: FVG etc. are Not checked, not invented
     assert any(c["status"] == "Not checked" for c in j["sections"]["checklist"]["entry_reads"])
-    assert [e["kind"] for e in j["events"]][:3] == ["setup-detected", "risk-check-passed", "trade-opened"]
+    assert [e["kind"] for e in j["events"]][:5] == [
+        "setup-detected", "quality-gate-passed", "risk-check-passed", "risk-sized", "trade-opened"]
 
     # close it — review + evolution generated from the real outcome
     c = pipe.process({"alert_id": "c1", "symbol": "BTCUSDT", "side": "CLOSE",

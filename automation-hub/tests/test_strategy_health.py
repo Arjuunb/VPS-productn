@@ -1,5 +1,5 @@
 """Strategy Health monitoring (Phase 3 · strategy quality)."""
-from services.strategy_health import HealthConfig, StrategyHealthMonitor
+from services.strategy_health import HealthConfig, StrategyHealthMonitor, entry_risk_factor
 
 
 def _trade(pnl, r=1.0):
@@ -50,6 +50,16 @@ def test_small_sample_does_not_warn():
     mon = StrategyHealthMonitor(HealthConfig(min_sample=8))
     h = mon.evaluate(_losses(3))                 # too few trades
     assert h.status == "Healthy" and not h.warnings
+
+
+def test_health_risk_factor_only_reduces_new_entry_risk():
+    mon = StrategyHealthMonitor(HealthConfig(window=10, min_sample=5))
+    assert entry_risk_factor(mon.evaluate(_wins(10))) == 1.0
+    degrading = mon.evaluate(_wins(10) + _wins(5) + _losses(5))
+    assert entry_risk_factor(degrading) == 0.75
+    unhealthy = mon.evaluate(_losses(10))
+    assert unhealthy.status == "Unhealthy"
+    assert entry_risk_factor(unhealthy) == 0.50
 
 
 def test_runner_reports_strategy_health():

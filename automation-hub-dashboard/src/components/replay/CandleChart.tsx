@@ -39,9 +39,22 @@ export interface Shape { id: string; kind: "trend" | "rect" | "fib"; p1: [number
  *  engine target), never invented. Dragging commits back through the API. */
 export interface LiveLevels { side: "long" | "short"; entry: number; stop: number | null; target: number | null; }
 
+/** An actual fill from the application's paper ledger, rendered separately
+ * from a replay strategy marker. Times and prices are supplied by the backend;
+ * the chart only anchors them to the nearest displayed candle. */
+export interface PaperFillMarker {
+  id: string;
+  side: "long" | "short";
+  entry: number;
+  openedAt: string | null;
+  exit: number | null;
+  closedAt: string | null;
+  pnl: number | null;
+}
+
 /** Chart appearance settings (persisted). Colours affect real candles only. */
-export interface ChartSettings { upColor: string; downColor: string; grid: boolean; crosshair: boolean; priceLine: boolean; volProfile: boolean; }
-export const DEFAULT_SETTINGS: ChartSettings = { upColor: "#089981", downColor: "#f23645", grid: true, crosshair: true, priceLine: true, volProfile: false };
+export interface ChartSettings { upColor: string; downColor: string; grid: boolean; crosshair: boolean; priceLine: boolean; volProfile: boolean; paperFills: boolean; }
+export const DEFAULT_SETTINGS: ChartSettings = { upColor: "#089981", downColor: "#f23645", grid: true, crosshair: true, priceLine: true, volProfile: false, paperFills: true };
 
 const FIB = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1];
 
@@ -59,6 +72,8 @@ interface Props {
   onAddShape?: (p1: [number, number], p2: [number, number]) => void;
   settings?: ChartSettings;
   liveLevels?: LiveLevels | null;
+  paperFills?: PaperFillMarker[];
+  onPaperFillSelect?: (tradeId: string) => void;
   onCommitLevel?: (kind: "stop" | "target", price: number) => void;
 }
 
@@ -73,16 +88,18 @@ const num = (a: (number | null)[] | undefined, end: number) => (a ? a.slice(0, e
  *  risk/reward zones, a volume pane and an optional oscillator pane (RSI /
  *  MACD / ATR). Renders ONLY candles up to `index` — the future is never drawn.
  *  Every indicator drawn here is a real, server-computed causal series. */
-export default function CandleChart({ data, index, toggles, height = 520, extraLines, gridLines, chartType = "candles", drawings, shapes, drawTool = "none", onAddShape, settings = DEFAULT_SETTINGS, liveLevels, onCommitLevel }: Props) {
+export default function CandleChart({ data, index, toggles, height = 520, extraLines, gridLines, chartType = "candles", drawings, shapes, drawTool = "none", onAddShape, settings = DEFAULT_SETTINGS, liveLevels, paperFills, onPaperFillSelect, onCommitLevel }: Props) {
   const elRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<echarts.ECharts | null>(null);
   // refs so the persistent zr click handler always sees the latest tool/callback
   const toolRef = useRef<DrawTool>(drawTool);
   const addRef = useRef<Props["onAddShape"]>(onAddShape);
+  const paperFillSelectRef = useRef<Props["onPaperFillSelect"]>(onPaperFillSelect);
   const commitRef = useRef<Props["onCommitLevel"]>(onCommitLevel);
   const pendingRef = useRef<[number, number] | null>(null);
   useEffect(() => { toolRef.current = drawTool; if (drawTool === "none") pendingRef.current = null; }, [drawTool]);
   useEffect(() => { addRef.current = onAddShape; }, [onAddShape]);
+  useEffect(() => { paperFillSelectRef.current = onPaperFillSelect; }, [onPaperFillSelect]);
   useEffect(() => { commitRef.current = onCommitLevel; }, [onCommitLevel]);
 
   useEffect(() => {
@@ -100,6 +117,12 @@ export default function CandleChart({ data, index, toggles, height = 520, extraL
       if (!pendingRef.current) { pendingRef.current = p; return; }
       const p1 = pendingRef.current; pendingRef.current = null;
       addRef.current?.(p1, p);
+    });
+    // Ledger-fill markers are an audit entry point: a click opens the exact
+    // corresponding journal, never a reconstructed or inferred record.
+    chart.on("click", (event: any) => {
+      const tradeId = event?.data?.paperTradeId;
+      if (typeof tradeId === "string" && tradeId) paperFillSelectRef.current?.(tradeId);
     });
     return () => { ro.disconnect(); chart.dispose(); chartRef.current = null; };
   }, []);
@@ -121,7 +144,7 @@ export default function CandleChart({ data, index, toggles, height = 520, extraL
     const last = c[c.length - 1];
     const prev = c[c.length - 2];
     const chg = prev ? ((last.c - prev.c) / prev.c) * 100 : 0;
-    const upCol = last.c >= last.o ? "#089981" : "#f23645";
+    const upCol = last.c >= last.o ? settings.upColor : settings.downColor;
 
     // ---- dynamic pane layout: price + optional volume + optional oscillator ----
     const hasVol = toggles.volume;
@@ -178,6 +201,55 @@ export default function CandleChart({ data, index, toggles, height = 520, extraL
           itemStyle: { color: t.result === "Winner" ? "#089981" : "#f23645" },
           label: { show: false, formatter: "", position: "bottom", color: "#cfd6e4", fontSize: 9 },
         } as any);
+      }
+    }
+    // Real paper fills from the ledger. These intentionally do not reuse the
+    // strategy replay markers above: a real engine order is evidence, whereas
+    // a replay marker is a simulation. Only markers whose timestamp belongs to
+    // the currently visible chart window are drawn.
+    const nearestCandle = (ts: string | null): number | null => {
+      const target = ts ? Date.parse(ts) : Number.NaN;
+      if (!Number.isFinite(target)) return null;
+      const first = Date.parse(c[0].t);
+      const lastTs = Date.parse(c[c.length - 1].t);
+      // Do not pin a real fill from outside this historical window to the
+      // nearest edge candle — that would manufacture a misleading marker.
+      if (!Number.isFinite(first) || !Number.isFinite(lastTs) || target < first || target > lastTs) return null;
+      let best = -1;
+      let distance = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < c.length; i += 1) {
+        const candleTs = Date.parse(c[i].t);
+        if (!Number.isFinite(candleTs)) continue;
+        const next = Math.abs(candleTs - target);
+        if (next < distance) { best = i; distance = next; }
+      }
+      return best >= 0 ? best : null;
+    };
+    if (settings.paperFills) {
+      for (const trade of paperFills ?? []) {
+        const entryIdx = nearestCandle(trade.openedAt);
+        if (entryIdx != null) {
+          const isLong = trade.side === "long";
+          markPts.push({
+            name: isLong ? "Paper BUY" : "Paper SELL", coord: [entryIdx, trade.entry],
+            symbol: "triangle", symbolSize: 13, symbolRotate: isLong ? 0 : 180,
+            paperTradeId: trade.id,
+            itemStyle: { color: isLong ? settings.upColor : settings.downColor },
+            label: { show: true, formatter: isLong ? "BUY" : "SELL", position: isLong ? "bottom" : "top",
+              color: "#fff", fontSize: 8, fontWeight: 700 },
+          } as any);
+        }
+        const exitIdx = nearestCandle(trade.closedAt);
+        if (exitIdx != null && trade.exit != null) {
+          const profitable = (trade.pnl ?? 0) >= 0;
+          markPts.push({
+            name: "Paper Exit", coord: [exitIdx, trade.exit], symbol: "diamond", symbolSize: 11,
+            paperTradeId: trade.id,
+            itemStyle: { color: profitable ? settings.upColor : settings.downColor },
+            label: { show: true, formatter: profitable ? "EXIT +" : "EXIT −", position: "top",
+              color: "#fff", fontSize: 8, fontWeight: 700 },
+          } as any);
+        }
       }
     }
 
@@ -445,7 +517,7 @@ export default function CandleChart({ data, index, toggles, height = 520, extraL
     } else {
       chart.setOption({ graphic: [] }, { replaceMerge: ["graphic"] } as any);
     }
-  }, [data, index, toggles, height, chartType, drawings, shapes, settings, liveLevels]);
+  }, [data, index, toggles, height, chartType, drawings, shapes, settings, liveLevels, paperFills]);
 
   return <div ref={elRef} style={{ width: "100%", height, cursor: drawTool !== "none" ? "crosshair" : undefined }} />;
 }

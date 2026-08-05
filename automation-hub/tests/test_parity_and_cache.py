@@ -12,6 +12,7 @@ from services.controls import TradingControl
 from services.counterfactual import CounterfactualTracker
 from services.signal_pipeline import SignalPipeline
 from services.ttl_cache import cached, clear
+from strategies.brain import BrainVerdict
 
 TS = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -75,6 +76,64 @@ def test_quality_gate_disabled_or_warming_up_lets_signals_through():
     stub2 = _Stub([_sig(tp=102.0)], bars=_history(10))
     eng2._process_bar("BTCUSDT", _history(11)[-1], stub2)
     assert paper2.open_position("BTCUSDT") is not None
+
+
+def test_quality_gate_receives_only_its_symbol_closed_loss_streak():
+    """Forward entries must use the existing TradeBrain streak protection.
+
+    The closed-paper ledger contains losses for BTC and a separate ETH loss;
+    only BTC's trailing sequence belongs in a BTC entry decision.
+    """
+    from data.journal_store import JournalStore
+    from services.decision_journal import DecisionJournal
+
+    eng, paper, _ = _engine()
+    eng.pipeline.journal = DecisionJournal(JournalStore(":memory:"))
+    paper._hist_cache = [
+        {"symbol": "BTCUSDT", "pnl": -1.0},
+        {"symbol": "ETHUSDT", "pnl": -1.0},
+        {"symbol": "BTCUSDT", "pnl": -1.0},
+        {"symbol": "BTCUSDT", "pnl": -1.0},
+    ]
+
+    class CapturingBrain:
+        def __init__(self):
+            self.recent_losses = None
+
+        def evaluate(self, *args, **kwargs):
+            self.recent_losses = kwargs["recent_losses"]
+            return BrainVerdict(
+                allowed=True, score=90, regime="Trending", htf_bias="bullish",
+                setup_type="trend", components={}, passed=[], failed=[], blocks=[])
+
+    capture = CapturingBrain()
+    eng._quality_brain = capture
+    assert eng._symbol_loss_streak("BTCUSDT") == 3
+    assert eng._symbol_loss_streak("ETHUSDT") == 1
+    eng._on_signal("BTCUSDT", _sig(tp=112.0), _Stub([], bars=_history()))
+
+    assert capture.recent_losses == 3
+    entry = eng.pipeline.journal.store.list()[0]["sections"]["entry_decision"]
+    assert entry["quality_gate_score"] == 90
+    assert entry["quality_gate_regime"] == "Trending"
+    assert entry["quality_gate_status"] == "Passed"
+
+
+def test_autonomous_entry_journal_records_symbol_guardrail_context():
+    """The bot's journal receipt includes the context it actually used."""
+    from data.journal_store import JournalStore
+    from services.decision_journal import DecisionJournal
+
+    eng, paper, _ = _engine(min_score=0)
+    eng.pipeline.journal = DecisionJournal(JournalStore(":memory:"))
+    eng._process_bar("BTCUSDT", _history(91)[-1], _Stub([_sig(tp=112.0)], bars=_history()))
+
+    entries = eng.pipeline.journal.store.list()
+    assert len(entries) == 1 and paper.open_position("BTCUSDT") is not None
+    risk = entries[0]["sections"]["risk_check"]
+    assert risk["entry_sizing"]["filled_size"] > 0
+    assert risk["engine_guardrails"]["closed_symbol_loss_streak"] == 0
+    assert "strategy_health" in risk["engine_guardrails"]
 
 
 def test_min_quality_score_is_runtime_settable():

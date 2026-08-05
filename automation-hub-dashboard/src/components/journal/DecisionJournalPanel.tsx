@@ -51,6 +51,10 @@ function Checks({ items }: { items: Read[] }) {
   );
 }
 
+const label = (key: string) => key.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+const pct = (value: unknown) => typeof value === "number" ? `${value.toFixed(2)}%` : null;
+const factor = (value: unknown) => typeof value === "number" ? `${value.toFixed(2)}×` : null;
+
 export default function DecisionJournalPanel({ tradeId }: { tradeId: string }) {
   const [j, setJ] = useState<Journal | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -71,6 +75,11 @@ export default function DecisionJournalPanel({ tradeId }: { tradeId: string }) {
   const ex = s.exit_decision ?? {};
   const rv = s.review ?? {};
   const ev = s.evolution ?? {};
+  const sizing = s.risk_check?.entry_sizing ?? {};
+  const modifiers = sizing.modifiers ?? {};
+  const activeModifiers = Object.entries(modifiers)
+    .filter(([, value]) => typeof value === "number" && Math.abs(value - 1) > 0.0001);
+  const engineGuardrails = s.risk_check?.engine_guardrails ?? {};
 
   return (
     <div style={{ padding: "6px 4px 10px" }}>
@@ -101,7 +110,23 @@ export default function DecisionJournalPanel({ tradeId }: { tradeId: string }) {
           <Row k="Higher-timeframe trend" v={ed.higher_timeframe_trend} />
           <Row k="Confidence score" v={ed.confidence_score} />
           <Row k="Final decision score" v={ed.final_decision_score} />
+          <Row k="Quality-gate score" v={ed.quality_gate_score} />
+          <Row k="Quality-gate regime" v={ed.quality_gate_regime} />
+          <Row k="Decision reference" v={ed.decision_reference} />
         </div>
+        {ed.quality_gate_status && (
+          <div className="row-actions" style={{ justifyContent: "flex-start", gap: 8, marginTop: 6 }}>
+            <Badge text={`Quality gate: ${ed.quality_gate_status}`} tone={statusTone(ed.quality_gate_status) as any} />
+          </div>
+        )}
+        {(ed.quality_gate_passed?.length > 0 || ed.quality_gate_failed?.length > 0) && (
+          <div className="risk-list" style={{ marginTop: 6 }}>
+            {(ed.quality_gate_passed ?? []).map((item: string, i: number) =>
+              <div className="risk-item" key={`pass-${i}`}><span style={{ fontSize: 12 }}>{item}</span><Badge text="Passed" tone="green" /></div>)}
+            {(ed.quality_gate_failed ?? []).map((item: string, i: number) =>
+              <div className="risk-item" key={`fail-${i}`}><span style={{ fontSize: 12 }}>{item}</span><Badge text="Failed" tone="red" /></div>)}
+          </div>
+        )}
       </Section>
 
       {/* 3. Rule Checklist */}
@@ -129,6 +154,35 @@ export default function DecisionJournalPanel({ tradeId }: { tradeId: string }) {
             <Row k="Risk per trade" v={s.risk_check.risk_per_trade} />
             <Row k="Final risk decision" v={s.risk_check.final_risk_decision} />
           </div>
+          {Object.keys(sizing).length > 0 && (
+            <>
+              <div className="dim" style={{ fontSize: 11, margin: "8px 0 4px" }}>
+                Entry sizing receipt — what the bot actually submitted
+              </div>
+              <div className="form-grid-3">
+                <Row k="Base risk" v={pct(sizing.base_risk_pct)} />
+                <Row k="Effective risk" v={pct(sizing.effective_risk_pct)} />
+                <Row k="Computed size" v={sizing.computed_size} />
+                <Row k="Accepted size" v={sizing.accepted_size} />
+                <Row k="Filled size" v={sizing.filled_size} />
+                <Row k="Filled notional" v={sizing.filled_notional} />
+              </div>
+              {activeModifiers.length > 0 && (
+                <div className="risk-list" style={{ marginTop: 6 }}>
+                  {activeModifiers.map(([key, value]) => (
+                    <Row key={key} k={`${label(key)} modifier`} v={factor(value)} />
+                  ))}
+                </div>
+              )}
+              {Object.keys(engineGuardrails).length > 0 && (
+                <div className="risk-list" style={{ marginTop: 6 }}>
+                  {Object.entries(engineGuardrails).map(([key, value]) => (
+                    <Row key={key} k={label(key)} v={value} />
+                  ))}
+                </div>
+              )}
+            </>
+          )}
         </Section>
       )}
 

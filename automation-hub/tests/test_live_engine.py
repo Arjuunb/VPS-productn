@@ -74,3 +74,14 @@ def test_ingest_ignores_in_progress_candle():
 def test_status_reports_mode():
     eng, _ = _engine()
     assert eng.status()["mode"] == "live"
+
+
+def test_health_guard_reduces_new_entry_risk_after_measured_losses():
+    eng, paper = _engine()
+    # Paper history is the source of truth. A symbol-specific losing sample
+    # should reduce only future entry risk and expose the reason in status.
+    paper._hist_cache = [{"symbol": "BTCUSDT", "pnl": -10.0, "rr": -1.0}
+                         for _ in range(10)]
+    assert eng._health_factor("BTCUSDT") == 0.50
+    status = eng.status()["strategy_health"]["BTCUSDT"]
+    assert status["status"] == "Unhealthy" and status["factor"] == 0.50

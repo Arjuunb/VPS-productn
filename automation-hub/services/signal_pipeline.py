@@ -603,6 +603,17 @@ class SignalPipeline:
         lf = self.learning.risk_multiplier(symbol) if self.learning is not None else 1.0
         af = float(self.allocator(symbol)) if self.allocator is not None else 1.0
         xf = _clamp_context(payload.get("context_size_factor", 1.0))
+        # The autonomous engine may reduce new-entry risk when the current
+        # symbol's *measured* paper record deteriorates. It shares the bounded
+        # context slot rather than adding a second independent sizing path;
+        # 0.5 is the existing global floor, so this can never size to zero or
+        # create a surprise leverage change. Webhooks that omit the field are
+        # completely backward compatible.
+        hf = _clamp_context(payload.get("health_size_factor", 1.0))
+        xf = _clamp_context(xf * hf)
+        if hf < 1.0:
+            steps.append(Step("strategy_health", True,
+                              f"measured strategy-health throttle {hf:.2f}× on new-entry risk"))
         sfm = (self.learning.side_multiplier(_dir(side))
                if self.learning is not None else 1.0)
         # edge boost: size up ONLY a proven winning pattern, and never while any
@@ -622,6 +633,27 @@ class SignalPipeline:
         size = size_position(self.equity, entry, stop, RiskRules(risk_per_trade_pct=eff_risk))
         if size <= 0:
             return reject("sizing", "Computed position size is zero")
+        # Immutable-at-entry evidence for the decision journal. This is a
+        # receipt of the factors already used above, not a second sizing path.
+        # Values are overwritten server-side so a webhook cannot fabricate the
+        # explanation later shown to the operator.
+        payload["journal_sizing"] = {
+            "base_risk_pct": round(self.risk_per_trade_pct * 100, 4),
+            "effective_risk_pct": round(eff_risk * 100, 4),
+            "computed_size": round(size, 10),
+            "modifiers": {
+                "confidence": round(factors.confidence, 4),
+                "kelly": round(factors.kelly, 4),
+                "equity_curve": round(factors.equity_curve, 4),
+                "learning": round(factors.learned, 4),
+                "allocator": round(factors.allocator, 4),
+                "event": round(factors.event, 4),
+                "edge": round(factors.boost, 4),
+                "context_and_health": round(factors.context, 4),
+                "side": round(factors.side, 4),
+                "account_loss_streak": round(factors.streak, 4),
+            },
+        }
         steps.append(Step("risk", True,
                           f"{_describe_factors(factors)}"
                           f" → risk {eff_risk*100:.2f}% sized {size:.6f}"))
@@ -653,6 +685,8 @@ class SignalPipeline:
             else:
                 steps.append(Step("portfolio_exposure", True,
                                   f"total within {self.max_total_exposure_pct*100:.0f}%"))
+        payload["journal_sizing"]["accepted_size"] = round(size, 10)
+        payload["journal_sizing"]["accepted_notional"] = round(size * entry, 2)
 
         # 5c. THE RISK ENGINE VETO — the last thing between a signal and a fill.
         # Every trade passes through it before execution; there is no path to
@@ -700,6 +734,11 @@ class SignalPipeline:
         if fill.action == "rejected":
             return reject("execution", "Order rejected at fill (execution model)")
         entry, size = fill.price, fill.size          # actual filled price / size
+        payload["journal_sizing"].update({
+            "filled_entry": round(entry, 10),
+            "filled_size": round(size, 10),
+            "filled_notional": round(size * entry, 2),
+        })
         self.ledger.insert_webhook_event(alert_id=alert_id, symbol=symbol, side=side,
                                           entry=entry, stop=stop, payload=payload, status="accepted")
         open_msg = f"{symbol} {side} opened {size:.6f} @ {entry}"

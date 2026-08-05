@@ -312,11 +312,19 @@ def validation_paper():
         emergency_stop_tested_at=_wa.safety_state.emergency_stop_tested_at(),
     )
 
+    feed_status, _ = _wa.engine.feed_status()
+    execution_model = str(getattr(_wa.paper.fill_model, "name", "perfect"))
     return build_paper_validation(
         perf=perf, avg_rr=avg_rr, per_symbol=per_symbol, per_strategy=per_strategy,
         skipped_total=_wa.skipped_store.total(),
         skipped_by_category=_wa.skipped_store.categories(),
-        readiness=readiness)
+        readiness=readiness,
+        closed_trades=trades,
+        # Only connected forward market data qualifies as paper evidence for a
+        # future live review. Replay/synthetic mode remains useful research, but
+        # must never be presented as forward execution proof.
+        forward_data=bool(_wa.engine.live and feed_status == "connected"),
+        execution_model=execution_model)
 
 
 @router.get("/validation/daily-report")

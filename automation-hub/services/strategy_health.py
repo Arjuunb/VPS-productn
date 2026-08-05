@@ -64,6 +64,21 @@ class StrategyHealth:
         }
 
 
+def entry_risk_factor(health: StrategyHealth) -> float:
+    """Defensive sizing modifier derived from measured strategy deterioration.
+
+    This is intentionally one-way: it can reduce new-entry risk but never
+    increase it. A strategy keeps trading on paper at a smaller size so its
+    current regime can be measured rather than silently frozen after one weak
+    sample. Open positions and exits are never affected.
+    """
+    if health.status == "Unhealthy":
+        return 0.50
+    if health.status == "Degrading":
+        return 0.75
+    return 1.0
+
+
 def _cum_drawdown(trades: Sequence[dict]) -> float:
     cum = 0.0
     peak = 0.0

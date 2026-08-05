@@ -23,6 +23,7 @@ _GATE_NAMES = {
     "dedup": "Not a duplicate alert", "correlation": "Correlated-exposure safe",
     "event_risk": "No high-impact event blackout", "learning": "No learned block",
     "context": "Cross-asset (BTC trend) OK", "risk_guard": "Drawdown / position-count safe",
+    "strategy_health": "Strategy-health entry throttle",
     "trading_day": "Allowed trading day", "session": "Within trading session",
     "daily_loss": "Daily loss limit safe", "weekly_loss": "Weekly loss limit safe",
     "cooldown": "Post-loss cooldown clear", "max_trades": "Max trades/day safe",
@@ -34,6 +35,31 @@ _GATE_NAMES = {
 _BRAIN_NOT_CHECKED = ["Supply/demand zone", "Fair-value gap (FVG)",
                       "Break of structure (BOS)", "Change of character (CHoCH)",
                       "Liquidity sweep"]
+
+
+def _sizing_event_detail(sizing: dict) -> str:
+    """Compact, factual timeline text from the server-calculated receipt."""
+    if not sizing:
+        return "Position-size receipt was not captured for this legacy entry."
+    base = sizing.get("base_risk_pct")
+    effective = sizing.get("effective_risk_pct")
+    units = sizing.get("filled_size", sizing.get("accepted_size"))
+    notional = sizing.get("filled_notional", sizing.get("accepted_notional"))
+    text = f"risk {base}% → {effective}%"
+    if units is not None:
+        text += f"; filled {units} units"
+    if notional is not None:
+        text += f" ({notional} notional)"
+    return text
+
+
+def _quality_event_detail(verdict: dict) -> str:
+    """Describe the actual accepted TradeBrain verdict without recomputing it."""
+    if not verdict:
+        return "Quality gate stood down (disabled or still warming up)."
+    score = verdict.get("score")
+    regime = verdict.get("regime") or "unknown regime"
+    return f"score {score} · {regime} · accepted"
 
 
 def map_checklist(steps: list, brain_checklist: Optional[list]) -> dict:
@@ -198,6 +224,9 @@ class DecisionJournal:
         snapshot = payload.get("snapshot") or {"note": "Not captured for this entry."}
         reason = payload.get("reason", "")
         risk_step = next((s for s in checklist["risk_gates"] if s["rule"] == "risk"), None)
+        sizing = payload.get("journal_sizing") or {}
+        engine_guardrails = payload.get("journal_engine") or {}
+        quality_gate = payload.get("journal_quality_gate") or {}
         sections = {
             "entry_decision": {
                 "main_reason": reason or "Strategy signal fired.",
@@ -205,6 +234,14 @@ class DecisionJournal:
                 "higher_timeframe_trend": snapshot.get("regime", regime),
                 "confidence_score": confidence,
                 "final_decision_score": brain_score,
+                "quality_gate_score": quality_gate.get("score"),
+                "quality_gate_regime": quality_gate.get("regime"),
+                "quality_gate_status": ("Passed" if quality_gate.get("allowed")
+                                        else "Not evaluated" if not quality_gate
+                                        else "Failed"),
+                "quality_gate_passed": quality_gate.get("passed") or [],
+                "quality_gate_failed": quality_gate.get("failed") or quality_gate.get("blocks") or [],
+                "decision_reference": payload.get("journal_decision_id"),
                 "reads": checklist["entry_reads"],
             },
             "checklist": checklist,
@@ -213,6 +250,11 @@ class DecisionJournal:
             "risk_check": {
                 "risk_per_trade": risk_step["detail"] if risk_step else "Not checked",
                 "gates": checklist["risk_gates"],
+                # Captured after the pipeline calculated and capped the size,
+                # then updated once the paper fill returned. It is therefore a
+                # receipt of what the bot actually put on, not an estimate.
+                "entry_sizing": sizing,
+                "engine_guardrails": engine_guardrails,
                 "final_risk_decision": "Allowed — all risk gates passed.",
             },
         }
@@ -225,7 +267,9 @@ class DecisionJournal:
         })
         t = payload.get("timestamp")
         self.store.add_event(trade_id, "setup-detected", f"{strategy} setup on {symbol} {timeframe}", t)
+        self.store.add_event(trade_id, "quality-gate-passed", _quality_event_detail(quality_gate), t)
         self.store.add_event(trade_id, "risk-check-passed", "All risk gates cleared", t)
+        self.store.add_event(trade_id, "risk-sized", _sizing_event_detail(sizing), t)
         self.store.add_event(trade_id, "trade-opened",
                              f"{side.upper()} {size:.6f} @ {entry} (stop {stop}, target {target})", t)
 

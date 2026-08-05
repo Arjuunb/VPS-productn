@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import Card from "../components/common/Card";
 import Icon from "../components/common/Icon";
-import CandleChart, { type ChartToggles, type ExtraLine, type GridLine, type ChartType, type PriceLine, type Shape, type DrawTool, type ChartSettings, type LiveLevels, DEFAULT_SETTINGS } from "../components/replay/CandleChart";
+import CandleChart, { type ChartToggles, type ExtraLine, type GridLine, type ChartType, type PriceLine, type Shape, type DrawTool, type ChartSettings, type LiveLevels, type PaperFillMarker, DEFAULT_SETTINGS } from "../components/replay/CandleChart";
 import ChartTools from "../components/replay/ChartTools";
 import ReplayBar from "../components/replay/ReplayBar";
 import { Badge, StatCard } from "../components/common/ui";
@@ -360,6 +360,22 @@ export default function BotTerminalPage() {
       target: openPos.target ?? null,
     };
   }, [openPos]);
+  // The terminal must distinguish actual paper orders from replay annotations.
+  // This is a direct ledger projection, filtered to the market currently shown.
+  const paperFillMarkers = useMemo<PaperFillMarker[]>(() => (liveTrades ?? [])
+    .filter((trade) => trade.symbol === symbol)
+    .map((trade) => ({
+      id: trade.id,
+      side: trade.side === "short" ? "short" : "long",
+      entry: trade.entry,
+      openedAt: trade.opened_at,
+      exit: trade.exit,
+      closedAt: trade.closed_at,
+      pnl: trade.pnl,
+    })), [liveTrades, symbol]);
+  const openPaperJournal = useCallback((tradeId: string) => {
+    window.location.hash = `/trade/${encodeURIComponent(tradeId)}`;
+  }, []);
   // Commit a dragged stop/target back to the engine (persists SL, updates TP).
   const commitLevel = useCallback((kind: "stop" | "target", price: number) => {
     if (!openPos) return;
@@ -681,7 +697,7 @@ export default function BotTerminalPage() {
               {loading ? "Connecting to live Binance data…" : "Waiting for live data — check the engine feed in the status bar."}</div>
           ) : (
             <>
-            <CandleChart data={data} index={idx} toggles={chartToggles} extraLines={extraLines} gridLines={gridChartLines} chartType={chartType} drawings={drawings} shapes={shapes} drawTool={drawTool} onAddShape={addShape} settings={chartSettings} liveLevels={replay ? null : liveLevels} onCommitLevel={commitLevel} height={full ? Math.max(420, window.innerHeight - 220) : 548} />
+            <CandleChart data={data} index={idx} toggles={chartToggles} extraLines={extraLines} gridLines={gridChartLines} chartType={chartType} drawings={drawings} shapes={shapes} drawTool={drawTool} onAddShape={addShape} settings={chartSettings} liveLevels={replay ? null : liveLevels} paperFills={paperFillMarkers} onPaperFillSelect={openPaperJournal} onCommitLevel={commitLevel} height={full ? Math.max(420, window.innerHeight - 220) : 548} />
             {replay && data.candles.length > 1 && (
               <ReplayBar len={data.candles.length} idx={idx} setIdx={setIdx}
                          onExit={() => setReplay(false)} timeLabel={candle?.t} />
@@ -691,6 +707,7 @@ export default function BotTerminalPage() {
           {data && (
             <div className="row-actions" style={{ gap: 10, alignItems: "center", marginTop: 8, fontSize: 11.5 }}>
               <span className="dim">Watching the live market — the engine acts when a {tf} candle closes.</span>
+              {paperFillMarkers.length > 0 && chartSettings.paperFills && <span className="dim">Paper fills are real ledger orders · click a marker for its journal</span>}
               <span className="dim mono" style={{ marginLeft: "auto" }}>
                 last update {hhmmss(candle?.t)} · {data.candles.length} bars</span>
             </div>
