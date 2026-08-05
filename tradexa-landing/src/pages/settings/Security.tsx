@@ -6,12 +6,12 @@ import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
 import { Switch } from "@/components/ui/Switch";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
-import { hubConfig } from "@/lib/hub";
 import { useToast } from "@/lib/toast";
+import { auth } from "@/lib/auth";
 
 export default function Security() {
   const { toast } = useToast();
-  const signedIn = hubConfig() !== null;
+  const signedIn = auth.configured;
 
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
@@ -24,7 +24,7 @@ export default function Security() {
   const [logoutOpen, setLogoutOpen] = useState(false);
 
   const changePassword = async () => {
-    if (!current || !next || !confirm) {
+    if (!next || !confirm) {
       toast("Fill in all password fields.", "error");
       return;
     }
@@ -40,23 +40,19 @@ export default function Security() {
       toast("Sign in first — your password is managed by the hub account.", "error");
       return;
     }
-    // Real change against the hub account (session-cookie authenticated).
+    // Supabase owns password hashing and verification. The active authenticated
+    // session authorizes the rotation; the old value is never sent to our API.
     setBusy(true);
     try {
-      const res = await fetch("/auth/change-password", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ current, new: next }),
-      });
-      const body = (await res.json()) as { ok?: boolean; error?: string };
-      if (!res.ok || !body.ok) {
-        toast(body.error || "Password change failed.", "error");
+      const result = await auth.updatePassword(next);
+      if (!result.ok) {
+        toast(result.message, "error");
         return;
       }
       setCurrent("");
       setNext("");
       setConfirm("");
-      toast("Password changed.", "success");
+      toast(result.message, "success");
     } catch {
       toast("Password change failed — backend unreachable.", "error");
     } finally {
@@ -188,7 +184,7 @@ export default function Security() {
         title="Log out all devices"
         description="This signs you out of every active session on all devices. You'll need to sign in again everywhere."
         confirmLabel="Log out everywhere"
-        onConfirm={() => toast("Signed out of all devices.", "success")}
+        onConfirm={() => { void auth.signOutAll().then((result) => toast(result.message, result.ok ? "success" : "error")); }}
         onClose={() => setLogoutOpen(false)}
       />
     </>

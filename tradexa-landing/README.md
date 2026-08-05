@@ -13,7 +13,8 @@ Apple restraint × Linear polish** — institutional-grade, minimal, fast.
   `#C8A94B`, emerald, soft red)
 - **Framer Motion** — page transitions, scroll reveals, count-ups, toasts
 - **React Hook Form + Zod** — typed forms with live inline validation
-- **Supabase** — authentication (email/password, Google, GitHub, TOTP 2FA)
+- **Supabase** — production authentication (email/password, verification,
+  reset, session refresh, Google/Apple when enabled, and MFA support)
 - **Lucide** icons · shadcn-style UI primitives (hand-owned in `components/ui`)
 
 ## What's inside
@@ -34,22 +35,22 @@ npm run build             # type-check + production build
 npm run preview
 ```
 
-### Authentication — demo vs live
+### Authentication
 
-The auth layer runs in **demo mode** until Supabase credentials are present:
-forms fully validate, animate and give honest feedback, but no real account is
-created (a banner says so). Provide the two public env vars to go live — **no
-code changes required**:
+There is no demo account or local password fallback. The Docker deployment
+injects the public Supabase URL/anon key at runtime; credentials and the
+service-role key never enter the frontend. See the repository-level
+`DEPLOYMENT_VPS.md` for the required Supabase SQL migration and setup:
 
 ```env
 VITE_SUPABASE_URL=https://YOUR-PROJECT.supabase.co
 VITE_SUPABASE_ANON_KEY=your-anon-key      # safe to expose in the browser
-VITE_APP_URL=/app                         # where "Launch Bot" / post-login goes
+VITE_APP_URL=/app
 ```
 
 The `anon` key is designed to be public; keep the `service_role` key server-side
-only. Enable the Google and GitHub providers (and, optionally, TOTP MFA) in the
-Supabase dashboard to activate those buttons.
+only. Enable Google and/or Apple in Supabase, then set the corresponding
+`HUB_AUTH_GOOGLE_ENABLED` / `HUB_AUTH_APPLE_ENABLED` server flag to show a button.
 
 ## Design & integrity notes
 
@@ -63,8 +64,8 @@ Supabase dashboard to activate those buttons.
 
 ## Deploy
 
-**Single-origin (recommended).** The repo `Dockerfile` bundles this site *and*
-the trading dashboard behind the backend on one origin (e.g. Render):
+**Single-origin deployment.** The repository `Dockerfile` bundles this site
+and the trading dashboard behind the backend, exposed by the Compose Nginx proxy:
 
 - this landing/auth/settings SPA is served at **`/`**, `/auth/*`, `/settings/*`
 - the session-gated dashboard is served at **`/app`** (built with `DASHBOARD_BASE=/app/`)
@@ -73,6 +74,6 @@ the trading dashboard behind the backend on one origin (e.g. Render):
 `Launch Bot` and the "Automation Hub" logo move between the two with no extra
 config. Just deploy the image and everything is on the bot's URL.
 
-**Standalone.** You can also deploy `dist/` to any static host. `vercel.json`
-includes the SPA rewrite so deep links to `/auth/*` and `/settings/*` resolve to
-`index.html`; set `VITE_APP_URL` to the dashboard's URL.
+Deploy with `docker compose up -d --build` on the Ubuntu VPS. Do not deploy the
+auth UI separately: same-origin HttpOnly session cookies are part of the
+security model.

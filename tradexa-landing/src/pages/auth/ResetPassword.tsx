@@ -35,7 +35,7 @@ export default function ResetPassword() {
     const res = await auth.updatePassword(values.password);
     setSubmitting(false);
     if (!res.ok) return toast(res.message, "error");
-    toast(res.message, res.demo ? "info" : "success");
+    toast(res.message, "success");
     navigate("/auth/login");
   };
 

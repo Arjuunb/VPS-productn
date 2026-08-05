@@ -38,29 +38,27 @@ cd automation-hub-dashboard && npm run test:e2e
 
 ## 3. Deployment checks
 
-Single-origin Docker image: the React build is bundled into the FastAPI app
-(`Dockerfile` stage 1 → `automation-hub/webui`), so the Render URL serves the
-identical UI Vercel serves.
+Single-origin Docker Compose image: the React build is bundled into the FastAPI
+app (`Dockerfile` stage 1 → `automation-hub/webui`) and Nginx serves the
+identical UI on the VPS.
 
 | Item | Status / Location |
 |---|---|
-| Backend host | Render (`render.yaml`, Docker, `plan: free`) |
-| Frontend host | Same image on Render **or** Vercel (`VITE_API_BASE` → backend URL) |
-| Health endpoint | `GET /health` (Render `healthCheckPath`) + `GET /health/bot` |
-| Env vars (Render) | `HUB_WEBHOOK_SECRET` (sync:false), `HUB_USERNAME`/`HUB_PASSWORD` (sync:false), `HUB_SECRET` (generateValue), `HUB_MAX_DAILY_LOSS=0.03`, `HUB_AUTO_ENGINE=1`, `HUB_USE_LIVE_DATA=1` |
+| Backend host | Ubuntu VPS Docker Compose |
+| Frontend host | Same FastAPI image, reverse-proxied by Nginx |
+| Health endpoint | `GET /health` + `GET /health/bot` |
+| Env vars | `.env`: Supabase Auth keys, `HUB_SECRET`, `HUB_MAX_DAILY_LOSS=0.03`, `HUB_AUTO_ENGINE=1`, `HUB_USE_LIVE_DATA=1` |
 | Webhook secret | Server-side only; control endpoints require the `X-Webhook-Secret` header |
-| API base URL | `VITE_API_BASE` (frontend build-time), defaults to `http://localhost:8000` |
-| CORS | `allow_origins=["*"]`, `allow_credentials=False` — safe: browsers never send cookies cross-origin, so auth relies on the same-origin cookie or the secret header |
-| Cookie/session | HMAC-signed, `httponly`, `samesite=lax`, survives restarts |
+| API base URL | same origin, injected at runtime |
+| CORS | exact `HUB_CORS_ORIGINS`; same-origin credentials only |
+| Cookie/session | Supabase-verified HttpOnly Secure cookie, `samesite=lax` |
 | Static serving | `/assets` mounted; `index.html` served at `/` with runtime config |
-| DB / persistent storage | SQLite under `HUB_DATA_DIR`. **Free tier disk is ephemeral** — history resets on redeploy unless a paid persistent disk is mounted and `HUB_DATA_DIR` points at it |
+| DB / persistent storage | Compose `tradexa-data` volume under `HUB_DATA_DIR`; Supabase provides identity/RLS-backed SaaS data |
 
 **Secret hygiene:** secrets are never logged and never committed (`.env` is
-gitignored). One honest caveat: a Vercel-hosted frontend embeds
-`VITE_WEBHOOK_SECRET` in its bundle (Vite inlines `VITE_*`), so on a split-origin
-deploy that value is publicly readable. On the single-origin Render deploy the
-cookie session is the primary auth and the embedded secret is not required.
-Control actions are paper-only (pause/stop/start) — no money movement.
+gitignored). The public browser gets only the Supabase URL/anon key; webhook,
+service-role and control keys never use a `VITE_` prefix. Control actions are
+paper-only (pause/stop/start) — no money movement.
 
 ## 4. Safety checks (verified from real runtime state)
 

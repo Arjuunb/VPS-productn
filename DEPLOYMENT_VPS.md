@@ -93,3 +93,83 @@ docker compose exec app python -c "import urllib.request; print(urllib.request.u
 The compose configuration uses `restart: unless-stopped`, bounded local logs,
 health checks, a non-root application user, persistent trading and certificate
 volumes, an internal-only FastAPI port, and only Nginx publishes ports 80/443.
+
+## Supabase customer authentication (required before production use)
+
+TradeLogX customer sign-up, passwords, email confirmation, password reset,
+Google/Apple OAuth, and refresh-token rotation are handled by Supabase Auth.
+`HUB_USERNAME` and `HUB_PASSWORD` are **not** customer credentials; they are
+only retained for a deliberately disabled emergency recovery mode.
+
+1. Create a Supabase project and set its Auth Site URL to
+   `https://trade-logx.com`. Add these redirect URLs:
+
+   ```text
+   https://trade-logx.com/auth/verify-email
+   https://trade-logx.com/auth/reset-password
+   https://www.trade-logx.com/auth/verify-email
+   https://www.trade-logx.com/auth/reset-password
+   ```
+
+2. In Supabase Auth, enable **Confirm email**. Configure SMTP before inviting
+   real users. Enable Google and/or Apple only after adding their provider
+   credentials in Supabase; do not place provider client secrets in `.env`.
+
+3. Apply the tracked SQL in the Supabase SQL editor, in this order:
+
+   ```sh
+   # From your checkout, copy the text of this file into Supabase SQL Editor:
+   less supabase/migrations/0001_saas_auth.sql
+   ```
+
+4. Create the first administrator using the normal `/auth/register` page,
+   verify that email, then promote the copied Auth user UUID in Supabase SQL
+   editor:
+
+   ```sql
+   update public.tradexa_profiles
+   set role = 'admin'
+   where id = '<AUTH_USER_UUID>'::uuid;
+   ```
+
+5. If this VPS has legacy trade rows, make a backup first, then copy
+   `supabase/migrations/0002_legacy_owner_backfill.sql` outside Git, replace
+   the `first_admin` placeholder with that UUID, review it, and run it once.
+   It assigns only rows with a null `user_id`; it never overwrites a user owner.
+
+6. Set these values in `/opt/VPS-productn/.env` and rebuild:
+
+   ```dotenv
+   HUB_AUTH_MODE=supabase
+   SUPABASE_URL=https://YOUR_PROJECT.supabase.co
+   SUPABASE_ANON_KEY=YOUR_PUBLIC_ANON_KEY
+   SUPABASE_SERVICE_ROLE_KEY=YOUR_SERVER_ONLY_SERVICE_ROLE_KEY
+   SUPABASE_KEY=YOUR_SERVER_ONLY_SERVICE_ROLE_KEY
+   HUB_AUTH_GOOGLE_ENABLED=0
+   HUB_AUTH_APPLE_ENABLED=0
+   HUB_EMERGENCY_ADMIN_ENABLED=0
+   ```
+
+   Set an OAuth flag to `1` only after its Supabase provider is configured.
+   The URL and anon key are injected at runtime into the frontend; the service
+   role key remains server-only and must never be prefixed with `VITE_`.
+
+7. Deploy and validate the auth boundary:
+
+   ```sh
+   cd /opt/VPS-productn
+   docker compose config
+   docker compose up -d --build
+   docker compose ps
+   curl -fsS https://trade-logx.com/health
+   curl -sS https://trade-logx.com/auth/status
+   docker compose logs --tail=150 app | grep -Ei 'traceback|exception|refusing' && exit 1 || true
+   ```
+
+   In a private browser window, register an email, confirm it, sign in, verify
+   `/app` loads, update a profile, sign out, reset the password, and sign in
+   again. Verify that a second user sees no rows belonging to the first user.
+
+Never commit `.env`, Supabase keys, SMTP passwords, OAuth private keys, or
+certificate material. A production startup fails closed if Supabase Auth is
+selected without its URL and anon key.

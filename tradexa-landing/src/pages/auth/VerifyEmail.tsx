@@ -21,7 +21,7 @@ export default function VerifyEmail() {
     setResending(true);
     const res = await auth.resendVerification(email);
     setResending(false);
-    toast(res.message, res.ok ? (res.demo ? "info" : "success") : "error");
+    toast(res.message, res.ok ? "success" : "error");
     if (res.ok) {
       setCooldown(30);
       const iv = window.setInterval(() => {

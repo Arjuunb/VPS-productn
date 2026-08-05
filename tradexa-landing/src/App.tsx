@@ -1,4 +1,4 @@
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useEffect, useState, type ReactNode } from "react";
 import { MotionConfig } from "framer-motion";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { ToastProvider } from "@/lib/toast";
@@ -6,6 +6,8 @@ import { Skeleton } from "@/components/ui/Skeleton";
 import { SettingsProvider, useApplyAppearance } from "@/settings/store";
 import { PAGES } from "@/site/routes";
 import { ScrollManager } from "@/site/ScrollManager";
+import { auth } from "@/lib/auth";
+import { supabase } from "@/lib/supabase";
 
 // Landing renders eagerly (it's the entry point); auth + settings are code-split
 // so the marketing page ships the smallest possible bundle.
@@ -26,6 +28,7 @@ const ResetPassword = lazy(() => import("@/pages/auth/ResetPassword"));
 const VerifyEmail = lazy(() => import("@/pages/auth/VerifyEmail"));
 const TwoFactor = lazy(() => import("@/pages/auth/TwoFactor"));
 const SessionExpired = lazy(() => import("@/pages/auth/SessionExpired"));
+const Admin = lazy(() => import("@/pages/Admin"));
 
 const SettingsLayout = lazy(() => import("@/components/settings/SettingsLayout"));
 const SettingsOverview = lazy(() => import("@/pages/settings/Overview"));
@@ -88,6 +91,33 @@ function AppearanceApplier() {
   return null;
 }
 
+/** Keeps the backend's HttpOnly dashboard cookie synchronized with Supabase's
+ * refreshed browser session. Supabase remains the credential authority. */
+function SessionBridge() {
+  useEffect(() => {
+    void auth.bridgeCurrentSession();
+    const subscription = supabase?.auth.onAuthStateChange((_event, session) => {
+      if (session) void auth.bridgeCurrentSession();
+    }).data.subscription;
+    return () => subscription?.unsubscribe();
+  }, []);
+  return null;
+}
+
+function Protected({ children }: { children: ReactNode }) {
+  const [ready, setReady] = useState(!auth.configured);
+  const [signedIn, setSignedIn] = useState(false);
+  useEffect(() => {
+    if (!supabase) return;
+    void supabase.auth.getUser().then(({ data }) => {
+      setSignedIn(Boolean(data.user?.email_confirmed_at));
+      setReady(true);
+    });
+  }, []);
+  if (!ready) return <Fallback />;
+  return signedIn ? <>{children}</> : <Navigate to="/auth/login" replace />;
+}
+
 export default function App() {
   return (
     // reducedMotion="user" makes EVERY framer-motion animation on the site
@@ -101,6 +131,7 @@ export default function App() {
       <SettingsProvider>
         <ToastProvider>
           <AppearanceApplier />
+          <SessionBridge />
           <ScrollManager />
           <Suspense fallback={<Fallback />}>
             <Routes>
@@ -121,8 +152,9 @@ export default function App() {
               <Route path="/auth/verify-email" element={<VerifyEmail />} />
               <Route path="/auth/two-factor" element={<TwoFactor />} />
               <Route path="/auth/session-expired" element={<SessionExpired />} />
+              <Route path="/admin" element={<Protected><Admin /></Protected>} />
 
-              <Route path="/settings" element={<SettingsLayout />}>
+              <Route path="/settings" element={<Protected><SettingsLayout /></Protected>}>
                 <Route index element={<Navigate to="/settings/overview" replace />} />
                 <Route path="overview" element={<SettingsOverview />} />
                 <Route path="profile" element={<Profile />} />

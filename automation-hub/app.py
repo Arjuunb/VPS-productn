@@ -40,6 +40,7 @@ from database.store import SqliteStore  # noqa: E402
 from core_engine.observer import CoreV2ShadowObserver  # noqa: E402
 from core_engine.persistence import ShadowDecisionStore  # noqa: E402
 from routers.core_v2 import create_router as create_core_v2_router  # noqa: E402
+from services.supabase_auth import Principal, SupabaseAuth, SupabaseAuthError  # noqa: E402
 
 # The API version prefix, declared before the app so the OpenAPI docs can live
 # under it (see below). The router mount further down reuses this constant.
@@ -57,9 +58,9 @@ app = FastAPI(
     docs_url=f"/api/{API_VERSION}/docs",
     redoc_url=f"/api/{API_VERSION}/redoc",
 )
-# Phase 6/7: one SQLite store backs both bot persistence and user accounts.
-# The first admin is seeded from HUB_USERNAME/HUB_PASSWORD. Tests override
-# `manager` with an in-memory BotManager() but reuse `store` for auth.
+# SQLite keeps bot configuration and is retained for the emergency-only legacy
+# mode. Customer identity is Supabase Auth; do not seed an env-password user in
+# that mode because it would silently create a second login authority.
 store = SqliteStore(settings.db_path)
 # Durable settings mirror: when SUPABASE_URL + SUPABASE_KEY are set, per-user
 # settings persist to Supabase so they survive an ephemeral-disk restart (no
@@ -77,13 +78,17 @@ try:
               "and reset on an ephemeral-disk redeploy.", flush=True)
 except Exception:  # noqa: BLE001 — never let settings persistence break boot
     pass
-store.seed_admin(settings.username, settings.password)
+if settings.auth_mode == "legacy":
+    store.seed_admin(settings.username, settings.password)
+elif settings.auth_mode != "supabase":
+    raise RuntimeError("HUB_AUTH_MODE must be 'supabase' or 'legacy'")
+supabase_auth = SupabaseAuth()
 manager = BotManager(store=store)
 # V2 records are kept in a distinct table in the durable decisions database.
 # They are shadow observations, not legacy decisions and never execution input.
 core_v2_store = ShadowDecisionStore(settings.decisions_db)
 
-# M-7: fail closed on insecure defaults in production. render.yaml generates a
+# M-7: fail closed on insecure defaults in production. The deployment operator
 # strong HUB_SECRET, so a default here on a cloud host means misconfiguration —
 # and a default session-signing key makes cookie forgery trivial. A default
 # password is warned about loudly but not hard-blocked (so you're never locked
@@ -93,11 +98,20 @@ _ON_CLOUD = bool(_sec_os.environ.get("RENDER") or _sec_os.environ.get("DYNO")
                  or _sec_os.environ.get("HUB_ENV", "").lower() == "production")
 _UNDER_TEST = "PYTEST_CURRENT_TEST" in _sec_os.environ or bool(_sec_os.environ.get("HUB_DEV"))
 if _ON_CLOUD and not _UNDER_TEST:
+    if settings.auth_mode != "supabase" and not settings.emergency_admin_enabled:
+        raise RuntimeError(
+            "REFUSING TO BOOT: production customer authentication requires "
+            "HUB_AUTH_MODE=supabase. Set HUB_EMERGENCY_ADMIN_ENABLED=1 only "
+            "for a time-limited break-glass recovery session.")
+    if settings.auth_mode == "supabase" and not supabase_auth.configured:
+        raise RuntimeError(
+            "REFUSING TO BOOT: SUPABASE_URL and SUPABASE_ANON_KEY are required "
+            "when HUB_AUTH_MODE=supabase.")
     if settings.secret_key == "dev-insecure-secret":
         raise RuntimeError(
             "REFUSING TO BOOT: HUB_SECRET is unset (default session-signing key). "
-            "Set HUB_SECRET to a strong random value (render.yaml does this with "
-            "generateValue) before exposing this service — otherwise session "
+            "Set HUB_SECRET to a strong random value before exposing this service "
+            "— otherwise session "
             "cookies are forgeable.")
     import sys as _sec_sys
     if settings.password == "admin":
@@ -247,6 +261,17 @@ def _client_ip(request: Request) -> str:
 @app.middleware("http")
 async def _require_auth(request: Request, call_next):
     path = request.url.path
+    # Same-origin protection for state-changing requests authenticated only by
+    # the HttpOnly Supabase bridge cookie. A browser supplies Origin for fetch/
+    # form requests; an absent Origin is retained for non-browser API clients.
+    if (settings.auth_mode == "supabase" and request.method in {"POST", "PUT", "PATCH", "DELETE"}
+            and request.cookies.get(SUPABASE_COOKIE) and not request.headers.get("authorization")):
+        origin = request.headers.get("origin")
+        if origin:
+            from urllib.parse import urlparse
+            if urlparse(origin).netloc != request.headers.get("host", ""):
+                from fastapi.responses import JSONResponse
+                return JSONResponse({"error": "Cross-site request rejected."}, status_code=403)
     # --- rate limiting (brute-force protection) — before auth so failed attempts
     # count. The under-test check is evaluated per-REQUEST (PYTEST_CURRENT_TEST is
     # set during a test's execution, not necessarily at import), so the limiter is
@@ -276,6 +301,18 @@ async def _require_auth(request: Request, call_next):
         # and must stay session-gated. The landing serves only "/settings/{path}".
         exempt = exempt + ("/settings/", "/app")
     hdr = request.headers.get("x-webhook-secret")
+    # The retained SQLite engine is deployment-wide legacy state. While the
+    # per-user execution stores are migrated to the RLS-backed Supabase tables,
+    # never let a regular SaaS user read or control that owner's account. Their
+    # verified account/profile routes remain available under /auth/ and the
+    # protected settings SPA under /settings/.
+    if settings.auth_mode == "supabase":
+        principal = _supabase_principal(request)
+        legacy_engine_path = not (path.startswith("/auth/") or path.startswith("/settings/")
+                                  or path == "/app" or path.startswith("/app/"))
+        if principal and not principal.is_admin and legacy_engine_path:
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"error": "This deployment-wide engine is restricted to administrators while its legacy data is migrated."}, status_code=403)
     if (request.method == "OPTIONS"          # CORS preflight — CORSMiddleware answers it
             or path == "/" or path in ("/api/version", "/api/" + API_VERSION)  # public version handshake (NOT the /api/v1/* API subtree)
             # public marketing pages, matched exactly — see _LANDING_PAGE_PATHS
@@ -287,7 +324,10 @@ async def _require_auth(request: Request, call_next):
         # A browser session is an authenticated operator.  Supply the internal
         # control credential only to downstream endpoint handlers; it is never
         # rendered into React configuration or sent over the network by clients.
-        if _user(request) and not hdr:
+        # Legacy handlers use an internal control-header bridge. Never grant it
+        # to a Supabase customer: a user session must not become the shared
+        # deployment-wide operator credential.
+        if _user(request) and not hdr and settings.auth_mode == "legacy":
             request.scope["headers"] = list(request.scope["headers"]) + [
                 (b"x-webhook-secret", settings.admin_key.encode("utf-8"))]
         return await call_next(request)
@@ -349,7 +389,11 @@ for _bf in _BRAND_FILES:
 def _serve_react() -> HTMLResponse:
     html = (_WEBUI / "index.html").read_text(encoding="utf-8")
     cfg = ('<script>window.__HUB_CONFIG__='
-           + _json.dumps({"apiBase": ""})
+           + _json.dumps({"apiBase": "", "authMode": settings.auth_mode,
+                          "supabaseUrl": supabase_auth.url or None,
+                          "supabaseAnonKey": supabase_auth.anon_key or None,
+                          "oauthProviders": [p for p in ("google", "apple")
+                                            if _sec_os.environ.get(f"HUB_AUTH_{p.upper()}_ENABLED", "").lower() in ("1", "true", "yes")]})
            + '</script>')
     return HTMLResponse(html.replace("<head>", "<head>" + cfg, 1))
 
@@ -360,11 +404,17 @@ def _serve_landing(request: Optional[Request] = None) -> HTMLResponse:
     strategy switcher) drive the engine and need the same runtime config the
     dashboard gets. Anonymous visitors always receive the bare page."""
     html = (_LANDING / "index.html").read_text(encoding="utf-8")
-    if request is not None and _user(request):
-        cfg = ('<script>window.__HUB_CONFIG__='
-               + _json.dumps({"apiBase": ""})
-               + '</script>')
-        html = html.replace("<head>", "<head>" + cfg, 1)
+    # URL and anon key are deliberately public Supabase browser values. Runtime
+    # injection avoids baking deployment-specific keys into a Docker image; the
+    # service-role key is never present here.
+    cfg = ('<script>window.__HUB_CONFIG__='
+           + _json.dumps({"apiBase": "", "authMode": settings.auth_mode,
+                          "supabaseUrl": supabase_auth.url or None,
+                          "supabaseAnonKey": supabase_auth.anon_key or None,
+                          "oauthProviders": [p for p in ("google", "apple")
+                                            if _sec_os.environ.get(f"HUB_AUTH_{p.upper()}_ENABLED", "").lower() in ("1", "true", "yes")]})
+           + '</script>')
+    html = html.replace("<head>", "<head>" + cfg, 1)
     return HTMLResponse(html)
 
 
@@ -388,6 +438,7 @@ if _LANDING_READY:
     for _p in _LANDING_AUTH:
         app.add_api_route(f"/auth/{_p}", _landing_page, response_class=HTMLResponse, methods=["GET"])
     app.add_api_route("/settings/{path:path}", _landing_sub, response_class=HTMLResponse, methods=["GET"])
+    app.add_api_route("/admin", _landing_page, response_class=HTMLResponse, methods=["GET"])
 
     # Every public marketing page. Registered individually rather than behind a
     # catch-all: a catch-all would answer HTML to a mistyped API path, turning
@@ -402,6 +453,9 @@ if _LANDING_READY:
         u = _require(request)
         if isinstance(u, RedirectResponse):
             return u
+        p = _supabase_principal(request)
+        if settings.auth_mode == "supabase" and p is not None and not p.is_admin:
+            return RedirectResponse("/settings/account", status_code=303)
         return _serve_react() if _WEBUI_READY else HTMLResponse(render_overview(manager, user=u))
 
 
@@ -429,6 +483,7 @@ hub_events = HubEventHub()
 # token -> username (legacy in-memory sessions; kept for test fixtures)
 _sessions: dict[str, str] = {}
 COOKIE = "hub_session"
+SUPABASE_COOKIE = "hub_supabase_access"
 SESSION_DAYS = 7
 
 
@@ -443,7 +498,9 @@ def _cookie_kwargs() -> dict:
         samesite = "lax"
     kw = {"httponly": True, "samesite": samesite,
           "max_age": SESSION_DAYS * 86400}
-    if samesite == "none":
+    # HTTPS is mandatory in production. Cookies may be non-secure only for a
+    # local HTTP development server; never allow that production downgrade.
+    if samesite == "none" or _ON_CLOUD:
         kw["secure"] = True
     return kw
 
@@ -485,7 +542,7 @@ def verify_access(token: str):
     return username if username and store.get_user(username) else None
 
 
-def _bearer(request: Request):
+def _legacy_bearer(request: Request):
     """Username from an `Authorization: Bearer <jwt>` header, if present + valid."""
     auth = request.headers.get("authorization", "")
     if auth[:7].lower() == "bearer ":
@@ -494,10 +551,39 @@ def _bearer(request: Request):
 
 
 def _user(request: Request):
+    if settings.auth_mode == "supabase":
+        p = _supabase_principal(request)
+        return p.id if p else None
     token = request.cookies.get(COOKIE, "")
     # cookie first (the browser dashboard), then a Bearer JWT (API clients),
     # then the legacy in-memory map kept only for test fixtures.
-    return _verify_session(token) or _bearer(request) or _sessions.get(token)
+    return _verify_session(token) or _legacy_bearer(request) or _sessions.get(token)
+
+
+def _supabase_token(request: Request) -> str:
+    """Read an HttpOnly browser bridge cookie or an API Bearer token."""
+    header = request.headers.get("authorization", "")
+    if header[:7].lower() == "bearer ":
+        return header[7:].strip()
+    return request.cookies.get(SUPABASE_COOKIE, "")
+
+
+def _supabase_principal(request: Request) -> Principal | None:
+    """Verify the token at Supabase and cache it only for this request."""
+    if settings.auth_mode != "supabase":
+        return None
+    cached = getattr(request.state, "supabase_principal", None)
+    if cached is not None:
+        return cached
+    token = _supabase_token(request)
+    if not token:
+        return None
+    try:
+        principal = supabase_auth.principal(token)
+    except SupabaseAuthError:
+        return None
+    request.state.supabase_principal = principal
+    return principal
 
 
 def _require(request: Request):
@@ -510,6 +596,9 @@ def _tenant(request: Request) -> str:
     """The data-tenant for this request (Phase C seam). Single-owner: always the
     owner. Multi-user (HUB_MULTI_USER): the signed-in user. Stores default to the
     owner, so this only diverges once multi-user is switched on."""
+    if settings.auth_mode == "supabase":
+        # Supabase Auth UUID is the immutable ownership key.
+        return _user(request) or ""
     from services.tenancy import resolve_tenant
     return resolve_tenant(_user(request))
 
@@ -518,6 +607,9 @@ def _request_role(request: Request):
     """The RBAC role for this request. A signed-in user's stored role; or
     'owner' when the caller presents the admin/control secret (automation acts
     with full authority); else None (anonymous)."""
+    if settings.auth_mode == "supabase":
+        p = _supabase_principal(request)
+        return "admin" if p and p.is_admin else ("user" if p else None)
     u = _user(request)
     if u:
         rec = store.get_user(u)
@@ -548,7 +640,7 @@ def _require_role(request: Request, minimum: str):
 def _signup_open() -> bool:
     """Signup creates the single OWNER account. It stays open only while the
     seeded default admin is the sole user — after that this hub has an owner."""
-    return all(u.username == settings.username for u in store.list_users())
+    return settings.auth_mode == "legacy" and all(u.username == settings.username for u in store.list_users())
 
 
 # ----------------------------------------------------------------------- login
@@ -762,6 +854,11 @@ def _storage_notice() -> str:
 
 @app.get("/login", response_class=HTMLResponse)
 def login_form(error: str = "") -> str:
+    if settings.auth_mode == "supabase":
+        # The landing SPA owns every customer-facing auth flow. Keeping this
+        # route only as a compatibility redirect prevents env credentials from
+        # becoming a second customer login path.
+        return RedirectResponse("/auth/login", status_code=303)
     err = f'<div class="err">{w.esc(error)}</div>' if error else ""
     err += _storage_notice()
     signup = ('<p class="foot">New here? <a href="/signup">Create your account</a></p>'
@@ -834,6 +931,8 @@ def _grant_session(user, destination: str = "/"):
 
 @app.post("/login")
 def login(username: str = Form(...), password: str = Form(...)):
+    if settings.auth_mode == "supabase":
+        raise HTTPException(status_code=410, detail="Use the Supabase sign-in page at /auth/login.")
     # verify against hashed credentials; signed cookie survives restarts
     user = store.authenticate(username, password)
     if user is not None:
@@ -852,6 +951,8 @@ def login(username: str = Form(...), password: str = Form(...)):
 
 @app.get("/signup", response_class=HTMLResponse)
 def signup_form(error: str = "") -> str:
+    if settings.auth_mode == "supabase":
+        return RedirectResponse("/auth/register", status_code=303)
     if not _signup_open():
         return _auth_page("Sign up", f'''{_BRAND_HEAD}
 <h1>Already set up</h1>
@@ -897,6 +998,8 @@ def _create_owner(username: str, password: str, confirm: str):
 
 @app.post("/signup")
 def signup(username: str = Form(...), password: str = Form(...), confirm: str = Form(...)):
+    if settings.auth_mode == "supabase":
+        raise HTTPException(status_code=410, detail="Use the Supabase registration page at /auth/register.")
     user, err = _create_owner(username, password, confirm)
     if err:
         return RedirectResponse(f"/signup?error={err.replace(' ', '+')}", status_code=303)
@@ -919,6 +1022,8 @@ def auth_login(username: str = Form(...), password: str = Form(...)):
     """JSON login for API clients: returns a JWT access token AND sets the
     session cookie, so callers can use `Authorization: Bearer` while browsers
     keep the cookie. Same credential check as the form /login."""
+    if settings.auth_mode == "supabase":
+        raise HTTPException(status_code=410, detail="Use Supabase Auth; this endpoint accepts no customer passwords.")
     from fastapi.responses import JSONResponse
     user = store.authenticate(username, password)
     if user is None:
@@ -945,6 +1050,12 @@ def auth_login(username: str = Form(...), password: str = Form(...)):
 @app.get("/auth/status")
 def auth_status(request: Request):
     """For the React app: who am I, and is first-time signup still open?"""
+    if settings.auth_mode == "supabase":
+        p = _supabase_principal(request)
+        return {"authenticated": bool(p), "user": p.id if p else None,
+                "email": p.email if p else None, "role": p.role if p else None,
+                "email_confirmed": bool(p and p.email_confirmed), "signup_open": True,
+                "provider": "supabase"}
     u = _user(request)
     return {"authenticated": bool(u), "user": u, "signup_open": _signup_open()}
 
@@ -955,8 +1066,115 @@ def auth_logout(request: Request):
     from fastapi.responses import JSONResponse
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(COOKIE)
+    resp.delete_cookie(SUPABASE_COOKIE)
     resp.delete_cookie(PENDING_2FA_COOKIE)
     return resp
+
+
+# ---------------------------------------------------------- Supabase bridge
+# Supabase owns credentials, verification, OAuth, reset links and refresh
+# tokens.  The SPA exchanges only its short-lived access token for this
+# HttpOnly same-origin cookie so the independently-built dashboard can use the
+# verified backend session without ever seeing a server credential.
+@app.post("/auth/supabase/session")
+async def supabase_session(request: Request):
+    if settings.auth_mode != "supabase":
+        raise HTTPException(status_code=404, detail="Supabase Auth is not enabled.")
+    token = _supabase_token(request)
+    try:
+        principal = supabase_auth.principal(token)
+    except SupabaseAuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    if not principal.email_confirmed:
+        raise HTTPException(status_code=403, detail="Verify your email before opening the dashboard.")
+    try:
+        body = await request.json()
+    except ValueError:
+        body = {}
+    remember = bool(body.get("remember", True)) if isinstance(body, dict) else True
+    from fastapi.responses import JSONResponse
+    resp = JSONResponse({"ok": True, "user": principal.id, "role": principal.role})
+    cookie = dict(_cookie_kwargs())
+    if remember:
+        cookie["max_age"] = 30 * 86400
+    else:
+        cookie.pop("max_age", None)  # browser-session cookie
+    resp.set_cookie(SUPABASE_COOKIE, token, **cookie)
+    try:
+        supabase_auth.touch_last_login(token, principal.id)
+    except SupabaseAuthError:
+        # A successful authentication must not be rejected because optional
+        # telemetry is temporarily unavailable.
+        pass
+    supabase_auth.audit(actor_id=principal.id, event="session.created",
+                        metadata={"remember": remember})
+    return resp
+
+
+@app.get("/auth/me")
+def auth_me(request: Request):
+    if settings.auth_mode != "supabase":
+        raise HTTPException(status_code=404, detail="Supabase Auth is not enabled.")
+    p = _supabase_principal(request)
+    if p is None:
+        raise HTTPException(status_code=401, detail="Sign in required.")
+    return {"id": p.id, "email": p.email, "full_name": p.full_name,
+            "avatar_url": p.avatar_url, "role": p.role, "email_confirmed": p.email_confirmed}
+
+
+@app.patch("/auth/me")
+async def update_auth_me(request: Request):
+    if settings.auth_mode != "supabase":
+        raise HTTPException(status_code=404, detail="Supabase Auth is not enabled.")
+    p = _supabase_principal(request)
+    if p is None:
+        raise HTTPException(status_code=401, detail="Sign in required.")
+    try:
+        body = await request.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="A JSON profile payload is required.") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="A JSON object is required.")
+    try:
+        profile = supabase_auth.update_profile(_supabase_token(request), p.id, body)
+    except SupabaseAuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    supabase_auth.audit(actor_id=p.id, event="profile.updated", metadata={"fields": sorted(body)})
+    return {"ok": True, "profile": profile}
+
+
+@app.delete("/auth/me")
+def delete_auth_me(request: Request):
+    if settings.auth_mode != "supabase":
+        raise HTTPException(status_code=404, detail="Supabase Auth is not enabled.")
+    p = _supabase_principal(request)
+    if p is None:
+        raise HTTPException(status_code=401, detail="Sign in required.")
+    try:
+        supabase_auth.audit(actor_id=p.id, event="account.deleted", target_id=p.id)
+        supabase_auth.delete_account(p.id)
+    except SupabaseAuthError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    from fastapi.responses import JSONResponse
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(SUPABASE_COOKIE)
+    return resp
+
+
+@app.get("/admin/api/status")
+def admin_status(request: Request):
+    if settings.auth_mode != "supabase":
+        raise HTTPException(status_code=404, detail="Supabase Auth is not enabled.")
+    p = _supabase_principal(request)
+    if p is None or not p.is_admin:
+        raise HTTPException(status_code=403, detail="Administrator access required.")
+    try:
+        users = supabase_auth.admin_profiles()
+    except SupabaseAuthError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    supabase_auth.audit(actor_id=p.id, event="admin.status.viewed")
+    return {"ok": True, "users": users, "engine": webhook_api.engine.status(),
+            "health": {"status": "ok", "auth": "supabase"}}
 
 
 # ══════════════════════════════════════════════════ real auth flows

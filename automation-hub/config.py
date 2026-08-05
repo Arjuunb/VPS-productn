@@ -34,7 +34,12 @@ _load_dotenv(BASE_DIR / ".env")
 
 @dataclass
 class Settings:
-    # --- auth (Phase 1: single configured operator) ---
+    # --- emergency-only legacy credentials ---
+    # Customer authentication is Supabase when HUB_AUTH_MODE=supabase. These
+    # values remain solely for an explicitly enabled break-glass local admin.
+    auth_mode: str = field(default_factory=lambda: os.environ.get("HUB_AUTH_MODE", "legacy").strip().lower())
+    emergency_admin_enabled: bool = field(default_factory=lambda: os.environ.get(
+        "HUB_EMERGENCY_ADMIN_ENABLED", "").lower() in ("1", "true", "yes", "on"))
     username: str = field(default_factory=lambda: os.environ.get("HUB_USERNAME", "admin"))
     password: str = field(default_factory=lambda: os.environ.get("HUB_PASSWORD", "admin"))
     secret_key: str = field(default_factory=lambda: os.environ.get("HUB_SECRET", "dev-insecure-secret"))

@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/Button";
 import { profileSchema } from "@/settings/schema";
 import { useSettings } from "@/settings/store";
 import { useToast } from "@/lib/toast";
+import { auth } from "@/lib/auth";
 import type { z } from "zod";
 
 type Values = z.infer<typeof profileSchema>;
@@ -32,10 +33,19 @@ export default function Profile() {
   const initials = (watch("fullName") || watch("username") || "T A")
     .split(" ").map((s) => s[0]).slice(0, 2).join("").toUpperCase();
 
-  const onSubmit = (values: Values) => {
+  const onSubmit = async (values: Values) => {
+    const remote = await auth.updateProfile({
+      full_name: values.fullName,
+      timezone: values.timezone,
+      preferences: { country: values.country, language: values.language, experience: values.experience, bio: values.bio },
+    });
+    if (!remote.ok) {
+      toast(remote.message, "error");
+      return;
+    }
     setSection("profile", values);
     reset(values);
-    toast("Profile updated", "success");
+    toast(remote.message, "success");
   };
 
   return (

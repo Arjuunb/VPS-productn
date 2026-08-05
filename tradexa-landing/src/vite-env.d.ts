@@ -6,6 +6,16 @@ interface ImportMetaEnv {
   readonly VITE_APP_URL?: string;
 }
 
+interface Window {
+  __HUB_CONFIG__?: {
+    apiBase?: string;
+    authMode?: string;
+    supabaseUrl?: string | null;
+    supabaseAnonKey?: string | null;
+    oauthProviders?: string[];
+  };
+}
+
 interface ImportMeta {
   readonly env: ImportMetaEnv;
 }

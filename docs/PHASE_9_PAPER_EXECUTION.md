@@ -18,12 +18,11 @@ exists.
 
 ## Deployment info
 
-- **Backend/UI:** single-origin Docker image on Render (`render.yaml`,
-  `healthCheckPath: /health`). The React build is bundled into the FastAPI app,
-  so the Render URL serves the same UI as Vercel.
+- **Backend/UI:** single-origin Docker Compose deployment on the Ubuntu VPS.
+  The React builds are bundled into FastAPI and Nginx exposes `/health`.
 - **Engine:** `HUB_AUTO_ENGINE=1` starts the autonomous paper engine on boot;
   `HUB_USE_LIVE_DATA=1` paper-trades the DecisionBrain on real Binance candles.
-- **Risk guard:** `HUB_MAX_DAILY_LOSS=0.03` is set in `render.yaml` so the
+- **Risk guard:** set `HUB_MAX_DAILY_LOSS=0.03` in the VPS `.env` so the
   daily-loss kill switch is engaged in production.
 
 ## Persistence check result
@@ -33,11 +32,10 @@ exists.
   (a fresh store instance on the same file). Settings persist via
   `runtime_settings.json`; paper trades + journal live in SQLite under
   `HUB_DATA_DIR`.
-- **Action required for the live deploy:** set **`HUB_DATA_DIR` to a persistent
-  disk** (e.g. `/data` on a paid Render disk). On the free tier the disk is
-  **ephemeral** — a redeploy or spin-down wipes paper history, so the 30–50
-  trade sample would reset. Verify by redeploying once and confirming the trade
-  count on the Paper Validation panel is unchanged.
+- **Action required for the live deploy:** keep **`HUB_DATA_DIR`** on the
+  Compose `tradexa-data` named volume. It survives a container rebuild; verify
+  by recreating the app container and confirming the Paper Validation count is
+  unchanged.
 
 ## Validation rules (multi-factor — one metric can never carry it)
 

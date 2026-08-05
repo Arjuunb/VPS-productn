@@ -440,7 +440,7 @@ Bottleneck today: **one process, one engine loop, SQLite single-writer, one Bina
 | WS health | `wsOk` client flag; reconnect counter | server-side connection count, drop rate |
 | DB performance | none (SQLite) | Postgres slow-query log, connection-pool saturation |
 | API latency / error rate | none structured | RED metrics (Rate/Errors/Duration) per route at the gateway |
-| CPU / memory | Render dashboard only | container metrics → Prometheus + Grafana; alerts |
+| CPU / memory | Docker host metrics | container metrics → Prometheus + Grafana; alerts |
 | Logs | ledger `bot_logs` + boot logs (stdout) | structured JSON logs → Loki/ELK; trace IDs |
 
 **Golden signals to alert on first:** engine loop lag, decisions-going-to-zero (silent engine), broker error-rate, drawdown breach, 5xx rate, DB pool saturation.
@@ -450,11 +450,14 @@ Bottleneck today: **one process, one engine loop, SQLite single-writer, one Bina
 ## 13. Deployment architecture
 
 ### 🟢 AS-BUILT
-- **Docker** image (`Dockerfile`) builds both SPAs + serves them from the FastAPI backend single-origin; deployed on **Render** (free plan, `/health` check). SPAs also on **Vercel**.
-- **Config** via env (`HUB_*`, `SUPABASE_*`, `VITE_*`); `render.yaml` documents the service.
-- **CI:** GitHub → Vercel preview deploys per PR; backend tested via `pytest` (851) locally/CI; frontend `tsc`+`vite build`+Playwright.
-- **Release flow (this project):** feature branch → PR → 2 Vercel checks green → squash-merge to `main` → Vercel auto-deploys SPAs; **Render is manual** ("Choose Commit to Deploy").
-- **Rollback:** redeploy a previous commit (Render commit picker / Vercel instant rollback).
+- **Docker Compose** builds both SPAs into the FastAPI image and serves them
+  single-origin through Nginx on the Ubuntu VPS.
+- **Config** uses `.env` (`HUB_*`, `SUPABASE_*`); deployment is documented in
+  `DEPLOYMENT_VPS.md`.
+- **CI:** backend `pytest`; frontend `tsc` + `vite build` + Playwright.
+- **Release flow:** pull a reviewed commit on the VPS and run
+  `docker compose up -d --build`.
+- **Rollback:** redeploy a previous Git commit and rebuild the Compose stack.
 
 ### 🎯 TARGET
 | Env | Purpose | Config |

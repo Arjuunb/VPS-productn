@@ -1,13 +1,19 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-const url = import.meta.env.VITE_SUPABASE_URL as string | undefined;
-const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
+interface RuntimeConfig {
+  supabaseUrl?: string;
+  supabaseAnonKey?: string;
+}
+
+const runtime = (typeof window !== "undefined" ? (window as Window & { __HUB_CONFIG__?: RuntimeConfig }).__HUB_CONFIG__ : undefined) ?? {};
+const url = runtime.supabaseUrl ?? (import.meta.env.VITE_SUPABASE_URL as string | undefined);
+const anonKey = runtime.supabaseAnonKey ?? (import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined);
 
 /**
  * True when real Supabase credentials are present. When false, the auth layer
- * runs in DEMO mode: forms validate, animate and give honest feedback, but no
- * real account is created. Drop VITE_SUPABASE_URL + VITE_SUPABASE_ANON_KEY into
- * the environment to go live — no code changes required.
+ * runs in a deliberately unavailable state: no demo accounts or local password
+ * fallback exist in production. Supply only the public URL/anon key; the
+ * service-role key must stay on the server.
  */
 export const isSupabaseConfigured = Boolean(url && anonKey);
 

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -13,7 +13,7 @@ import { Checkbox } from "@/components/ui/Checkbox";
 import { registerSchema, type RegisterValues, passwordStrength } from "@/lib/validation";
 import { auth } from "@/lib/auth";
 import { useToast } from "@/lib/toast";
-import { cn, SIGNUP_URL } from "@/lib/utils";
+import { cn } from "@/lib/utils";
 
 const COUNTRIES = [
   "United States", "United Kingdom", "Canada", "Australia", "Germany", "France",
@@ -36,17 +36,12 @@ export default function Register() {
   const pw = watch("password") ?? "";
   const strength = passwordStrength(pw);
 
-  // Single front door: without Supabase configured this page can't create a real
-  // account, so forward to the app's own (working, premium) create-account page.
-  useEffect(() => { if (!auth.configured) window.location.replace(SIGNUP_URL); }, []);
-  if (!auth.configured) return null;
-
   const onSubmit = async (values: RegisterValues) => {
     setSubmitting(true);
     const res = await auth.signUp(values);
     setSubmitting(false);
     if (!res.ok) return toast(res.message, "error");
-    toast(res.message, res.demo ? "info" : "success");
+    toast(res.message, "success");
     navigate("/auth/verify-email", { state: { email: values.email } });
   };
 
@@ -58,6 +53,7 @@ export default function Register() {
 
       <h1 className="text-2xl font-bold tracking-tight text-white">Create your account</h1>
       <p className="mt-1.5 text-sm text-white/50">Start automating in minutes. No card required.</p>
+      {!auth.configured && <p className="mt-4 rounded-lg border border-loss/30 bg-loss/10 px-3 py-2 text-sm text-loss-soft">Registration is not configured on this deployment.</p>}
 
       <form onSubmit={handleSubmit(onSubmit)} className="mt-7 space-y-4" noValidate>
         <div className="grid grid-cols-2 gap-3">
@@ -167,7 +163,7 @@ export default function Register() {
           )}
         </div>
 
-        <Button type="submit" fullWidth size="lg" loading={submitting}>
+        <Button type="submit" fullWidth size="lg" loading={submitting} disabled={!auth.configured}>
           Create account
         </Button>
       </form>

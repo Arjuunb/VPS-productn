@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { useState } from "react";
+import { Link } from "react-router-dom";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Mail, Lock } from "lucide-react";
@@ -13,11 +13,10 @@ import { Checkbox } from "@/components/ui/Checkbox";
 import { loginSchema, type LoginValues } from "@/lib/validation";
 import { auth } from "@/lib/auth";
 import { useToast } from "@/lib/toast";
-import { APP_URL, LOGIN_URL } from "@/lib/utils";
+import { APP_URL } from "@/lib/utils";
 
 export default function Login() {
   const { toast } = useToast();
-  const navigate = useNavigate();
   const [submitting, setSubmitting] = useState(false);
   const {
     register,
@@ -25,19 +24,13 @@ export default function Login() {
     formState: { errors },
   } = useForm<LoginValues>({ resolver: zodResolver(loginSchema), mode: "onBlur" });
 
-  // Single front door: without Supabase configured this page can't create a real
-  // session, so forward to the app's own (working, premium) sign-in.
-  useEffect(() => { if (!auth.configured) window.location.replace(LOGIN_URL); }, []);
-  if (!auth.configured) return null;
-
   const onSubmit = async (values: LoginValues) => {
     setSubmitting(true);
     const res = await auth.signIn(values.email, values.password, values.remember ?? false);
     setSubmitting(false);
     if (!res.ok) return toast(res.message, "error");
-    toast(res.message, res.demo ? "info" : "success");
-    if (!res.demo) window.location.assign(APP_URL);
-    else navigate("/auth/two-factor");
+    toast(res.message, "success");
+    window.location.assign(APP_URL);
   };
 
   return (
@@ -48,6 +41,7 @@ export default function Login() {
 
       <h1 className="text-2xl font-bold tracking-tight text-white">Welcome back</h1>
       <p className="mt-1.5 text-sm text-white/50">Sign in to your TradeLogX Nexus workspace.</p>
+      {!auth.configured && <p className="mt-4 rounded-lg border border-loss/30 bg-loss/10 px-3 py-2 text-sm text-loss-soft">Authentication is not configured on this deployment. Contact the administrator.</p>}
 
       <form onSubmit={handleSubmit(onSubmit)} className="mt-7 space-y-4" noValidate>
         <Field label="Email" htmlFor="email" error={errors.email?.message}>
@@ -85,7 +79,7 @@ export default function Login() {
 
         <Checkbox id="remember" label="Remember me for 30 days" {...register("remember")} />
 
-        <Button type="submit" fullWidth size="lg" loading={submitting}>
+        <Button type="submit" fullWidth size="lg" loading={submitting} disabled={!auth.configured}>
           Sign in
         </Button>
       </form>

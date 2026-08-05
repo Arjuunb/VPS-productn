@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/Button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { useSettings } from "@/settings/store";
 import { useToast } from "@/lib/toast";
+import { auth } from "@/lib/auth";
 
 /** A right-aligned read-only value, with an honest fallback when unknown. */
 function Value({ children, muted }: { children?: ReactNode; muted?: boolean }) {
@@ -115,7 +116,7 @@ export default function Account() {
         description="This requests permanent deletion of your account and every associated record. This action cannot be undone."
         confirmLabel="Request deletion"
         confirmPhrase="DELETE"
-        onConfirm={() => toast("Account deletion requested.", "success")}
+        onConfirm={() => { void auth.deleteAccount().then((result) => toast(result.message, result.ok ? "success" : "error")); }}
         onClose={() => setDeleteOpen(false)}
       />
 
