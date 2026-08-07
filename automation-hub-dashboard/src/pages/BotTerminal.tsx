@@ -6,6 +6,7 @@ import ChartTools from "../components/replay/ChartTools";
 import ReplayBar from "../components/replay/ReplayBar";
 import { Badge, StatCard } from "../components/common/ui";
 import EquityCurve from "../components/chart/EquityCurve";
+import EngineControlCard from "../components/trading/EngineControlCard";
 import { useApp } from "../app-context";
 import { createGridRun, gridOnCandle, gridUnrealized, gridInventory, type GridRun } from "../lib/gridRunner";
 import {
@@ -202,7 +203,7 @@ export default function BotTerminalPage() {
   const { data: ai } = useLive<AIAnalysis>(`/ai/analyze?symbol=${symbol}&timeframe=${tf}`, 30000);
   const { data: positions, refetch: refetchPositions } = useLive<LedgerPosition[]>("/paper/positions", 5000);
   const { data: liveTrades } = useLive<PaperTradeRow[]>("/paper/trades", 8000);
-  const { data: logs } = useLive<LogRow[]>("/ledger/logs?limit=40", 8000);
+  const { data: logs, refetch: refetchLogs } = useLive<LogRow[]>("/ledger/logs?limit=40", 8000);
   const { data: perf } = useLive<StrategyPerformance>("/strategy/performance", 10000);
 
   const streaming = isCryptoStreamable(symbol);
@@ -617,6 +618,9 @@ export default function BotTerminalPage() {
         <StatCard label="Risk / Trade" value={risk?.risk_per_trade_pct != null ? `${(risk.risk_per_trade_pct * 100).toFixed(1)}%` : "—"}
           sub={`${risk?.open_positions ?? 0} of ${risk?.max_open_positions ?? "—"} positions`} />
       </div>
+
+      <EngineControlCard engine={eng ?? null} logs={logs ?? []}
+        onRefresh={() => { refetchEng(); refetchLogs(); refetchPositions(); }} toast={toast} />
 
       {!streaming && (
         <div className="banner" style={{ marginBottom: 10 }}><Icon name="info" size={14} />
