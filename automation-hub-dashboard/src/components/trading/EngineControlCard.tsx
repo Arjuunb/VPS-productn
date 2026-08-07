@@ -79,7 +79,8 @@ export default function EngineControlCard({ engine, logs, onRefresh, toast }: Pr
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))", gap: "8px 18px" }}>
         {detail("Last heartbeat", hhmmss(engine?.last_heartbeat))}
         {detail("Engine uptime", uptime(engine?.uptime_s ?? undefined))}
-        {detail("Symbols", engine?.symbols?.join(", "))}
+        {detail("Current symbol", engine?.current_symbol ?? "Waiting for market data")}
+        {detail("Configured symbols", engine?.symbols?.join(", "))}
         {detail("Timeframe", engine?.timeframe)}
         {detail("Active strategy", engine?.strategy)}
         {detail("Exchange", engine?.connected_exchange)}

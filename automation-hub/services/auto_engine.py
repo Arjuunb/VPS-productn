@@ -174,6 +174,7 @@ class AutoStrategyEngine:
         # (e.g. a stalled live feed that never delivers a new candle).
         self.last_bar_ts: Optional[str] = None      # timestamp of the last bar acted on
         self.last_activity: Optional[str] = None    # wall-clock of the last processed bar
+        self.current_symbol: Optional[str] = None   # most recently processed market
         self.last_source: Optional[str] = None       # data source ("live (ccxt)" / "bundled sample" / …)
         self._warned_fallback: set = set()           # symbols already warned (no per-poll spam)
         # Event bus (architecture phase 2). The engine PUBLISHES; it never
@@ -293,6 +294,7 @@ class AutoStrategyEngine:
             "reconnect_next_at": self.reconnect_next_at,
             "autostart_enabled": self.autostart_enabled,
             "last_trade": self.last_trade,
+            "current_symbol": self.current_symbol,
             "last_bar_ts": self.last_bar_ts,
             "last_activity": self.last_activity,
             "data_source": self.last_source,
@@ -498,6 +500,7 @@ class AutoStrategyEngine:
         except Exception:  # noqa: BLE001
             self.last_bar_ts = str(getattr(bar, "timestamp", ""))
         self.last_activity = datetime.now(timezone.utc).isoformat()
+        self.current_symbol = sym
         # Announce the closed bar. Only CLOSED bars reach this method, which is
         # the contract MarketDataReceived states. The bus isolates subscriber
         # errors, and this guard covers the remaining case — constructing the
