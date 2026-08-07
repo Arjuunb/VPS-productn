@@ -12,6 +12,12 @@ def test_save_and_load_overrides_roundtrip(tmp_path):
     assert out == {"risk_per_trade_pct": 0.02, "exposure_limit_pct": 0.1, "max_drawdown_pct": 0.15}
 
 
+def test_engine_desired_running_persists(tmp_path):
+    path = str(tmp_path / "engine.json")
+    save_overrides(path, {"engine_desired_running": 0})
+    assert load_overrides(path)["engine_desired_running"] == 0
+
+
 def test_load_missing_file_is_empty(tmp_path):
     assert load_overrides(str(tmp_path / "nope.json")) == {}
 

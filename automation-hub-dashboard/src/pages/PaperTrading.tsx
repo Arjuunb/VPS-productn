@@ -4,6 +4,7 @@ import Icon from "../components/common/Icon";
 import { Badge, PageHeader, StatCard } from "../components/common/ui";
 import DecisionJournalPanel from "../components/journal/DecisionJournalPanel";
 import ModeApprovals from "../components/trading/ModeApprovals";
+import EngineControlCard from "../components/trading/EngineControlCard";
 import { useApp } from "../app-context";
 import {
   apiPost, useLive, hhmmss, API_BASE,
@@ -58,15 +59,6 @@ export default function PaperTradingPage() {
       <PageHeader
         title="Paper Account"
         subtitle="Live engine · real strategy signals → risk → paper execution · no real funds"
-        actions={
-          <div className="row-actions">
-            {eng?.running ? (
-              <button className="btn btn-warn" onClick={() => confirmAct("Stop the trading engine? No new signals will be processed until you start it again.", "/engine/stop", "Engine stopped", engine.refetch)}><Icon name="pause" size={14} /> Stop Engine</button>
-            ) : (
-              <button className="btn btn-primary" onClick={() => act("/engine/start", "Engine started", engine.refetch)}><Icon name="play" size={14} /> Start Engine</button>
-            )}
-          </div>
-        }
       />
 
       {offline && (
@@ -95,7 +87,10 @@ export default function PaperTradingPage() {
         <StatCard label="Trading State" value={state ?? "—"} tone={stateTone(state)} />
       </div>
 
-      <Card title="Engine & Emergency Controls" subtitle={eng ? `${eng.symbols.join(", ")} · ${eng.timeframe} · ${eng.bars} bars processed` : "autonomous strategy engine"}>
+      <EngineControlCard engine={eng ?? null} logs={logs.data ?? []}
+        onRefresh={() => { engine.refetch(); control.refetch(); logs.refetch(); }} toast={app.toast} />
+
+      <Card title="Entry Safety Controls" subtitle={eng ? `${eng.symbols.join(", ")} · ${eng.timeframe} · ${eng.bars} bars processed` : "autonomous strategy engine"}>
         <div className="row-actions" style={{ justifyContent: "flex-start", gap: 8, flexWrap: "wrap" }}>
           <button className="btn btn-warn" onClick={() => confirmAct("Pause all trading? New entries from the engine and webhooks will be blocked until you resume.", "/controls/pause-all", "Trading paused — entries blocked", control.refetch)}><Icon name="pause" size={14} /> Pause All</button>
           <button className="btn btn-danger" onClick={() => confirmAct("Stop all trading? This is a hard halt — resume to re-enable.", "/controls/stop-all", "Trading stopped", control.refetch)}><Icon name="close" size={14} /> Stop All</button>

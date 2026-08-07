@@ -174,33 +174,113 @@ def resume(x_webhook_secret: _wa.Optional[str] = _wa.Header(default=None)):
     return {"state": _wa.controls.state, "auto_halted": _wa.pipeline.halted}
 
 # ---------------------------------------------------- autonomous engine
+def _engine_payload() -> dict:
+    """One authoritative control-plane view for every dashboard surface."""
+    from datetime import datetime, timezone
+
+    st = _wa.engine.status()
+    state = st.get("lifecycle_state", "stopped")
+    reason = st.get("stop_reason")
+    recommendation = "Start the paper engine to resume market scanning."
+    if st.get("running"):
+        if _wa.pipeline.halted:
+            state = "paused"
+            reason = _wa.pipeline.halt_reason or "Risk Manager paused new entries"
+            recommendation = "Review the risk limit, then Resume when it is safe to trade."
+        elif _wa.controls.state != "Active":
+            state = "paused"
+            reason = f"Trading controls are {_wa.controls.state.lower()}"
+            recommendation = "Resume trading controls to allow new paper entries."
+        elif state not in ("starting", "reconnecting"):
+            state = "running"
+            recommendation = "Scanning closed candles; no action is required."
+    elif state == "error":
+        recommendation = "Review the engine logs, verify exchange connectivity, then Restart Engine."
+    elif reason and "Replay data completed" in reason:
+        recommendation = "Enable live market data for continuous paper trading, or Start a new replay run."
+
+    uptime_s = None
+    try:
+        started = datetime.fromisoformat(str(st.get("started_at")).replace("Z", "+00:00"))
+        uptime_s = max(0, round((datetime.now(timezone.utc) - started).total_seconds()))
+    except (TypeError, ValueError):
+        pass
+    hour = datetime.now(timezone.utc).hour
+    session = "Asia" if hour < 8 else "London" if hour < 16 else "New York"
+    st.update({
+        "state": state,
+        "reason": reason,
+        "recommended_action": recommendation,
+        "uptime_s": uptime_s,
+        "trading_state": _wa.controls.state,
+        "auto_halted": _wa.pipeline.halted,
+        "halt_reason": _wa.pipeline.halt_reason,
+        "connected_exchange": getattr(_wa.settings, "default_exchange", "configured"),
+        # The paper engine uses server-side REST polling, not a hidden websocket.
+        "websocket_status": "not used (REST polling)",
+        "market_session": session,
+    })
+    return st
+
+
 @router.post("/engine/start")
 def engine_start(x_webhook_secret: _wa.Optional[str] = _wa.Header(default=None)):
     _wa._check_secret(x_webhook_secret)
     started = _wa.engine.start()
-    return {"started": started, "status": _wa.engine.status()}
+    _wa.save_overrides(_wa.settings.settings_path, _wa._settings_snapshot())
+    _wa.ledger.log(level="info", stage="engine", message=f"Operator requested engine start (started={started})")
+    return {"started": started, "status": _engine_payload()}
+
+@router.post("/engine/pause")
+def engine_pause(x_webhook_secret: _wa.Optional[str] = _wa.Header(default=None)):
+    _wa._check_secret(x_webhook_secret)
+    _wa.controls.pause_all()
+    _wa.ledger.log(level="warning", stage="engine", message="Operator paused paper-engine entries")
+    return {"paused": True, "status": _engine_payload()}
+
+@router.post("/engine/resume")
+def engine_resume(x_webhook_secret: _wa.Optional[str] = _wa.Header(default=None)):
+    _wa._check_secret(x_webhook_secret)
+    _wa.controls.resume()
+    _wa.pipeline.resume()
+    started = _wa.engine.start() if not _wa.engine.running else False
+    _wa.save_overrides(_wa.settings.settings_path, _wa._settings_snapshot())
+    _wa.ledger.log(level="info", stage="engine", message=f"Operator resumed paper engine (started={started})")
+    return {"resumed": True, "started": started, "status": _engine_payload()}
+
+@router.post("/engine/restart")
+def engine_restart(x_webhook_secret: _wa.Optional[str] = _wa.Header(default=None)):
+    _wa._check_secret(x_webhook_secret)
+    started = _wa.engine.restart()
+    _wa.save_overrides(_wa.settings.settings_path, _wa._settings_snapshot())
+    _wa.ledger.log(level="info", stage="engine", message=f"Operator requested engine restart (started={started})")
+    return {"restarted": started, "status": _engine_payload()}
 
 @router.post("/engine/stop")
 def engine_stop(x_webhook_secret: _wa.Optional[str] = _wa.Header(default=None)):
     _wa._check_secret(x_webhook_secret)
     stopped = _wa.engine.stop()
-    return {"stopped": stopped, "status": _wa.engine.status()}
+    _wa.save_overrides(_wa.settings.settings_path, _wa._settings_snapshot())
+    _wa.ledger.log(level="warning", stage="engine", message=f"Operator requested engine stop (stopped={stopped})")
+    return {"stopped": stopped, "status": _engine_payload()}
 
 @router.get("/engine/status")
 def engine_status():
-    return _wa.engine.status()
+    return _engine_payload()
 
 @router.get("/system/status")
 def system_status():
     """Real bot/system health — no fabricated values. Paper-only until a live
     broker is wired (live execution is a future phase)."""
-    st = _wa.engine.status()
+    st = _engine_payload()
     verdict = _inactivity_verdict(st)
     return {
         "mode": "paper",                     # the engine paper-executes; no live broker
         "broker_connected": False,           # honest: no live venue connected
         "data_source": "live (ccxt)" if _wa.engine.live else "synthetic / replay",
         "engine_running": st.get("running", False),
+        "engine_state": st.get("state"),
+        "engine_reason": st.get("reason"),
         "engine_mode": st.get("mode"),
         "strategy": _wa.engine.strategy_label,
         "symbols": _wa.engine.symbols,
@@ -258,12 +338,14 @@ def engine_diagnostics():
     """Plain-English answer to 'why isn't the bot trading?' — built from real
     engine activity (running state, data feed, bars/signals/rejections, and how
     long since the last new candle)."""
-    st = _wa.engine.status()
+    st = _engine_payload()
     age = _last_activity_age_s(st)
     verdict = _inactivity_verdict(st)
     return {
         **verdict,
         "running": st.get("running", False),
+        "state": st.get("state"), "reason": st.get("reason"),
+        "recommended_action": st.get("recommended_action"),
         "mode": st.get("mode"),
         "timeframe": st.get("timeframe"),
         "data_source": st.get("data_source"),

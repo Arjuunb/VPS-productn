@@ -105,7 +105,7 @@ function StrategyMenu({ status }: { status?: SystemStatus }) {
   const ed = cfg.data?.editable;
   const patch = async (body: Record<string, unknown>, note: string) => {
     try { await apiPostJson("/settings", body); app.toast(note, "success"); cfg.refetch(); }
-    catch { app.toast("Engine rejected the change.", "error"); }
+    catch (error) { app.toast(error instanceof Error ? error.message : "Engine rejected the change.", "error"); }
   };
 
   const activate = async (key: string, label: string) => {
@@ -125,7 +125,7 @@ function StrategyMenu({ status }: { status?: SystemStatus }) {
       await apiPostJson("/market/symbols", { symbols });
       app.toast(`Watchlist applied: ${symbols.join(", ")}`, "success");
       setDraftSymbols(null);
-    } catch { app.toast("Engine rejected the watchlist.", "error"); }
+    } catch (error) { app.toast(error instanceof Error ? error.message : "Engine rejected the watchlist.", "error"); }
   };
 
   return (
@@ -209,7 +209,7 @@ function TimeframeMenu({ status }: { status?: SystemStatus }) {
       try { localStorage.setItem("hub.timeframe", tf); } catch { /* private mode */ }
       app.toast(`Engine switched to ${tf}`, "success");
       pop.setOpen(false);
-    } catch { app.toast(`Engine rejected timeframe ${tf}.`, "error"); }
+    } catch (error) { app.toast(error instanceof Error ? error.message : `Engine rejected timeframe ${tf}.`, "error"); }
     setBusy(false);
   };
 
@@ -263,7 +263,7 @@ function EngineSettings({ status }: { status?: SystemStatus }) {
       setDraft({});
       cfg.refetch(); notif.refetch();
       pop.setOpen(false);
-    } catch { app.toast("Engine rejected the settings.", "error"); }
+    } catch (error) { app.toast(error instanceof Error ? error.message : "Engine rejected the settings.", "error"); }
     setBusy(false);
   };
 

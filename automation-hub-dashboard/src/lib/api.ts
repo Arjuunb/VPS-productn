@@ -13,11 +13,20 @@ const _cfg = (typeof window !== "undefined" ? (window as any).__HUB_CONFIG__ : u
 export const API_BASE = (_cfg.apiBase ?? (import.meta.env.VITE_API_BASE as string | undefined)) ?? "http://localhost:8000";
 const requestOptions: RequestInit = { credentials: "include" };
 
+async function requestError(res: Response, path: string): Promise<Error> {
+  try {
+    const payload = await res.json();
+    const detail = payload?.detail ?? payload?.error;
+    if (typeof detail === "string" && detail) return new Error(`${path}: ${detail}`);
+  } catch { /* keep the safe HTTP status when the error has no JSON body */ }
+  return new Error(`${path}: HTTP ${res.status}`);
+}
+
 export async function apiGet<T>(path: string): Promise<T> {
   // session cookie authenticates same-origin; the secret header keeps
   // cross-origin dev (Vite -> localhost API) working behind the auth wall
   const res = await fetch(`${API_BASE}${path}`, requestOptions);
-  if (!res.ok) throw new Error(`GET ${path} → ${res.status}`);
+  if (!res.ok) throw await requestError(res, `GET ${path}`);
   return res.json() as Promise<T>;
 }
 
@@ -26,13 +35,13 @@ export async function apiPost<T>(path: string): Promise<T> {
     method: "POST",
     credentials: "include",
   });
-  if (!res.ok) throw new Error(`POST ${path} → ${res.status}`);
+  if (!res.ok) throw await requestError(res, `POST ${path}`);
   return res.json() as Promise<T>;
 }
 
 export async function apiDelete<T>(path: string): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, { method: "DELETE", credentials: "include" });
-  if (!res.ok) throw new Error(`DELETE ${path} → ${res.status}`);
+  if (!res.ok) throw await requestError(res, `DELETE ${path}`);
   return res.json() as Promise<T>;
 }
 
@@ -42,7 +51,7 @@ export async function apiPostJson<T>(path: string, body: unknown): Promise<T> {
     headers: { "Content-Type": "application/json" }, credentials: "include",
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`POST ${path} → ${res.status}`);
+  if (!res.ok) throw await requestError(res, `POST ${path}`);
   return res.json() as Promise<T>;
 }
 
@@ -52,7 +61,7 @@ export async function apiPatchJson<T>(path: string, body: unknown): Promise<T> {
     headers: { "Content-Type": "application/json" }, credentials: "include",
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`PATCH ${path} → ${res.status}`);
+  if (!res.ok) throw await requestError(res, `PATCH ${path}`);
   return res.json() as Promise<T>;
 }
 
@@ -368,6 +377,16 @@ export interface EngineStatus {
   running: boolean; symbols: string[]; timeframe: string; interval: number;
   strategy?: string; entry_mode?: string;
   started_at: string | null; bars: number; signals: number; trades: number; rejections: number;
+  state?: "running" | "starting" | "paused" | "stopped" | "error" | "reconnecting";
+  reason?: string | null; recommended_action?: string;
+  lifecycle_state?: string; stop_reason?: string | null; last_error?: string | null;
+  last_heartbeat?: string | null; last_activity?: string | null; last_bar_ts?: string | null;
+  uptime_s?: number | null; reconnect_attempt?: number; max_reconnect_attempts?: number;
+  reconnect_next_at?: string | null; trading_state?: string; auto_halted?: boolean;
+  halt_reason?: string | null; connected_exchange?: string; websocket_status?: string;
+  market_session?: string; feed_status?: string; feed_error?: string | null;
+  data_source?: string | null;
+  last_trade?: { action?: string; symbol?: string; side?: string; price?: number; timestamp?: string } | null;
 }
 export interface ControlState { state: "Active" | "Paused" | "Stopped"; }
 export interface SystemStatus {

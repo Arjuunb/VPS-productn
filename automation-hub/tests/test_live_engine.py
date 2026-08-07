@@ -1,10 +1,11 @@
 """Live forward mode: trade only NEW closed candles, never the in-progress one."""
 from datetime import datetime, timedelta, timezone
+import time
 
 from bot.types import Bar, Signal, SignalType
 from data.ledger import SqliteLedger
 from execution.paper_engine import PaperExecutionEngine
-from services.auto_engine import AutoStrategyEngine
+from services.auto_engine import AutoStrategyEngine, EngineFeedError
 from services.controls import TradingControl
 from services.signal_pipeline import SignalPipeline
 
@@ -74,6 +75,50 @@ def test_ingest_ignores_in_progress_candle():
 def test_status_reports_mode():
     eng, _ = _engine()
     assert eng.status()["mode"] == "live"
+
+
+def test_reconnect_lifecycle_is_visible_and_bounded():
+    eng, _ = _engine()
+    delay = eng._schedule_reconnect(EngineFeedError("temporary provider timeout"))
+    state = eng.status()
+    assert delay == 2.0
+    assert state["lifecycle_state"] == "reconnecting"
+    assert state["reconnect_attempt"] == 1
+    assert state["last_error"] == "EngineFeedError: temporary provider timeout"
+
+    for _ in range(eng.max_reconnect_attempts):
+        final = eng._schedule_reconnect(EngineFeedError("still unavailable"))
+    assert final is None
+    eng._mark_error("Market data connection lost", EngineFeedError("still unavailable"))
+    assert eng.status()["lifecycle_state"] == "error"
+
+
+def test_live_worker_recovers_after_a_transient_warmup_failure():
+    led = SqliteLedger(":memory:")
+    paper = PaperExecutionEngine(led, 10_000)
+    pipe = SignalPipeline(led, paper, TradingControl(), equity=10_000,
+                          risk_per_trade_pct=0.01, exposure_limit_pct=0.5)
+    calls = {"n": 0}
+
+    def fetcher(symbol, timeframe, limit):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("temporary network failure")
+        return _bars(4), "live (test)"
+
+    eng = AutoStrategyEngine(pipe, paper, led, symbols=["BTCUSDT"], live=True,
+                             live_poll_s=0.01, fetcher=fetcher)
+    original = eng._schedule_reconnect
+    eng._schedule_reconnect = lambda exc: 0.0 if original(exc) is not None else None
+    try:
+        assert eng.start() is True
+        deadline = time.time() + 1
+        while calls["n"] < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        assert calls["n"] >= 2
+        assert eng.status()["lifecycle_state"] == "running"
+    finally:
+        eng.stop()
 
 
 def test_health_guard_reduces_new_entry_risk_after_measured_losses():

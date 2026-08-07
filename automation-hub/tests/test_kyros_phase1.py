@@ -234,6 +234,19 @@ def test_engine_endpoints_gated_and_status(client):
     assert stopped.json()["stopped"] is True
 
 
+def test_engine_lifecycle_control_endpoints(client):
+    headers = {"X-Webhook-Secret": SECRET}
+    assert client.post("/engine/start", headers=headers).status_code == 200
+    paused = client.post("/engine/pause", headers=headers)
+    assert paused.status_code == 200 and paused.json()["status"]["state"] == "paused"
+    resumed = client.post("/engine/resume", headers=headers)
+    assert resumed.status_code == 200 and resumed.json()["status"]["trading_state"] == "Active"
+    restarted = client.post("/engine/restart", headers=headers)
+    assert restarted.status_code == 200 and "status" in restarted.json()
+    status = client.get("/engine/status").json()
+    assert {"state", "last_heartbeat", "recommended_action", "market_session"} <= set(status)
+
+
 def test_webhook_rejects_missing_secret(client):
     r = client.post("/webhook/tradingview", json=_alert())
     assert r.status_code == 401

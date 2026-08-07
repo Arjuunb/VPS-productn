@@ -20,12 +20,18 @@ from __future__ import annotations
 import itertools
 import threading
 import time
+import traceback
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
 from bot.types import Signal, SignalType
 from data.ledger import Ledger
 from execution.paper_engine import PaperExecutionEngine
 from services.signal_pipeline import SignalPipeline
+
+
+class EngineFeedError(RuntimeError):
+    """A transient market-data failure eligible for bounded reconnect attempts."""
 
 
 def _default_strategy_factory(symbol: str):
@@ -92,6 +98,18 @@ class AutoStrategyEngine:
         self._lock = threading.Lock()
         self.running = False
         self.started_at: Optional[str] = None
+        # Lifecycle state is server-owned.  A page refresh must never infer it
+        # from a stale client timer or a missing websocket connection.
+        self.lifecycle_state = "stopped"  # starting|running|reconnecting|error|stopped
+        self.stop_reason = "Not started"
+        self.last_error: Optional[str] = None
+        self.last_heartbeat: Optional[str] = None
+        self.last_transition: Optional[str] = None
+        self.reconnect_attempt = 0
+        self.max_reconnect_attempts = 5
+        self.reconnect_next_at: Optional[str] = None
+        self.autostart_enabled = True  # persisted by the control API
+        self.last_trade: Optional[dict] = None
         self.stats = {"bars": 0, "signals": 0, "trades": 0, "rejections": 0}
         self._targets: dict[str, float] = {}
         # Mid-trade management (break-even / scale-out / trailing). The default
@@ -171,6 +189,14 @@ class AutoStrategyEngine:
                 return False
             self._stop.clear()
             self.running = True
+            self.autostart_enabled = True
+            self.lifecycle_state = "starting"
+            self.stop_reason = None
+            self.last_error = None
+            self.reconnect_attempt = 0
+            self.reconnect_next_at = None
+            self.last_heartbeat = self._utc_now()
+            self.last_transition = self.last_heartbeat
             from data.ledger import _now
             self.started_at = _now()
             self._thread = threading.Thread(target=self._run, name="auto-engine", daemon=True)
@@ -179,17 +205,32 @@ class AutoStrategyEngine:
                             message=f"Autonomous engine started — {', '.join(self.symbols)} ({self.timeframe})")
             return True
 
-    def stop(self) -> bool:
+    def stop(self, reason: str = "Stopped by operator") -> bool:
         with self._lock:
             if not self.running:
+                self.autostart_enabled = False
+                self.lifecycle_state = "stopped"
+                self.stop_reason = reason
+                self.last_transition = self._utc_now()
                 return False
+            self.autostart_enabled = False
             self._stop.set()
         t = self._thread
         if t is not None:
             t.join(timeout=5)
-        self.running = False
-        self.ledger.log(level="info", stage="engine", message="Autonomous engine stopped")
+        with self._lock:
+            self.running = False
+            self.lifecycle_state = "stopped"
+            self.stop_reason = reason
+            self.reconnect_next_at = None
+            self.last_transition = self._utc_now()
+        self.ledger.log(level="info", stage="engine", message=f"Autonomous engine stopped: {reason}")
         return True
+
+    def restart(self) -> bool:
+        """Restart the worker without changing its strategy/risk configuration."""
+        self.stop("Restart requested by operator")
+        return self.start()
 
     def reconfigure(self, *, symbols, timeframe, strategy_factory, label,
                     spec=None) -> dict:
@@ -201,7 +242,7 @@ class AutoStrategyEngine:
         whatever is ACTUALLY running. It defaults to None and is cleared on every
         reconfigure, because a built-in engine strategy has no rule spec to
         compare against and a stale one would silently monitor the wrong thing."""
-        self.stop()
+        self.stop("Reconfiguring engine")
         self.symbols = list(symbols)
         self.timeframe = timeframe
         self.strategy_factory = strategy_factory
@@ -242,6 +283,16 @@ class AutoStrategyEngine:
             "mode": "live" if self.live else "replay",
             "strategy": self.strategy_label,
             "started_at": self.started_at,
+            "lifecycle_state": self.lifecycle_state,
+            "stop_reason": self.stop_reason,
+            "last_error": self.last_error,
+            "last_heartbeat": self.last_heartbeat,
+            "last_transition": self.last_transition,
+            "reconnect_attempt": self.reconnect_attempt,
+            "max_reconnect_attempts": self.max_reconnect_attempts,
+            "reconnect_next_at": self.reconnect_next_at,
+            "autostart_enabled": self.autostart_enabled,
+            "last_trade": self.last_trade,
             "last_bar_ts": self.last_bar_ts,
             "last_activity": self.last_activity,
             "data_source": self.last_source,
@@ -258,14 +309,89 @@ class AutoStrategyEngine:
     # ----------------------------------------------------------- worker
     def _run(self) -> None:
         try:
-            if self.live:
-                self._run_live()
-            else:
-                self._run_replay()
-        except Exception as e:  # noqa: BLE001 — never let the engine thread crash silently
-            self.ledger.log(level="error", stage="engine", message=f"Engine error: {e}")
+            while not self._stop.is_set():
+                self._heartbeat()
+                try:
+                    if self.live:
+                        self._run_live()
+                    else:
+                        self._mark_running()
+                        self._run_replay()
+                        if not self._stop.is_set():
+                            self._mark_stopped("Replay data completed — start a new paper run or enable live market data.")
+                    return
+                except EngineFeedError as exc:
+                    delay = self._schedule_reconnect(exc)
+                    if delay is None:
+                        self._mark_error("Market data connection lost", exc)
+                        return
+                    self._stop.wait(delay)
+                except Exception as exc:  # strategy/config/runtime errors are not blindly retried
+                    self._mark_error("Unknown internal error", exc)
+                    return
         finally:
-            self.running = False
+            with self._lock:
+                self.running = False
+                if self._stop.is_set() and self.lifecycle_state != "error":
+                    self.lifecycle_state = "stopped"
+                    self.stop_reason = self.stop_reason or "Stopped by operator"
+                    self.reconnect_next_at = None
+                    self.last_transition = self._utc_now()
+
+    @staticmethod
+    def _utc_now() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _heartbeat(self) -> None:
+        self.last_heartbeat = self._utc_now()
+
+    def _mark_running(self) -> None:
+        with self._lock:
+            self.lifecycle_state = "running"
+            self.stop_reason = None
+            self.last_error = None
+            self.reconnect_attempt = 0
+            self.reconnect_next_at = None
+            self.last_transition = self._utc_now()
+            self.last_heartbeat = self.last_transition
+
+    def _mark_stopped(self, reason: str) -> None:
+        with self._lock:
+            self.lifecycle_state = "stopped"
+            self.stop_reason = reason
+            self.last_transition = self._utc_now()
+
+    def _schedule_reconnect(self, exc: Exception) -> Optional[float]:
+        with self._lock:
+            self.reconnect_attempt += 1
+            attempt = self.reconnect_attempt
+            safe_error = f"{type(exc).__name__}: {exc}"[:500]
+            self.last_error = safe_error
+            self.last_heartbeat = self._utc_now()
+            if attempt > self.max_reconnect_attempts:
+                return None
+            delay = min(2.0 ** attempt, 30.0)
+            self.lifecycle_state = "reconnecting"
+            self.stop_reason = "Market data connection lost"
+            self.reconnect_next_at = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
+            self.last_transition = self.last_heartbeat
+        self.ledger.log(level="warning", stage="engine",
+                        message=(f"Market data connection lost — reconnecting "
+                                 f"(attempt {attempt}/{self.max_reconnect_attempts} in {delay:.0f}s): {safe_error}"))
+        return delay
+
+    def _mark_error(self, reason: str, exc: Exception) -> None:
+        detail = f"{type(exc).__name__}: {exc}"[:500]
+        stack = traceback.format_exc(limit=5).strip()[-1200:]
+        with self._lock:
+            self.lifecycle_state = "error"
+            self.stop_reason = reason
+            self.last_error = detail
+            self.reconnect_next_at = None
+            self.last_heartbeat = self._utc_now()
+            self.last_transition = self.last_heartbeat
+        self.ledger.log(level="error", stage="engine",
+                        message=f"Engine stopped — {reason}: {detail}" + (f"\n{stack}" if stack else ""))
 
     def _run_replay(self) -> None:
         from data.market_data import get_bars
@@ -303,7 +429,12 @@ class AutoStrategyEngine:
         last_ts: dict[str, object] = {}
 
         for sym in self.symbols:
-            bars, src = self._fetcher(sym, self.timeframe, self.warmup + self.live_bars)
+            try:
+                bars, src = self._fetcher(sym, self.timeframe, self.warmup + self.live_bars)
+            except Exception as exc:  # initial warmup previously killed the thread silently
+                raise EngineFeedError(f"{sym} warmup failed: {exc}") from exc
+            if not (src or "").startswith("live"):
+                raise EngineFeedError(f"{sym} live feed unavailable (source: {src or 'none'})")
             self.last_source = src
             strat = self.strategy_factory(sym)
             closed = bars[:-1]                     # last candle may be in-progress
@@ -315,41 +446,22 @@ class AutoStrategyEngine:
                             message=f"{sym}: {src} — warmed {len(closed)} bars; "
                                     f"watching for new {self.timeframe} candles")
 
+        self._mark_running()
+
         while not self._stop.is_set():
             for sym in self.symbols:
                 if self._stop.is_set():
                     break
                 try:
                     bars, src = self._fetcher(sym, self.timeframe, max(self.warmup + 5, 60))
-                    self.last_source = src
-                    # Live mode but the feed isn't actually live -> it will never
-                    # deliver a NEW candle, so warn loudly (once per symbol, with
-                    # the REAL fetch error) instead of going quiet or spamming.
-                    if self.live and not (src or "").startswith("live"):
-                        if sym not in self._warned_fallback:
-                            self._warned_fallback.add(sym)
-                            err = None
-                            try:
-                                from data.live_data import last_error
-                                err = last_error(sym)
-                            except Exception:  # noqa: BLE001
-                                pass
-                            why = f" Live fetch error: {err}." if err else ""
-                            self.ledger.log(level="warning", stage="engine", symbol=sym,
-                                            message=(f"{sym}: live feed unavailable — using '{src}'.{why} "
-                                                     f"No new {self.timeframe} candles will arrive; "
-                                                     f"no trades will fire. Fix the feed (try HUB_EXCHANGE="
-                                                     f"kraken/coinbase — Binance blocks many cloud IPs) or "
-                                                     f"unset HUB_USE_LIVE_DATA for replay mode."))
-                    elif (src or "").startswith("live") and sym in self._warned_fallback:
-                        self._warned_fallback.discard(sym)
-                        self.ledger.log(level="info", stage="engine", symbol=sym,
-                                        message=f"{sym}: live feed recovered ({src}).")
-                except Exception as e:  # noqa: BLE001 — a fetch hiccup shouldn't stop the engine
-                    self.ledger.log(level="warning", stage="engine", symbol=sym,
-                                    message=f"{sym}: live fetch failed ({e})")
-                    continue
+                except Exception as exc:
+                    raise EngineFeedError(f"{sym} fetch failed: {exc}") from exc
+                self.last_source = src
+                if not (src or "").startswith("live"):
+                    raise EngineFeedError(f"{sym} live feed unavailable (source: {src or 'none'})")
+                self._mark_running()
                 last_ts[sym] = self._ingest(sym, strategies[sym], bars, last_ts[sym])
+                self._heartbeat()
             self._stop.wait(self.live_poll_s)
 
     def _ingest(self, sym, strat, bars, last_ts):
@@ -937,7 +1049,15 @@ class AutoStrategyEngine:
 
     def _route(self, payload: dict):
         try:
-            return self.pipeline.process(payload)
+            result = self.pipeline.process(payload)
+            fill = result.fill or {}
+            if result.accepted and fill.get("action") in ("opened", "closed", "reduced"):
+                self.last_trade = {
+                    "action": fill.get("action"), "symbol": payload.get("symbol"),
+                    "side": payload.get("side"), "price": fill.get("price") or payload.get("entry"),
+                    "timestamp": payload.get("timestamp"),
+                }
+            return result
         except Exception as e:  # noqa: BLE001 — a bad bar shouldn't stop the engine
             self.ledger.log(level="error", stage="engine",
                             message=f"Pipeline error on {payload.get('symbol')}: {e}",

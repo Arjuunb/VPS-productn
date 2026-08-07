@@ -370,6 +370,8 @@ def _apply_setting(key: str, value) -> None:
         pipeline.streak_risk_scaling = bool(int(value))
     elif key == "trading_mode":
         engine.trading_mode = str(value) if str(value) in ("full", "semi", "signal") else "full" 
+    elif key == "engine_desired_running":
+        engine.autostart_enabled = bool(int(value))
     elif key == "engine_timeframe":
         # applied before the startup event starts the engine, so a persisted
         # timeframe choice survives restarts/redeploys
@@ -412,6 +414,7 @@ def _settings_snapshot() -> dict:
         "streak_risk_scaling": 1 if pipeline.streak_risk_scaling else 0,
         "engine_symbols": ",".join(engine.symbols),
         "trading_mode": engine.trading_mode,
+        "engine_desired_running": 1 if engine.autostart_enabled else 0,
     }
 
 
