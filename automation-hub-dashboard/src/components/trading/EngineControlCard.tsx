@@ -83,6 +83,7 @@ export default function EngineControlCard({ engine, logs, onRefresh, toast }: Pr
         {detail("Configured symbols", engine?.symbols?.join(", "))}
         {detail("Timeframe", engine?.timeframe)}
         {detail("Active strategy", engine?.strategy)}
+        {detail("Position sizing", engine?.position_sizing_mode === "fixed" ? `Manual · ${engine?.fixed_position_size ?? "—"} units` : "Automatic · risk-based")}
         {detail("Exchange", engine?.connected_exchange)}
         {detail("Market feed", engine?.feed_status ?? engine?.websocket_status)}
         {detail("Market session (UTC)", engine?.market_session)}

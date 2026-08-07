@@ -91,6 +91,7 @@ export interface BotSettings {
     trading_days_mask: number;
     entry_mode: string; daily_report_hour: number;
     min_quality_score: number; streak_risk_scaling: boolean;
+    position_sizing_mode: "auto" | "fixed"; fixed_position_size: number;
   };
   readonly: {
     strategy: string; strategy_key: string; timeframe: string; symbols: string[];
@@ -386,6 +387,7 @@ export interface EngineStatus {
   halt_reason?: string | null; connected_exchange?: string; websocket_status?: string;
   market_session?: string; feed_status?: string; feed_error?: string | null;
   data_source?: string | null;
+  position_sizing_mode?: "auto" | "fixed"; fixed_position_size?: number;
   last_trade?: { action?: string; symbol?: string; side?: string; price?: number; timestamp?: string } | null;
 }
 export interface ControlState { state: "Active" | "Paused" | "Stopped"; }

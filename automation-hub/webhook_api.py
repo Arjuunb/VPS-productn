@@ -368,6 +368,10 @@ def _apply_setting(key: str, value) -> None:
         engine.min_quality_score = int(value)
     elif key == "streak_risk_scaling":
         pipeline.streak_risk_scaling = bool(int(value))
+    elif key == "position_sizing_mode":
+        pipeline.position_sizing_mode = "fixed" if str(value) == "fixed" else "auto"
+    elif key == "fixed_position_size":
+        pipeline.fixed_position_size = max(0.0, float(value))
     elif key == "trading_mode":
         engine.trading_mode = str(value) if str(value) in ("full", "semi", "signal") else "full" 
     elif key == "engine_desired_running":
@@ -412,6 +416,8 @@ def _settings_snapshot() -> dict:
         "daily_report_hour": daily_tasks.hour,
         "min_quality_score": engine.min_quality_score,
         "streak_risk_scaling": 1 if pipeline.streak_risk_scaling else 0,
+        "position_sizing_mode": pipeline.position_sizing_mode,
+        "fixed_position_size": pipeline.fixed_position_size,
         "engine_symbols": ",".join(engine.symbols),
         "trading_mode": engine.trading_mode,
         "engine_desired_running": 1 if engine.autostart_enabled else 0,
@@ -442,6 +448,8 @@ class SettingsUpdate(BaseModel):
     daily_report_hour: Optional[int] = None
     min_quality_score: Optional[int] = None
     streak_risk_scaling: Optional[bool] = None
+    position_sizing_mode: Optional[str] = None
+    fixed_position_size: Optional[float] = None
 
 
 class WebhookPayload(BaseModel):

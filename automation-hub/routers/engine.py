@@ -219,6 +219,8 @@ def _engine_payload() -> dict:
         # The paper engine uses server-side REST polling, not a hidden websocket.
         "websocket_status": "not used (REST polling)",
         "market_session": session,
+        "position_sizing_mode": _wa.pipeline.position_sizing_mode,
+        "fixed_position_size": _wa.pipeline.fixed_position_size,
     })
     return st
 

@@ -191,6 +191,8 @@ def get_settings():
             "daily_report_hour": _wa.daily_tasks.hour,
             "min_quality_score": _wa.engine.min_quality_score,
             "streak_risk_scaling": _wa.pipeline.streak_risk_scaling,
+            "position_sizing_mode": _wa.pipeline.position_sizing_mode,
+            "fixed_position_size": _wa.pipeline.fixed_position_size,
         },
         "readonly": {
             "strategy": _wa.engine.strategy_label,
@@ -286,6 +288,22 @@ def update_settings(body: _wa.SettingsUpdate, x_webhook_secret: _wa.Optional[str
     if body.streak_risk_scaling is not None:
         _wa.pipeline.streak_risk_scaling = bool(body.streak_risk_scaling)
         changed["streak_risk_scaling"] = bool(body.streak_risk_scaling)
+    proposed_sizing_mode = (body.position_sizing_mode if body.position_sizing_mode is not None
+                            else _wa.pipeline.position_sizing_mode)
+    proposed_fixed_size = (body.fixed_position_size if body.fixed_position_size is not None
+                           else _wa.pipeline.fixed_position_size)
+    if proposed_sizing_mode not in ("auto", "fixed"):
+        raise _wa.HTTPException(400, "position_sizing_mode must be 'auto' or 'fixed'")
+    if not (0 <= float(proposed_fixed_size) <= 1_000_000_000):
+        raise _wa.HTTPException(400, "fixed_position_size must be in [0, 1000000000]")
+    if proposed_sizing_mode == "fixed" and float(proposed_fixed_size) <= 0:
+        raise _wa.HTTPException(400, "fixed_position_size must be greater than zero in manual mode")
+    if body.position_sizing_mode is not None:
+        _wa.pipeline.position_sizing_mode = proposed_sizing_mode
+        changed["position_sizing_mode"] = proposed_sizing_mode
+    if body.fixed_position_size is not None:
+        _wa.pipeline.fixed_position_size = float(proposed_fixed_size)
+        changed["fixed_position_size"] = float(proposed_fixed_size)
 
     snap = _wa._settings_snapshot()
     _wa.save_overrides(_wa.settings.settings_path, snap)

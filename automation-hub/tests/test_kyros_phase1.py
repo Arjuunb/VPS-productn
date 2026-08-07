@@ -137,6 +137,15 @@ def test_pipeline_opens_paper_trade(pipeline, paper):
     assert res.fill["action"] == "opened"
 
 
+def test_pipeline_manual_fixed_size_still_uses_safety_caps(pipeline, paper):
+    pipeline.position_sizing_mode = "fixed"
+    pipeline.fixed_position_size = 3.0
+    res = pipeline.process(_alert(entry=100, stop=99))
+    assert res.accepted and res.fill["size"] == pytest.approx(3.0)
+    assert paper.positions()[0]["size"] == pytest.approx(3.0)
+    assert any(step.rule == "risk" and "manual fixed quantity" in step.detail for step in res.steps)
+
+
 def test_pipeline_rejects_duplicate(pipeline):
     assert pipeline.process(_alert(alert_id="dup")).accepted
     res = pipeline.process(_alert(alert_id="dup"))

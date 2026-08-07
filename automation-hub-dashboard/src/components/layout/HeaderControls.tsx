@@ -165,6 +165,18 @@ function StrategyMenu({ status }: { status?: SystemStatus }) {
                      key={`r${ed?.risk_per_trade_pct}`}
                      onBlur={(e) => { const v = Number(e.target.value) / 100; if (v > 0 && v <= 0.5 && v !== ed?.risk_per_trade_pct) void patch({ risk_per_trade_pct: v }, "Risk per trade updated."); }} />
             </label>
+            <label>Position size
+              <select value={ed?.position_sizing_mode ?? "auto"}
+                      onChange={(e) => void patch({ position_sizing_mode: e.target.value }, "Position sizing mode updated.")}>
+                <option value="auto">automatic (risk-based)</option>
+                <option value="fixed">manual fixed quantity</option>
+              </select>
+            </label>
+            {ed?.position_sizing_mode === "fixed" && <label>Manual quantity / lots
+              <input type="number" min={0.00000001} step="any" key={`ps${ed.fixed_position_size}`}
+                     defaultValue={ed.fixed_position_size ?? ""}
+                     onBlur={(e) => { const v = Number(e.target.value); if (v > 0 && v !== ed.fixed_position_size) void patch({ fixed_position_size: v }, "Manual position quantity updated."); }} />
+            </label>}
             <label>Max positions
               <input type="number" min={1} max={50} key={`m${ed?.max_open_positions}`}
                      defaultValue={ed?.max_open_positions ?? ""}

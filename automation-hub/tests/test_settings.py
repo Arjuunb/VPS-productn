@@ -18,6 +18,12 @@ def test_engine_desired_running_persists(tmp_path):
     assert load_overrides(path)["engine_desired_running"] == 0
 
 
+def test_position_sizing_settings_persist(tmp_path):
+    path = str(tmp_path / "sizing.json")
+    save_overrides(path, {"position_sizing_mode": "fixed", "fixed_position_size": 0.01})
+    assert load_overrides(path) == {"position_sizing_mode": "fixed", "fixed_position_size": 0.01}
+
+
 def test_load_missing_file_is_empty(tmp_path):
     assert load_overrides(str(tmp_path / "nope.json")) == {}
 
@@ -78,3 +84,15 @@ def test_post_settings_validates_range(client):
     r = client.post("/settings", json={"risk_per_trade_pct": 5},
                     headers={"X-Webhook-Secret": SECRET})
     assert r.status_code == 400
+
+
+def test_post_settings_applies_manual_position_size(client, tmp_path):
+    r = client.post("/settings", json={"position_sizing_mode": "fixed", "fixed_position_size": 0.02},
+                    headers={"X-Webhook-Secret": SECRET})
+    assert r.status_code == 200
+    import webhook_api
+    assert webhook_api.pipeline.position_sizing_mode == "fixed"
+    assert webhook_api.pipeline.fixed_position_size == 0.02
+    saved = load_overrides(str(tmp_path / "runtime.json"))
+    assert saved["position_sizing_mode"] == "fixed"
+    assert saved["fixed_position_size"] == 0.02

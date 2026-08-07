@@ -64,6 +64,8 @@ export default function SettingsPage() {
         cooldown: String(data.editable.cooldown_after_loss_min),
         entrymode: data.editable.entry_mode ?? "limit",
         reporthour: String(data.editable.daily_report_hour ?? 8),
+        sizingmode: data.editable.position_sizing_mode ?? "auto",
+        fixedsize: String(data.editable.fixed_position_size ?? 0),
       });
     }
   }, [data, f]);
@@ -89,6 +91,8 @@ export default function SettingsPage() {
         trading_days_mask: days.reduce((acc, on, i) => (on ? acc | (1 << i) : acc), 0),
         entry_mode: f.entrymode === "market" ? "market" : "limit",
         daily_report_hour: Math.round(Number(f.reporthour)),
+        position_sizing_mode: f.sizingmode === "fixed" ? "fixed" : "auto",
+        fixed_position_size: Number(f.fixedsize),
       });
       app.toast("Settings saved & applied (persisted on backend)", "success");
       refetch();
@@ -142,10 +146,21 @@ export default function SettingsPage() {
                 <option value="market">market (taker)</option>
               </select>
             </Field>
+            <Field label="Position sizing" hint="auto = risk-based; manual = your fixed base-asset quantity">
+              <select value={f.sizingmode ?? "auto"} onChange={(e) => setF((prev) => ({ ...prev, sizingmode: e.target.value }))}>
+                <option value="auto">automatic (risk-based)</option>
+                <option value="fixed">manual fixed quantity</option>
+              </select>
+            </Field>
+            <Field label="Manual quantity / lots" hint="native base units, e.g. 0.01 BTC; used only in manual mode">
+              <input value={f.fixedsize ?? ""} onChange={set("fixedsize")} inputMode="decimal"
+                disabled={(f.sizingmode ?? "auto") !== "fixed"} />
+            </Field>
             <Field label="Daily report hour (UTC)" hint="-1 disables the Telegram morning report">
               <input value={f.reporthour ?? ""} onChange={set("reporthour")} inputMode="numeric" />
             </Field>
           </div>
+          <p className="dim" style={{ marginTop: 8 }}>Manual quantity still obeys per-trade exposure, total portfolio exposure, loss limits, position limits, and entry validation. It does not enable live trading.</p>
         </Card>
       </div>
 

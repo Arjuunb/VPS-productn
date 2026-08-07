@@ -176,6 +176,8 @@ class SignalPipeline:
         max_correlated_positions: int = 2,
         max_total_exposure_pct: float = 0.10,
         equity_throttle: bool = True,
+        position_sizing_mode: str = "auto",
+        fixed_position_size: float = 0.0,
     ):
         self.ledger = ledger
         self.paper = paper
@@ -183,6 +185,11 @@ class SignalPipeline:
         self.equity = equity
         self.risk_per_trade_pct = risk_per_trade_pct
         self.exposure_limit_pct = exposure_limit_pct
+        # "auto" sizes each entry from stop distance and risk. "fixed" uses a
+        # deliberate base-asset quantity (for example 0.01 BTC), but still
+        # passes every downstream exposure, portfolio, loss and risk-engine gate.
+        self.position_sizing_mode = "fixed" if position_sizing_mode == "fixed" else "auto"
+        self.fixed_position_size = max(0.0, float(fixed_position_size))
         self.dedup = DuplicateGuard(ledger, dedup_window_s)
         # Fail-closed pre-trade safety gate (default = strong defaults).
         self.quality = quality or MarketQualityGate()
@@ -630,9 +637,13 @@ class SignalPipeline:
             allocator=af, event=econ_risk, boost=bf, context=xf, side=sfm,
             streak=self._streak_factor())
         eff_risk = _effective_risk(self.risk_per_trade_pct, factors)
-        size = size_position(self.equity, entry, stop, RiskRules(risk_per_trade_pct=eff_risk))
+        auto_size = size_position(self.equity, entry, stop, RiskRules(risk_per_trade_pct=eff_risk))
+        manual_sizing = self.position_sizing_mode == "fixed"
+        size = self.fixed_position_size if manual_sizing else auto_size
         if size <= 0:
-            return reject("sizing", "Computed position size is zero")
+            reason = ("Manual position quantity is not configured" if manual_sizing
+                      else "Computed position size is zero")
+            return reject("sizing", reason)
         # Immutable-at-entry evidence for the decision journal. This is a
         # receipt of the factors already used above, not a second sizing path.
         # Values are overwritten server-side so a webhook cannot fabricate the
@@ -640,7 +651,10 @@ class SignalPipeline:
         payload["journal_sizing"] = {
             "base_risk_pct": round(self.risk_per_trade_pct * 100, 4),
             "effective_risk_pct": round(eff_risk * 100, 4),
+            "mode": "manual_fixed" if manual_sizing else "automatic_risk",
+            "configured_fixed_size": round(self.fixed_position_size, 10) if manual_sizing else None,
             "computed_size": round(size, 10),
+            "risk_model_size": round(auto_size, 10),
             "modifiers": {
                 "confidence": round(factors.confidence, 4),
                 "kelly": round(factors.kelly, 4),
@@ -654,9 +668,14 @@ class SignalPipeline:
                 "account_loss_streak": round(factors.streak, 4),
             },
         }
-        steps.append(Step("risk", True,
-                          f"{_describe_factors(factors)}"
-                          f" → risk {eff_risk*100:.2f}% sized {size:.6f}"))
+        if manual_sizing:
+            steps.append(Step("risk", True,
+                              f"manual fixed quantity {size:.6f}; risk-model reference "
+                              f"{auto_size:.6f}; exposure and portfolio caps still apply"))
+        else:
+            steps.append(Step("risk", True,
+                              f"{_describe_factors(factors)}"
+                              f" → risk {eff_risk*100:.2f}% sized {size:.6f}"))
 
         # 5. exposure limit (cap notional to the per-trade limit)
         max_size = (self.exposure_limit_pct * self.equity) / entry if entry > 0 else 0.0
