@@ -388,6 +388,7 @@ export interface EngineStatus {
   market_session?: string; feed_status?: string; feed_error?: string | null;
   data_source?: string | null;
   position_sizing_mode?: "auto" | "fixed"; fixed_position_size?: number;
+  symbol_selection_mode?: "auto" | "manual"; auto_symbols?: string[]; manual_symbol?: string;
   last_trade?: { action?: string; symbol?: string; side?: string; price?: number; timestamp?: string } | null;
 }
 export interface ControlState { state: "Active" | "Paused" | "Stopped"; }

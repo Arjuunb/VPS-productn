@@ -19,6 +19,9 @@ export default function SettingsPage() {
   const [f, setF] = useState<Record<string, string>>({});
   const [days, setDays] = useState<boolean[]>([]);
   const [symbols, setSymbols] = useState("");
+  const [pairMode, setPairMode] = useState<"auto" | "manual">("auto");
+  const [manualPair, setManualPair] = useState("");
+  const [pairLoaded, setPairLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -28,11 +31,27 @@ export default function SettingsPage() {
     }
   }, [data, days]);
   useEffect(() => { if (engine.data && symbols === "") setSymbols(engine.data.symbols.join(", ")); }, [engine.data, symbols]);
+  useEffect(() => {
+    if (engine.data && !pairLoaded) {
+      setPairMode(engine.data.symbol_selection_mode === "manual" ? "manual" : "auto");
+      setManualPair(engine.data.manual_symbol ?? engine.data.symbols[0] ?? "BTCUSDT");
+      setPairLoaded(true);
+    }
+  }, [engine.data, pairLoaded]);
 
   const applySymbols = async () => {
     const list = symbols.split(",").map((s) => s.trim()).filter(Boolean);
     try { await apiPostJson("/market/symbols", { symbols: list }); app.toast(`Watchlist applied: ${list.join(", ")}`, "success"); }
     catch { app.toast("Apply failed", "error"); }
+  };
+  const applyPairSelection = async () => {
+    const symbol = manualPair.trim().toUpperCase();
+    if (pairMode === "manual" && !symbol) { app.toast("Enter one pair, for example BTCUSDT", "error"); return; }
+    try {
+      await apiPostJson("/engine/symbol-selection", { mode: pairMode, manual_symbol: symbol || undefined });
+      app.toast(pairMode === "manual" ? `Manual mode: only ${symbol} will trade` : "Automatic watchlist mode restored", "success");
+      engine.refetch();
+    } catch (error) { app.toast(error instanceof Error ? error.message : "Could not apply pair selection", "error"); }
   };
   const preset = (name: string) => { const [s, e] = SESSIONS[name]; setF((p) => ({ ...p, sstart: String(s), send: String(e) })); };
 
@@ -185,10 +204,27 @@ export default function SettingsPage() {
       </div>
 
       <div className="grid-2-eq">
-        <Card title="Market — Watchlist (Symbols)" subtitle="editable · restarts the engine">
+        <Card title="Pair Selection" subtitle="manual = exactly one pair · auto = configured watchlist">
+          <div className="form-grid-2">
+            <Field label="Trading pair mode">
+              <select value={pairMode} onChange={(e) => setPairMode(e.target.value === "manual" ? "manual" : "auto")}>
+                <option value="manual">manual — one selected pair</option>
+                <option value="auto">automatic — watchlist pairs</option>
+              </select>
+            </Field>
+            <Field label="Manual trading pair" hint="the only pair scanned and traded in manual mode">
+              <input value={manualPair} onChange={(e) => setManualPair(e.target.value.toUpperCase())}
+                disabled={pairMode !== "manual"} placeholder="BTCUSDT" />
+            </Field>
+          </div>
+          <button className="btn btn-primary" style={{ marginTop: 8 }} onClick={applyPairSelection}><Icon name="check" size={14} /> Apply pair mode</button>
+          <p className="dim" style={{ marginTop: 8 }}>Changing pair mode safely restarts the paper engine. Open paper positions remain managed; no live orders are possible.</p>
+        </Card>
+
+        <Card title="Automatic Watchlist" subtitle="used only when pair mode is automatic">
           <Field label="Traded symbols (comma-separated)"><input value={symbols} onChange={(e) => setSymbols(e.target.value.toUpperCase())} /></Field>
           <button className="btn btn-soft" style={{ marginTop: 8 }} onClick={applySymbols}><Icon name="check" size={14} /> Apply watchlist</button>
-          <p className="dim" style={{ marginTop: 8 }}>Sets which symbols the engine trades (paper). Restart-to-persist via HUB_AUTO_SYMBOLS.</p>
+          <p className="dim" style={{ marginTop: 8 }}>Sets the auto-mode watchlist. In manual mode it is saved but not traded until you switch back to automatic.</p>
         </Card>
 
         <Card title="Engine Timeframe" subtitle="editable · restarts the engine · persists across redeploys">

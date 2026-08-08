@@ -1553,17 +1553,23 @@ def strategy_compare(symbol: str = "BTCUSDT", timeframe: str = "4h",
 
 @router.post("/market/symbols")
 def set_symbols(body: _wa.SymbolsUpdate, x_webhook_secret: _wa.Optional[str] = _wa.Header(default=None)):
-    """Set the engine's traded symbols (the active watchlist) and restart it."""
+    """Set the automatic watchlist; it is active immediately only in auto mode."""
     _wa._check_secret(x_webhook_secret)
     syms = [s.strip().upper() for s in body.symbols if s.strip()]
     if not syms:
         raise _wa.HTTPException(400, "At least one symbol is required")
-    _wa.engine.reconfigure(symbols=syms, timeframe=_wa.engine.timeframe,
-                       strategy_factory=_wa.engine.strategy_factory, label=_wa.engine.strategy_label)
+    _wa.engine.auto_symbols = syms
+    if _wa.engine.symbol_selection_mode == "auto":
+        if _wa.engine.running:
+            _wa.engine.reconfigure(symbols=syms, timeframe=_wa.engine.timeframe,
+                                   strategy_factory=_wa.engine.strategy_factory, label=_wa.engine.strategy_label)
+        else:
+            _wa.engine.symbols = syms
     # persist so the watchlist survives a server restart/redeploy
     _wa.save_overrides(_wa.settings.settings_path, _wa._settings_snapshot())
-    _wa.ledger.log(level="info", stage="audit", message=f"Watchlist applied: {', '.join(syms)}")
-    return {"applied": True, "symbols": _wa.engine.symbols}
+    _wa.ledger.log(level="info", stage="audit", message=f"Automatic watchlist applied: {', '.join(syms)}")
+    return {"applied": True, "symbols": _wa.engine.symbols,
+            "selection_mode": _wa.engine.symbol_selection_mode}
 
 @router.get("/strategy/list")
 def strategy_list():

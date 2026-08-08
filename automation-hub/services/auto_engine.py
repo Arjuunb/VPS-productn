@@ -71,6 +71,12 @@ class AutoStrategyEngine:
         self.paper = paper
         self.ledger = ledger
         self.symbols = symbols or ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        # Pair-selection state is separate from the active scan list. Manual
+        # mode reduces ``symbols`` to exactly one selected market; auto mode
+        # restores the saved watchlist. Both survive dashboard refreshes.
+        self.symbol_selection_mode = "auto"
+        self.auto_symbols = list(self.symbols)
+        self.manual_symbol = self.symbols[0] if self.symbols else "BTCUSDT"
         self.timeframe = timeframe
         self.interval = interval
         self.warmup = warmup
@@ -279,6 +285,9 @@ class AutoStrategyEngine:
         return {
             "running": self.running,
             "symbols": self.symbols,
+            "symbol_selection_mode": self.symbol_selection_mode,
+            "auto_symbols": self.auto_symbols,
+            "manual_symbol": self.manual_symbol,
             "timeframe": self.timeframe,
             "interval": self.interval,
             "mode": "live" if self.live else "replay",

@@ -256,6 +256,22 @@ def test_engine_lifecycle_control_endpoints(client):
     assert {"state", "last_heartbeat", "recommended_action", "market_session"} <= set(status)
 
 
+def test_manual_pair_selection_runs_exactly_one_symbol(client):
+    headers = {"X-Webhook-Secret": SECRET}
+    r = client.post("/engine/symbol-selection", json={
+        "mode": "manual", "manual_symbol": "ETHUSDT",
+        "auto_symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+    }, headers=headers)
+    assert r.status_code == 200
+    status = r.json()["status"]
+    assert status["symbol_selection_mode"] == "manual"
+    assert status["manual_symbol"] == "ETHUSDT"
+    assert status["symbols"] == ["ETHUSDT"]
+    auto = client.post("/engine/symbol-selection", json={"mode": "auto"}, headers=headers)
+    assert auto.status_code == 200
+    assert auto.json()["status"]["symbols"] == ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+
 def test_webhook_rejects_missing_secret(client):
     r = client.post("/webhook/tradingview", json=_alert())
     assert r.status_code == 401

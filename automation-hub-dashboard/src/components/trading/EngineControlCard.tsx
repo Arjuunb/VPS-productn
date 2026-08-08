@@ -81,6 +81,7 @@ export default function EngineControlCard({ engine, logs, onRefresh, toast }: Pr
         {detail("Engine uptime", uptime(engine?.uptime_s ?? undefined))}
         {detail("Current symbol", engine?.current_symbol ?? "Waiting for market data")}
         {detail("Configured symbols", engine?.symbols?.join(", "))}
+        {detail("Pair mode", engine?.symbol_selection_mode === "manual" ? `Manual · ${engine?.manual_symbol ?? "—"}` : `Automatic · ${(engine?.auto_symbols ?? engine?.symbols ?? []).length} pairs`)}
         {detail("Timeframe", engine?.timeframe)}
         {detail("Active strategy", engine?.strategy)}
         {detail("Position sizing", engine?.position_sizing_mode === "fixed" ? `Manual · ${engine?.fixed_position_size ?? "—"} units` : "Automatic · risk-based")}

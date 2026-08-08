@@ -233,6 +233,38 @@ def engine_start(x_webhook_secret: _wa.Optional[str] = _wa.Header(default=None))
     _wa.ledger.log(level="info", stage="engine", message=f"Operator requested engine start (started={started})")
     return {"started": started, "status": _engine_payload()}
 
+
+@router.post("/engine/symbol-selection")
+def engine_symbol_selection(body: _wa.SymbolSelectionUpdate,
+                            x_webhook_secret: _wa.Optional[str] = _wa.Header(default=None)):
+    """Persist and apply one-pair manual mode or the automatic watchlist."""
+    _wa._check_secret(x_webhook_secret)
+    mode = (body.mode or "").strip().lower()
+    if mode not in ("manual", "auto"):
+        raise _wa.HTTPException(400, "mode must be 'manual' or 'auto'")
+    auto_symbols = ([s.strip().upper() for s in (body.auto_symbols or _wa.engine.auto_symbols) if s.strip()]
+                    or list(_wa.engine.auto_symbols))
+    if not auto_symbols:
+        raise _wa.HTTPException(400, "At least one automatic watchlist symbol is required")
+    manual_symbol = (body.manual_symbol or _wa.engine.manual_symbol or auto_symbols[0]).strip().upper()
+    if not manual_symbol:
+        raise _wa.HTTPException(400, "A manual symbol is required")
+    target = [manual_symbol] if mode == "manual" else auto_symbols
+    _wa.engine.symbol_selection_mode = mode
+    _wa.engine.manual_symbol = manual_symbol
+    _wa.engine.auto_symbols = auto_symbols
+    if _wa.engine.running:
+        _wa.engine.reconfigure(symbols=target, timeframe=_wa.engine.timeframe,
+                               strategy_factory=_wa.engine.strategy_factory,
+                               label=_wa.engine.strategy_label)
+    else:
+        _wa.engine.symbols = target
+    _wa.save_overrides(_wa.settings.settings_path, _wa._settings_snapshot())
+    descriptor = manual_symbol if mode == "manual" else ", ".join(auto_symbols)
+    _wa.ledger.log(level="info", stage="audit",
+                   message=f"Pair selection set to {mode}: {descriptor}")
+    return {"applied": True, "status": _engine_payload()}
+
 @router.post("/engine/pause")
 def engine_pause(x_webhook_secret: _wa.Optional[str] = _wa.Header(default=None)):
     _wa._check_secret(x_webhook_secret)

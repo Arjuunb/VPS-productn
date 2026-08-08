@@ -372,6 +372,16 @@ def _apply_setting(key: str, value) -> None:
         pipeline.position_sizing_mode = "fixed" if str(value) == "fixed" else "auto"
     elif key == "fixed_position_size":
         pipeline.fixed_position_size = max(0.0, float(value))
+    elif key == "symbol_selection_mode":
+        engine.symbol_selection_mode = "manual" if str(value) == "manual" else "auto"
+    elif key == "manual_symbol":
+        symbol = str(value).strip().upper()
+        if symbol:
+            engine.manual_symbol = symbol
+    elif key == "auto_symbols":
+        syms = [x.strip().upper() for x in str(value).split(",") if x.strip()]
+        if syms:
+            engine.auto_symbols = syms
     elif key == "trading_mode":
         engine.trading_mode = str(value) if str(value) in ("full", "semi", "signal") else "full" 
     elif key == "engine_desired_running":
@@ -419,6 +429,9 @@ def _settings_snapshot() -> dict:
         "position_sizing_mode": pipeline.position_sizing_mode,
         "fixed_position_size": pipeline.fixed_position_size,
         "engine_symbols": ",".join(engine.symbols),
+        "symbol_selection_mode": engine.symbol_selection_mode,
+        "manual_symbol": engine.manual_symbol,
+        "auto_symbols": ",".join(engine.auto_symbols),
         "trading_mode": engine.trading_mode,
         "engine_desired_running": 1 if engine.autostart_enabled else 0,
     }
@@ -426,6 +439,13 @@ def _settings_snapshot() -> dict:
 
 for _k, _v in load_overrides(settings.settings_path).items():
     _apply_setting(_k, _v)
+
+# Legacy installations only have engine_symbols. New installs preserve the
+# full auto watchlist and activate exactly one pair when manual mode is saved.
+if engine.symbol_selection_mode == "manual" and engine.manual_symbol:
+    engine.symbols = [engine.manual_symbol]
+elif engine.auto_symbols:
+    engine.symbols = list(engine.auto_symbols)
 
 router = APIRouter()
 
@@ -1022,6 +1042,12 @@ def _default_base_spec(strategy: str, symbol: str = "BTCUSDT") -> dict:
 
 class SymbolsUpdate(BaseModel):
     symbols: list[str]
+
+
+class SymbolSelectionUpdate(BaseModel):
+    mode: str
+    manual_symbol: Optional[str] = None
+    auto_symbols: Optional[list[str]] = None
 
 
 
