@@ -262,6 +262,7 @@ instance_manager = TradingInstanceManager(
     ledger, strategy_factory=_make_instance_strategy, live=settings.use_live_data,
     live_poll_s=settings.live_poll_s,
     fetcher=ws_feed.make_fetcher(_default_fetcher) if settings.use_live_data else None,
+    decision_store=decision_store,
 )
 
 # Semi-auto / signal trading modes: the human-approval queue for entries.

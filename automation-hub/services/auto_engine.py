@@ -63,6 +63,8 @@ class AutoStrategyEngine:
         live: bool = False,
         live_poll_s: float = 60.0,
         fetcher: Optional[Callable[[str, str, int], tuple]] = None,
+        initial_last_processed_candle: Optional[str] = None,
+        candle_checkpoint: Optional[Callable[[str], None]] = None,
         trade_manager=None,
         entry_mode: Optional[str] = None,
         limit_ttl_bars: int = 3,
@@ -92,6 +94,16 @@ class AutoStrategyEngine:
         self.live = live
         self.live_poll_s = live_poll_s
         self._fetcher = fetcher or _default_fetcher
+        # A Trading Instance supplies these to make forward processing survive
+        # a worker/container restart.  The legacy engine leaves them unset.
+        self.last_processed_candle = initial_last_processed_candle
+        self._candle_checkpoint = candle_checkpoint
+        self.last_closed_candle: Optional[str] = None
+        self.warmup_bars = 0
+        self.market_data_status = "replay" if not live else "warming_up"
+        self.duplicate_candles_ignored = 0
+        self.missing_candles = 0
+        self.out_of_order_candles = 0
         # Human-readable label for the active strategy (shown on the Bots page).
         try:
             probe = strategy_factory(self.symbols[0]) if self.symbols else None
@@ -277,6 +289,8 @@ class AutoStrategyEngine:
             pass
         if not self.live:
             return "replay", err
+        if self.market_data_status == "stale":
+            return "stale", self.last_error or err
         src = self.last_source or ""
         if src.startswith("live"):
             return ("connected" if self.stats["bars"] > 0 else "waiting-for-candle"), None
@@ -314,6 +328,14 @@ class AutoStrategyEngine:
             "data_source": self.last_source,
             "feed_status": feed,             # connected | waiting-for-candle | fallback | failed | replay
             "feed_error": feed_err,          # last real fetch error, if any
+            "market_data_status": self.market_data_status,
+            "last_closed_candle": self.last_closed_candle,
+            "last_processed_candle_timestamp": self.last_processed_candle,
+            "warmup_bars": self.warmup_bars,
+            "warmup_required": self.warmup,
+            "duplicate_candles_ignored": self.duplicate_candles_ignored,
+            "missing_candles": self.missing_candles,
+            "out_of_order_candles": self.out_of_order_candles,
             "entry_mode": self.entry_mode,
             "pending_orders": len(self._pending),
             "missed_entries": self.stats_missed_entries,
@@ -446,7 +468,7 @@ class AutoStrategyEngine:
 
         for sym in self.symbols:
             try:
-                bars, src = self._fetcher(sym, self.timeframe, self.warmup + self.live_bars)
+                bars, src = self._forward_fetch(sym, self.warmup + self.live_bars)
             except Exception as exc:  # initial warmup previously killed the thread silently
                 raise EngineFeedError(f"{sym} warmup failed: {exc}") from exc
             if not (src or "").startswith("live"):
@@ -454,13 +476,38 @@ class AutoStrategyEngine:
             self.last_source = src
             strat = self.strategy_factory(sym)
             closed = bars[:-1]                     # last candle may be in-progress
-            for b in closed:                       # warm indicators, do NOT trade history
+            if not closed:
+                raise EngineFeedError(f"{sym} live feed returned no closed candles")
+            self._record_market_snapshot(sym, closed)
+            persisted = self._parse_timestamp(self.last_processed_candle)
+            # On recovery indicators are warmed only through the persisted
+            # cursor.  Newer bars are then processed chronologically below;
+            # warming through them first would leak future information.
+            warm = [b for b in closed if persisted is None or b.timestamp <= persisted]
+            if persisted is not None and len(warm) < self.warmup:
+                # The provider's regular window is not long enough to rebuild
+                # state safely from the cursor.  Do not replay/guess; fail
+                # closed and let the bounded reconnect/recovery path retry.
+                raise EngineFeedError(f"{sym} cannot rebuild {self.warmup}-bar warm-up before persisted candle")
+            for b in (warm[-self.warmup:] if persisted is not None else closed[-self.warmup:]):
                 strat.bars.append(b)
             strategies[sym] = strat
-            last_ts[sym] = closed[-1].timestamp if closed else None
+            self.warmup_bars = len(strat.bars)
+            if persisted is None:
+                # First forward start: historical bars initialise indicators
+                # only.  They can never create a paper trade.
+                last_ts[sym] = closed[-1].timestamp
+                self.last_processed_candle = last_ts[sym].isoformat()
+                self._checkpoint_candle(self.last_processed_candle)
+            else:
+                last_ts[sym] = persisted
+                # Recover missed *closed* candles once and in chronological
+                # order. _ingest ignores the persisted candle itself.
+                last_ts[sym] = self._ingest(sym, strat, closed, last_ts[sym])
             self.ledger.log(level="info", stage="engine", symbol=sym,
-                            message=f"{sym}: {src} — warmed {len(closed)} bars; "
-                                    f"watching for new {self.timeframe} candles")
+                            message=f"market_data_connected symbol={sym} timeframe={self.timeframe} source={src}")
+            self.ledger.log(level="info", stage="engine", symbol=sym,
+                            message=f"warmup_complete bars={self.warmup_bars} last_closed={self.last_closed_candle}")
 
         self._mark_running()
 
@@ -469,26 +516,79 @@ class AutoStrategyEngine:
                 if self._stop.is_set():
                     break
                 try:
-                    bars, src = self._fetcher(sym, self.timeframe, max(self.warmup + 5, 60))
+                    bars, src = self._forward_fetch(sym, max(self.warmup + 5, 60))
                 except Exception as exc:
                     raise EngineFeedError(f"{sym} fetch failed: {exc}") from exc
                 self.last_source = src
                 if not (src or "").startswith("live"):
                     raise EngineFeedError(f"{sym} live feed unavailable (source: {src or 'none'})")
+                closed = bars[:-1]
+                if not closed:
+                    raise EngineFeedError(f"{sym} provider returned no closed candles")
+                self._record_market_snapshot(sym, closed)
                 self._mark_running()
-                last_ts[sym] = self._ingest(sym, strategies[sym], bars, last_ts[sym])
+                last_ts[sym] = self._ingest(sym, strategies[sym], closed, last_ts[sym])
                 self._heartbeat()
             self._stop.wait(self.live_poll_s)
 
     def _ingest(self, sym, strat, bars, last_ts):
-        """Process only CLOSED bars newer than ``last_ts``; return updated last_ts."""
-        closed = bars[:-1] if len(bars) > 1 else []   # drop in-progress last candle
-        for b in closed:
+        """Process closed forward bars once; caller already removed forming bar."""
+        previous = last_ts
+        for b in sorted(bars, key=lambda item: item.timestamp):
+            if last_ts is not None and b.timestamp <= last_ts:
+                self.duplicate_candles_ignored += 1
+                continue
+            if last_ts is not None and b.timestamp < previous:
+                self.out_of_order_candles += 1
+                continue
+            if last_ts is not None:
+                gap_s = (b.timestamp - last_ts).total_seconds()
+                expected = _TF_SECONDS.get(self.timeframe, 3600)
+                if gap_s > expected * 1.5:
+                    self.missing_candles += max(0, int(gap_s // expected) - 1)
             if last_ts is None or b.timestamp > last_ts:
                 self._process_bar(sym, b, strat)
                 self.stats["bars"] += 1
                 last_ts = b.timestamp
+                self.last_processed_candle = last_ts.isoformat()
+                self._checkpoint_candle(self.last_processed_candle)
+                self.ledger.log(level="info", stage="engine", symbol=sym,
+                                message=f"candle_processed timestamp={self.last_processed_candle}")
         return last_ts
+
+    def _forward_fetch(self, symbol: str, limit: int):
+        """Call a strict forward fetcher; historical sources are rejected."""
+        bars, source = self._fetcher(symbol, self.timeframe, limit)
+        if not str(source or "").startswith("live"):
+            raise EngineFeedError(f"forward paper requires live provider data, got {source or 'none'}")
+        return bars, source
+
+    @staticmethod
+    def _parse_timestamp(value):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+
+    def _checkpoint_candle(self, timestamp: str) -> None:
+        if self._candle_checkpoint is None:
+            return
+        try:
+            self._candle_checkpoint(timestamp)
+        except Exception as exc:  # persistence is critical for exactly-once
+            raise EngineFeedError(f"candle cursor persistence failed: {exc}") from exc
+
+    def _record_market_snapshot(self, symbol, closed) -> None:
+        newest = closed[-1]
+        self.last_closed_candle = newest.timestamp.isoformat()
+        age = (datetime.now(timezone.utc) - newest.timestamp).total_seconds()
+        allowed_age = _TF_SECONDS.get(self.timeframe, 3600) * 1.5
+        if age > allowed_age:
+            self.market_data_status = "stale"
+            raise EngineFeedError(f"{symbol} market data stale: age={age:.0f}s allowed={allowed_age:.0f}s")
+        self.market_data_status = "healthy"
 
     def _load_batch(self, sym, strategies, live, seeds, get_bars) -> None:
         bars, src = get_bars(sym, n=self.warmup + self.live_bars,
@@ -853,6 +953,12 @@ class AutoStrategyEngine:
                 confidence=getattr(signal, "confidence", None), verdict=v,
                 min_score=self.min_quality_score,
                 regime_hint=getattr(signal, "regime", ""))
+            # InstanceLedger carries the persisted ownership boundary.  Keep
+            # decision history in that same boundary so the UI never credits a
+            # BTC decision from another strategy/instance to this worker.
+            instance_id = getattr(self.ledger, "instance_id", "")
+            if instance_id:
+                decision["instance_id"] = instance_id
             if self.decisions is not None:
                 try:
                     decision_id = self.decisions.record(decision)

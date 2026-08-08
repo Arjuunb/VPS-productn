@@ -206,6 +206,57 @@ lack a strategy id. The collector deliberately reports those as **unknown** and
 labels missing strategy attribution **UNATTRIBUTED LEGACY RUN**. It must not
 guess a strategy based on a profitable result.
 
+### Actual VPS snapshot — 2026-08-08
+
+The collector was run in the production app container on 2026-08-08. This is
+real runtime evidence, not an `.env.example` inference:
+
+| Area | Observed value | Consequence |
+| --- | --- | --- |
+| Data mode | `HUB_USE_LIVE_DATA=0`; V2 disabled | Workers are in historical replay mode, not forward paper-trading mode. |
+| Legacy cache | BTCUSDT 5m: 6,000 real cached candles, 2026-07-11T05:40Z to 2026-08-01T01:35Z | The data exists but is stale relative to the audit date. No current market candle can arrive in this mode. |
+| Legacy runtime selection | Supertrend / BTCUSDT / 5m / limit / manual symbol / fixed `0.3` | This is the legacy autonomous-engine configuration. It is not proof that an active Trading Instance uses those settings. |
+| Legacy engine state | Startup logged: `restored 2 trading instance worker(s); legacy autonomous engine remains stopped` | A stopped legacy engine is expected in this instance-first deployment; it is not a worker crash. |
+| Current settings mirror | Supabase connected | Settings and ledger data survived restart and the collector had access to the production source of truth. |
+
+The replay loop loads 150 warm-up bars plus 250 tradeable bars. When a local
+cache is present, it then reloads the same newest cache window after exhausting
+the 250 bars. With live data disabled, a static cache can therefore be replayed
+again rather than being replaced with a newly closed market candle. The
+attributed BTC Supertrend sequence (371 closed trades in about 22 hours) is
+consistent with repeated fast replay of stale history. It is **not evidence of
+371 independent live 5-minute opportunities** and must not be used to estimate
+live profitability.
+
+The real cached BTC 5m data rules out the synthetic-fallback concern for the
+observed BTC replay. It does not make the result forward-valid: its final
+candle is a week old and the same replay window can recur.
+
+The 469 closed Supabase paper trades show no reconstructable 500 → 2,500 run.
+The largest correctly attributed group is BTCUSDT Supertrend, 5m, 371 closed
+trades, 50.9% win rate, PF 2.66, average R +0.859, and 1,000 → 1,022.69. Its
+ledger schema does not store entry-mode or fill-model attribution. Earlier
+multi-pair rows are correctly retained as **UNATTRIBUTED LEGACY RUN** rather
+than being credited to Supertrend.
+
+#### Instance-versus-legacy control boundary
+
+This VPS has two restored Trading Instance workers. An instance worker is
+constructed from its own persisted `symbol`, `strategy_key`, `timeframe`,
+`risk_per_trade_pct`, and `capital_allocation`; it uses the global
+`HUB_USE_LIVE_DATA` mode but does not consume the legacy runtime settings for
+manual symbol selection, fixed position sizing, daily-loss limit, drawdown
+limit, or quality threshold. In particular, the instance constructor currently
+uses automatic sizing by default even though the legacy runtime mirror reports
+`position_sizing_mode=fixed` and `fixed_position_size=0.3`.
+
+Therefore the visible global settings panel can describe the stopped legacy
+engine while the active instance workers continue under their own persisted
+configuration. This is a confirmed explanation for confusing dashboard state
+and for historical BTC and ETH trades appearing despite a legacy manual BTC
+selection. It is an architecture/control-scope finding, not a change to either
+strategy formula.
+
 ### Full production-pipeline fixture: execution realism and entry mode
 
 The following is a second controlled test on the same bundled 2,000-bar BTC

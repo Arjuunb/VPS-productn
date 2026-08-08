@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS trading_instances (
  mode TEXT NOT NULL, state TEXT NOT NULL, desired_running BOOLEAN NOT NULL DEFAULT FALSE,
  created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL, last_error TEXT NOT NULL DEFAULT ''
 );
+ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS market_data_mode TEXT NOT NULL DEFAULT 'paper_forward';
 CREATE TABLE IF NOT EXISTS instance_metrics (
  instance_id TEXT PRIMARY KEY REFERENCES trading_instances(id) ON DELETE CASCADE,
  data_json JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL
@@ -20,6 +21,22 @@ CREATE TABLE IF NOT EXISTS instance_metrics (
 CREATE TABLE IF NOT EXISTS instance_engine_logs (
  id TEXT PRIMARY KEY, instance_id TEXT NOT NULL REFERENCES trading_instances(id) ON DELETE CASCADE,
  ts TIMESTAMPTZ NOT NULL, level TEXT NOT NULL, message TEXT NOT NULL
+);
+-- Durable forward-paper cursor. Each active Paper Trading instance stores the
+-- last closed candle it actually processed, so a restart can request only
+-- newer candles and cannot replay historical opportunities as new trades.
+CREATE TABLE IF NOT EXISTS instance_market_state (
+ instance_id TEXT PRIMARY KEY REFERENCES trading_instances(id) ON DELETE CASCADE,
+ last_processed_candle_timestamp TIMESTAMPTZ,
+ market_data_mode TEXT NOT NULL DEFAULT 'paper_forward',
+ market_data_status TEXT NOT NULL DEFAULT 'stopped',
+ last_market_data_timestamp TIMESTAMPTZ,
+ data_source TEXT,
+ warmup_bars INTEGER NOT NULL DEFAULT 0,
+ duplicate_candles INTEGER NOT NULL DEFAULT 0,
+ missing_candles INTEGER NOT NULL DEFAULT 0,
+ out_of_order_candles INTEGER NOT NULL DEFAULT 0,
+ updated_at TIMESTAMPTZ NOT NULL
 );
 CREATE TABLE IF NOT EXISTS trading_instance_platform_settings (
  id TEXT PRIMARY KEY, max_active_slots INTEGER NOT NULL DEFAULT 1,

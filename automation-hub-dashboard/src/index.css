@@ -694,6 +694,34 @@ a.brand:hover { opacity: 0.85; }
 .best-instance-insight span { color: var(--dim); font-size: 11.5px; }
 .best-instance-insight b { color: var(--green); font-size: 12.5px; }
 
+/* Trading Instances reference layout.  The data remains sourced from the
+   consolidated instance DTO; these classes only make its dense terminal
+   hierarchy legible at a glance. */
+.instance-overview { grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 0; border: 1px solid var(--card-border); border-radius: var(--radius); overflow: hidden; background: var(--card-1); }
+.instance-overview .stat-card { min-height: 88px; border: 0; border-right: 1px solid var(--card-border); border-radius: 0; box-shadow: none; padding: 13px 15px; }
+.instance-overview .stat-card:last-child { border-right: 0; }
+.instance-overview .stat-value { font-size: 19px; }
+.instances-control-grid { display: grid; grid-template-columns: minmax(330px, 1.1fr) minmax(260px, .78fr) minmax(460px, 1.55fr); gap: 14px; align-items: stretch; }
+.instances-control-grid > .card { min-width: 0; }
+.instance-control-card .form-grid-2 { gap: 9px 12px; }
+.instance-filter-card .form-grid-2 { grid-template-columns: 1fr; gap: 8px; }
+.instance-filter-card .field-label { font-size: 11px; }
+.instance-filter-card .field input, .instance-filter-card .field select { padding: 7px 9px; font-size: 12px; }
+.instance-health-card .card-body { padding: 0; }
+.instance-health-card .dim { margin: 10px 14px !important; }
+.instance-health-card .data-table { font-size: 11.5px; }
+.instance-health-card .data-table th, .instance-health-card .data-table td { padding: 8px 10px; }
+.instance-active-card > .card-body { padding: 0; }
+.instance-worker-row { display: grid; grid-template-columns: minmax(178px, 1.1fr) minmax(190px, 1.05fr) minmax(220px, 1.2fr) minmax(200px, 1.12fr) minmax(178px, 1fr); border-top: 1px solid var(--card-border); background: linear-gradient(90deg, rgba(255,255,255,.015), transparent); }
+.instance-worker-row:first-child { border-top: 0; }
+.instance-worker-column { padding: 14px 15px; min-width: 0; border-right: 1px solid var(--card-border); font-size: 12px; }
+.instance-worker-column:last-child { border-right: 0; }
+.instance-worker-column h3 { margin: 9px 0 2px; font-size: 18px; letter-spacing: -.2px; }
+.instance-worker-column .dim { font-size: 11px; }
+.instance-worker-column .detail-label { font-size: 10px; }
+.instance-worker-actions { margin-top: 11px; }
+.instance-worker-row .btn-link { padding-left: 0; font-size: 11px; }
+
 /* page grids */
 .grid-2-1 { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; }
 .grid-2-1 .span-2 { grid-column: auto; }
@@ -789,12 +817,21 @@ a.brand:hover { opacity: 0.85; }
   .stat-row, .stat-row.six { grid-template-columns: repeat(3, 1fr); }
   .instance-summary-row { grid-template-columns: repeat(3, 1fr); }
   .strategy-grid, .grid-3-eq { grid-template-columns: 1fr 1fr; }
+  .instance-overview { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .instance-overview .stat-card:nth-child(3n) { border-right: 0; }
+  .instance-overview .stat-card:nth-child(-n+3) { border-bottom: 1px solid var(--card-border); }
+  .instances-control-grid { grid-template-columns: 1fr 1fr; }
+  .instance-health-card { grid-column: 1 / -1; }
+  .instance-worker-row { overflow-x: auto; min-width: 1000px; }
+  .instance-active-card { overflow-x: auto; }
 }
 @media (max-width: 900px) {
   .grid-2-1, .grid-2-eq, .grid-3-eq, .strategy-grid { grid-template-columns: 1fr; }
   .stat-row, .stat-row.six { grid-template-columns: repeat(2, 1fr); }
   .instance-summary-row { grid-template-columns: repeat(2, 1fr); }
   .form-grid-3 { grid-template-columns: 1fr 1fr; }
+  .instances-control-grid { grid-template-columns: 1fr; }
+  .instance-health-card { grid-column: auto; }
 }
 @media (max-width: 600px) {
   .active-instances-title, .instance-empty { align-items: flex-start; flex-direction: column; }
@@ -802,6 +839,10 @@ a.brand:hover { opacity: 0.85; }
   .instance-summary-foot { flex-wrap: wrap; }
   .instance-summary-foot > span:nth-child(2) { text-align: left; flex: auto; }
   .best-instance-insight { align-items: flex-start; flex-direction: column; gap: 3px; }
+  .instance-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .instance-overview .stat-card { border-bottom: 1px solid var(--card-border); }
+  .instance-overview .stat-card:nth-child(2n) { border-right: 0; }
+  .instance-overview .stat-card:nth-last-child(-n+2) { border-bottom: 0; }
 }
 
 /* button variants + interaction polish (per-bot detail, run state) */

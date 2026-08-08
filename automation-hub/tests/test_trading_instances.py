@@ -1,4 +1,5 @@
 from data.ledger import SqliteLedger
+from data.decision_store import DecisionStore
 from execution.paper_engine import PaperExecutionEngine
 from services.trading_instances import InstanceLedger, ResearchExecutionEngine, TradingInstanceManager
 
@@ -75,3 +76,24 @@ def test_instances_api_returns_platform_status_and_validates_slot_change(monkeyp
     assert payload["max_active_slots"] == 1
     updated = instance_api.configure_platform(instance_api.PlatformConfig(max_active_slots=3))
     assert updated["max_active_slots"] == 3
+
+
+def test_instance_status_exposes_only_its_scoped_last_decision_and_real_aggregate_fields():
+    ledger = SqliteLedger(":memory:")
+    decisions = DecisionStore(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60,
+                                     decision_store=decisions)
+    instance = manager.create(symbol="BTCUSDT", strategy_key="brain", strategy_label="Decision Brain",
+                              strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+                              capital_allocation=1_000)
+    decisions.record({"symbol": "BTCUSDT", "decision": "accepted", "instance_id": instance.id,
+                      "strategy": "Decision Brain", "timeframe": "5m"})
+    decisions.record({"symbol": "ETHUSDT", "decision": "rejected", "instance_id": "other"})
+    status = manager.status(instance.id)
+    assert status["last_decision"]["instance_id"] == instance.id
+    assert status["configuration"]["capital_allocation"] == 1_000
+    assert status["execution"]["current_equity"] == 1_000
+    assert status["market_data"]["market_data_status"] == "stopped"
+    platform = manager.platform_status()
+    assert platform["total_allocated_capital"] == 1_000
+    assert platform["total_instances"] == 1

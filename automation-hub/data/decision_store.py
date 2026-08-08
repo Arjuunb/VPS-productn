@@ -13,7 +13,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Optional
 
-from data.tenant_scope import ensure_tenant_column
+from data.tenant_scope import ensure_column, ensure_tenant_column
 
 
 def _utcnow() -> str:
@@ -45,10 +45,13 @@ class DecisionStore:
                    decision TEXT NOT NULL,      -- accepted | rejected
                    reason TEXT,
                    executed INTEGER NOT NULL DEFAULT 0,
-                   components_json TEXT
+                   components_json TEXT,
+                   instance_id TEXT NOT NULL DEFAULT ''
                )""")
         self._c.execute("CREATE INDEX IF NOT EXISTS ix_decisions_ts ON decisions(ts)")
         self._c.execute("CREATE INDEX IF NOT EXISTS ix_decisions_decision ON decisions(decision)")
+        ensure_column(self._c, "decisions", "instance_id", "TEXT NOT NULL DEFAULT ''")
+        self._c.execute("CREATE INDEX IF NOT EXISTS ix_decisions_instance_ts ON decisions(instance_id, ts)")
         ensure_tenant_column(self._c, "decisions")   # Phase C-3: schema-only, additive
         self._c.commit()
 
@@ -59,8 +62,8 @@ class DecisionStore:
                    (ts, symbol, timeframe, strategy, side, regime, htf_bias,
                     setup_quality_score, volume_score, rr_score, confidence,
                     passed_json, failed_json, decision, reason, executed,
-                    components_json)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    components_json, instance_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (d.get("ts") or _utcnow(), d["symbol"], d.get("timeframe"),
                  d.get("strategy"), d.get("side"), d.get("regime"),
                  d.get("htf_bias"),
@@ -70,7 +73,7 @@ class DecisionStore:
                  json.dumps(d.get("failed_rules") or []),
                  d["decision"], d.get("reason"),
                  1 if d.get("executed") else 0,
-                 json.dumps(d.get("components") or {})))
+                 json.dumps(d.get("components") or {}), d.get("instance_id") or ""))
             self._c.commit()
             return int(cur.lastrowid)
 
@@ -88,13 +91,15 @@ class DecisionStore:
         return d
 
     def list(self, *, limit: int = 50, decision: Optional[str] = None,
-             symbol: Optional[str] = None) -> list[dict]:
+             symbol: Optional[str] = None, instance_id: Optional[str] = None) -> list[dict]:
         sql = "SELECT * FROM decisions"
         cond, args = [], []
         if decision:
             cond.append("decision = ?"); args.append(decision)
         if symbol:
             cond.append("symbol = ?"); args.append(symbol.upper())
+        if instance_id is not None:
+            cond.append("instance_id = ?"); args.append(instance_id)
         if cond:
             sql += " WHERE " + " AND ".join(cond)
         sql += " ORDER BY id DESC LIMIT ?"

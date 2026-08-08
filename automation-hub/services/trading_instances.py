@@ -31,6 +31,57 @@ def _id() -> str:
     return uuid.uuid4().hex
 
 
+_TIMEFRAME_SECONDS = {
+    "1m": 60, "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "2h": 7200, "4h": 14400, "1d": 86400, "1w": 604800,
+}
+
+
+def _age_seconds(value: object) -> Optional[int]:
+    if not value:
+        return None
+    try:
+        stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return max(0, int((datetime.now(timezone.utc) - stamp).total_seconds()))
+    except (TypeError, ValueError):
+        return None
+
+
+def _market_health(market: dict, *, timeframe: str, worker_state: str) -> dict:
+    """Classify candle freshness on the server, from its actual timestamp.
+
+    A transport being connected is deliberately not sufficient.  This makes
+    the UI's Healthy/Stale/Disconnected legend truthful after browser refresh
+    and also when the worker has stopped and only persisted state remains.
+    """
+    out = dict(market)
+    # Provider OHLCV uses candle-open timestamps. Freshness starts when that
+    # candle closes, not at its open, so a newly closed 5m candle reads 0s old.
+    raw_age = _age_seconds(out.get("last_market_data_timestamp"))
+    interval = _TIMEFRAME_SECONDS.get(timeframe, 300)
+    age = max(0, raw_age - interval) if raw_age is not None else None
+    out["market_data_age_seconds"] = age
+    raw = str(out.get("market_data_status") or "").lower()
+    if worker_state in ("error",) or raw == "error":
+        state = "error"
+    elif worker_state in ("stopped",) and raw not in ("healthy", "stale", "disconnected"):
+        state = "stopped"
+    elif raw == "warming_up" or int(out.get("warmup_bars") or 0) < 150:
+        state = "warming_up"
+    elif age is None:
+        state = "error" if raw in ("failed", "error") else "disconnected"
+    else:
+        state = "healthy" if age < interval * 1.5 else "stale" if age <= interval * 3 else "disconnected"
+    out["market_data_status"] = state
+    out["freshness_thresholds_seconds"] = {
+        "healthy_under": int(_TIMEFRAME_SECONDS.get(timeframe, 300) * 1.5),
+        "disconnected_over": int(_TIMEFRAME_SECONDS.get(timeframe, 300) * 3),
+    }
+    return out
+
+
 @dataclass
 class TradingInstance:
     id: str
@@ -42,6 +93,9 @@ class TradingInstance:
     risk_per_trade_pct: float
     capital_allocation: float
     mode: str = "trading"              # trading | research (paper only)
+    # Trading instances are always forward paper. Research remains the only
+    # instance mode allowed to consume a historical replay.
+    market_data_mode: str = "paper_forward"
     state: str = "stopped"             # running | paused | stopped | error
     desired_running: bool = False
     created_at: str = field(default_factory=_now)
@@ -120,7 +174,7 @@ CREATE TABLE IF NOT EXISTS trading_instances (
  id TEXT PRIMARY KEY, symbol TEXT NOT NULL, strategy_key TEXT NOT NULL,
  strategy_label TEXT NOT NULL, strategy_version TEXT NOT NULL, timeframe TEXT NOT NULL,
  risk_per_trade_pct REAL NOT NULL, capital_allocation REAL NOT NULL,
- mode TEXT NOT NULL, state TEXT NOT NULL, desired_running INTEGER NOT NULL DEFAULT 0,
+ mode TEXT NOT NULL, market_data_mode TEXT NOT NULL DEFAULT 'paper_forward', state TEXT NOT NULL, desired_running INTEGER NOT NULL DEFAULT 0,
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS instance_metrics (
@@ -128,6 +182,13 @@ CREATE TABLE IF NOT EXISTS instance_metrics (
 );
 CREATE TABLE IF NOT EXISTS instance_engine_logs (
  id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, ts TEXT NOT NULL, level TEXT NOT NULL, message TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS instance_market_state (
+ instance_id TEXT PRIMARY KEY, last_processed_candle_timestamp TEXT,
+ market_data_mode TEXT NOT NULL, market_data_status TEXT NOT NULL DEFAULT 'stopped',
+ last_market_data_timestamp TEXT, data_source TEXT, warmup_bars INTEGER NOT NULL DEFAULT 0,
+ duplicate_candles INTEGER NOT NULL DEFAULT 0, missing_candles INTEGER NOT NULL DEFAULT 0,
+ out_of_order_candles INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS trading_instance_platform_settings (
  id TEXT PRIMARY KEY, max_active_slots INTEGER NOT NULL DEFAULT 1,
@@ -150,6 +211,8 @@ class InstanceStore:
                 ledger._c.executescript(_LOCAL_SCHEMA)
                 ensure_column(ledger._c, "trading_instance_platform_settings",
                               "max_global_daily_loss_pct", "REAL NOT NULL DEFAULT 0.05")
+                ensure_column(ledger._c, "trading_instances", "market_data_mode",
+                              "TEXT NOT NULL DEFAULT 'paper_forward'")
                 ledger._c.commit()
 
     def _table(self, name):
@@ -164,8 +227,8 @@ class InstanceStore:
         else:
             with self.ledger._lock:
                 self.ledger._c.execute("""INSERT INTO trading_instances
-                (id,symbol,strategy_key,strategy_label,strategy_version,timeframe,risk_per_trade_pct,capital_allocation,mode,state,desired_running,created_at,updated_at,last_error)
-                VALUES (:id,:symbol,:strategy_key,:strategy_label,:strategy_version,:timeframe,:risk_per_trade_pct,:capital_allocation,:mode,:state,:desired_running,:created_at,:updated_at,:last_error)""", row)
+                (id,symbol,strategy_key,strategy_label,strategy_version,timeframe,risk_per_trade_pct,capital_allocation,mode,market_data_mode,state,desired_running,created_at,updated_at,last_error)
+                VALUES (:id,:symbol,:strategy_key,:strategy_label,:strategy_version,:timeframe,:risk_per_trade_pct,:capital_allocation,:mode,:market_data_mode,:state,:desired_running,:created_at,:updated_at,:last_error)""", row)
                 self.ledger._c.commit()
 
     def list(self) -> list[TradingInstance]:
@@ -188,7 +251,40 @@ class InstanceStore:
             self._table("trading_instances").update(row).eq("id", instance.id).execute()
         else:
             with self.ledger._lock:
-                self.ledger._c.execute("""UPDATE trading_instances SET state=:state,desired_running=:desired_running,updated_at=:updated_at,last_error=:last_error WHERE id=:id""", row)
+                self.ledger._c.execute("""UPDATE trading_instances SET market_data_mode=:market_data_mode,state=:state,desired_running=:desired_running,updated_at=:updated_at,last_error=:last_error WHERE id=:id""", row)
+                self.ledger._c.commit()
+
+    def market_state(self, instance_id: str) -> dict:
+        defaults = {"instance_id": instance_id, "last_processed_candle_timestamp": None,
+                    "market_data_mode": "paper_forward", "market_data_status": "stopped",
+                    "last_market_data_timestamp": None, "data_source": None,
+                    "warmup_bars": 0, "duplicate_candles": 0, "missing_candles": 0,
+                    "out_of_order_candles": 0}
+        try:
+            if self.remote:
+                rows = self._table("instance_market_state").select("*").eq("instance_id", instance_id).execute().data
+                return {**defaults, **(rows[0] if rows else {})}
+            with self.ledger._lock:
+                row = self.ledger._c.execute("SELECT * FROM instance_market_state WHERE instance_id=?", (instance_id,)).fetchone()
+            return {**defaults, **(dict(row) if row else {})}
+        except Exception as exc:
+            self.available = False
+            self.error = "Trading Instance market-state migration is not installed; run data/trading_instances_schema.sql"
+            raise RuntimeError(self.error) from exc
+
+    def save_market_state(self, instance_id: str, **values) -> None:
+        row = {"instance_id": instance_id, "last_processed_candle_timestamp": None,
+               "market_data_mode": "paper_forward", "market_data_status": "warming_up",
+               "last_market_data_timestamp": None, "data_source": None,
+               "warmup_bars": 0, "duplicate_candles": 0, "missing_candles": 0,
+               "out_of_order_candles": 0, "updated_at": _now(), **values}
+        if self.remote:
+            self._table("instance_market_state").upsert(row).execute()
+        else:
+            with self.ledger._lock:
+                self.ledger._c.execute("""INSERT OR REPLACE INTO instance_market_state
+                (instance_id,last_processed_candle_timestamp,market_data_mode,market_data_status,last_market_data_timestamp,data_source,warmup_bars,duplicate_candles,missing_candles,out_of_order_candles,updated_at)
+                VALUES (:instance_id,:last_processed_candle_timestamp,:market_data_mode,:market_data_status,:last_market_data_timestamp,:data_source,:warmup_bars,:duplicate_candles,:missing_candles,:out_of_order_candles,:updated_at)""", row)
                 self.ledger._c.commit()
 
     def save_metrics(self, instance_id: str, metrics: dict) -> None:
@@ -236,9 +332,16 @@ class InstanceStore:
 class TradingInstanceManager:
     def __init__(self, ledger: Ledger, *, strategy_factory: Callable[[str, str], object],
                  live: bool, live_poll_s: float, fetcher=None, max_slots: int = 1,
-                 max_global_risk_pct: float = 0.02, max_global_daily_loss_pct: float = 0.05):
+                 max_global_risk_pct: float = 0.02, max_global_daily_loss_pct: float = 0.05,
+                 decision_store=None):
         self.ledger, self.store = ledger, InstanceStore(ledger)
         self.strategy_factory, self.live, self.live_poll_s, self.fetcher = strategy_factory, live, live_poll_s, fetcher
+        self.decision_store = decision_store
+        # Forward trading intentionally does not inherit HUB_USE_LIVE_DATA. It
+        # always uses the strict provider-only adapter; a missing provider is a
+        # fail-closed market-data error, never a replay fallback.
+        from data.forward_market_data import fetch_forward_bars
+        self.forward_fetcher = fetch_forward_bars
         configured = self.store.platform_settings() if self.store.available else {}
         self.max_slots = min(3, max(1, int(configured.get("max_active_slots", max_slots))))
         self.max_global_risk_pct = min(1.0, max(0.001, float(configured.get("max_global_risk_pct", max_global_risk_pct))))
@@ -255,7 +358,8 @@ class TradingInstanceManager:
         inst = TradingInstance(id=_id(), symbol=symbol.upper(), strategy_key=strategy_key,
                                strategy_label=strategy_label, strategy_version=strategy_version or "builtin-1",
                                timeframe=timeframe, risk_per_trade_pct=risk_per_trade_pct,
-                               capital_allocation=capital_allocation, mode=mode)
+                               capital_allocation=capital_allocation, mode=mode,
+                               market_data_mode="paper_forward" if mode == "trading" else "replay")
         self.store.create(inst); self._instances[inst.id] = inst
         return inst
 
@@ -267,7 +371,8 @@ class TradingInstanceManager:
                          if p.get("instance_id") in self._instances]
         risk = sum(abs(float(p.get("entry", 0)) - float(p.get("stop") or p.get("entry", 0))) * float(p.get("size", 0)) for p in all_positions)
         next_risk = abs(entry - stop) * size
-        capital = sum(i.capital_allocation for i in self._instances.values() if i.mode == "trading") or 1.0
+        allocated_capital = sum(i.capital_allocation for i in self._instances.values() if i.mode == "trading")
+        capital = allocated_capital or 1.0
         today = datetime.now(timezone.utc).date().isoformat()
         daily_pnl = sum(float(t.get("pnl") or 0) for t in self.ledger.get_paper_trades()
                         if t.get("instance_id") in self._instances
@@ -294,10 +399,31 @@ class TradingInstanceManager:
             pipeline = SignalPipeline(scoped, paper, controls, equity=inst.capital_allocation,
                                       risk_per_trade_pct=inst.risk_per_trade_pct, exposure_limit_pct=0.05)
             pipeline.global_entry_guard = lambda **kw: self._global_guard(instance_id, **kw)
+            forward = inst.mode == "trading"
+            market = self.store.market_state(instance_id) if forward else {}
+            if forward:
+                self.store.save_market_state(instance_id,
+                    last_processed_candle_timestamp=market.get("last_processed_candle_timestamp"),
+                    market_data_mode="paper_forward", market_data_status="warming_up",
+                    last_market_data_timestamp=market.get("last_market_data_timestamp"),
+                    data_source=market.get("data_source"), warmup_bars=int(market.get("warmup_bars") or 0),
+                    duplicate_candles=int(market.get("duplicate_candles") or 0),
+                    missing_candles=int(market.get("missing_candles") or 0),
+                    out_of_order_candles=int(market.get("out_of_order_candles") or 0))
+            def checkpoint(timestamp: str) -> None:
+                self.store.save_market_state(instance_id,
+                    last_processed_candle_timestamp=timestamp,
+                    market_data_mode="paper_forward", market_data_status="healthy",
+                    last_market_data_timestamp=timestamp, data_source="live provider",
+                    warmup_bars=150)
             engine = AutoStrategyEngine(pipeline, paper, scoped, symbols=[inst.symbol], timeframe=inst.timeframe,
                                         strategy_factory=lambda symbol: self.strategy_factory(inst.strategy_key, symbol),
-                                        live=self.live, live_poll_s=self.live_poll_s, fetcher=self.fetcher)
+                                        live=forward, live_poll_s=self.live_poll_s,
+                                        fetcher=self.forward_fetcher if forward else self.fetcher,
+                                        initial_last_processed_candle=market.get("last_processed_candle_timestamp"),
+                                        candle_checkpoint=checkpoint if forward else None)
             engine.strategy_label = f"{inst.strategy_label} {inst.strategy_version}"
+            engine.decisions = self.decision_store
             engine.start(); self._runtime[instance_id] = (engine, paper, pipeline, controls)
             inst.state, inst.desired_running, inst.last_error = "running", True, ""
             self.store.save(inst); return inst
@@ -357,11 +483,23 @@ class TradingInstanceManager:
                           if p.get("instance_id") in self._instances]
         used_risk = sum(abs(float(p.get("entry", 0)) - float(p.get("stop") or p.get("entry", 0)))
                         * float(p.get("size", 0)) for p in open_positions)
-        capital = sum(i.capital_allocation for i in self._instances.values() if i.mode == "trading") or 1.0
+        allocated_capital = sum(i.capital_allocation for i in self._instances.values() if i.mode == "trading")
+        capital = allocated_capital or 1.0
         today = datetime.now(timezone.utc).date().isoformat()
-        today_pnl = sum(float(t.get("pnl") or 0) for t in self.ledger.get_paper_trades()
-                        if t.get("instance_id") in self._instances
-                        and str(t.get("closed_at") or "").startswith(today))
+        instance_ids = set(self._instances)
+        instance_trades = [t for t in self.ledger.get_paper_trades() if t.get("instance_id") in instance_ids]
+        today_closed = [t for t in instance_trades if str(t.get("closed_at") or "").startswith(today)]
+        today_pnl = sum(float(t.get("pnl") or 0) for t in today_closed)
+        runtime_states = [self.status(i) for i in self._instances]
+        unrealized = sum(float((row.get("current_position") or {}).get("unrealized_pnl") or 0)
+                         for row in runtime_states)
+        total_equity = sum(float((row.get("execution") or {}).get("current_equity") or 0)
+                           for row in runtime_states)
+        available_capital = sum(float((row.get("execution") or {}).get("available_capital") or 0)
+                                for row in runtime_states)
+        opened_or_closed_today = {str(t.get("id")) for t in instance_trades
+                                  if str(t.get("opened_at") or "").startswith(today)
+                                  or str(t.get("closed_at") or "").startswith(today)}
         risk_limit = capital * self.max_global_risk_pct
         daily_limit = capital * self.max_global_daily_loss_pct
         if today_pnl <= -daily_limit:
@@ -370,15 +508,37 @@ class TradingInstanceManager:
             risk_status, risk_message = "warning", "Risk capacity almost reached"
         else:
             risk_status, risk_message = "healthy", "Global risk within limits"
+        market_states = [str((row.get("market_data") or {}).get("market_data_status") or "")
+                         for row in runtime_states if row.get("mode") == "trading" and row.get("state") == "running"]
+        worker_errors = sum(1 for row in runtime_states if row.get("state") == "error")
+        if not self.store.available or worker_errors or any(s in ("error", "disconnected") for s in market_states):
+            global_status = "critical"
+        elif risk_status != "healthy" or any(s in ("stale", "warming_up") for s in market_states):
+            global_status = "warning"
+        else:
+            global_status = "healthy"
         return {"max_active_slots": self.max_slots, "active_slots": active,
                 "max_global_risk_pct": self.max_global_risk_pct,
                 "max_global_daily_loss_pct": self.max_global_daily_loss_pct,
-                "max_global_risk_amount": round(capital * self.max_global_risk_pct, 2),
+                "max_global_risk_amount": round(allocated_capital * self.max_global_risk_pct, 2),
                 "current_global_risk_amount": round(used_risk, 2),
                 "total_open_positions": len(open_positions),
-                "today_pnl": round(today_pnl, 2),
+                "total_instances": len(self._instances),
+                "instance_counts": {state: sum(1 for row in runtime_states if row.get("state") == state)
+                                    for state in ("running", "paused", "stopped", "error")},
+                "total_allocated_capital": round(allocated_capital, 2),
+                "total_current_equity": round(total_equity, 2),
+                "available_paper_capital": round(available_capital, 2),
+                "today_pnl": round(today_pnl + unrealized, 2),
+                "today_realized_pnl": round(today_pnl, 2),
+                "today_unrealized_pnl": round(unrealized, 2),
+                "today_trades": len(opened_or_closed_today),
                 "global_risk_status": risk_status,
-                "global_risk_message": risk_message}
+                "global_risk_message": risk_message,
+                "market_data_status": ("not_available" if not market_states else
+                                       "critical" if any(s in ("error", "disconnected") for s in market_states) else
+                                       "warning" if any(s in ("stale", "warming_up") for s in market_states) else "healthy"),
+                "global_status": global_status}
 
     def restore_desired_instances(self) -> list[str]:
         """Restore independently desired workers after an application restart.
@@ -450,6 +610,8 @@ class TradingInstanceManager:
     def status(self, instance_id: str) -> dict:
         inst = self._instances[instance_id]; runtime = self._runtime.get(instance_id)
         engine = runtime[0].status() if runtime else None
+        market = self.store.market_state(instance_id) if inst.mode == "trading" else {
+            "market_data_mode": "replay", "market_data_status": "research_replay"}
         current_position = None
         if engine is not None:
             positions = runtime[1].positions()
@@ -468,9 +630,31 @@ class TradingInstanceManager:
                     "stop": position.get("stop"), "target": runtime[0]._targets.get(position["symbol"]),
                     "mark": mark, "unrealized_pnl": round(unrealized, 2) if unrealized is not None else None,
                 }
+                entry, stop = float(position.get("entry") or 0), position.get("stop")
+                if mark is not None and stop is not None and entry != float(stop):
+                    direction = 1 if position.get("side") == "long" else -1
+                    current_position["current_r"] = round(direction * (float(mark) - entry) / abs(entry - float(stop)), 3)
+                else:
+                    current_position["current_r"] = None
+                current_position["risk_amount"] = round(abs(entry - float(stop or entry)) * float(position.get("size") or 0), 2)
+                current_position["opened_at"] = position.get("opened_at")
+                current_position["duration_seconds"] = _age_seconds(position.get("opened_at"))
             engine = {**engine, "open_positions": len(runtime[1].positions()),
                       "paper_balance": runtime[1].balance()}
+            if inst.mode == "trading":
+                market = {**market,
+                          "market_data_mode": "paper_forward",
+                          "market_data_status": engine.get("market_data_status", market["market_data_status"]),
+                          "last_market_data_timestamp": engine.get("last_closed_candle") or market.get("last_market_data_timestamp"),
+                          "last_processed_candle_timestamp": engine.get("last_processed_candle_timestamp") or market.get("last_processed_candle_timestamp"),
+                          "data_source": engine.get("data_source") or market.get("data_source"),
+                          "warmup_bars": engine.get("warmup_bars", market.get("warmup_bars", 0)),
+                          "duplicate_candles": engine.get("duplicate_candles_ignored", market.get("duplicate_candles", 0)),
+                          "missing_candles": engine.get("missing_candles", market.get("missing_candles", 0)),
+                          "out_of_order_candles": engine.get("out_of_order_candles", market.get("out_of_order_candles", 0))}
         state = inst.state if engine is None else ("paused" if inst.state == "paused" else engine.get("lifecycle_state", inst.state))
+        if inst.mode == "trading":
+            market = _market_health(market, timeframe=inst.timeframe, worker_state=state)
         if engine and state in ("stopped", "error") and inst.state != state:
             # Persist terminal worker state so a stale UI can never claim a
             # dead engine is live. Errors require explicit operator recovery;
@@ -479,8 +663,81 @@ class TradingInstanceManager:
             inst.last_error = engine.get("last_error") or engine.get("stop_reason") or ""
             inst.desired_running = False
             self.store.save(inst)
+        if inst.mode == "trading" and engine and state in ("stopped", "error"):
+            # Preserve a terminal data diagnosis for the dashboard after the
+            # worker object disappears on a later process restart.
+            self.store.save_market_state(instance_id,
+                last_processed_candle_timestamp=market.get("last_processed_candle_timestamp"),
+                market_data_mode="paper_forward",
+                market_data_status=engine.get("market_data_status", "error"),
+                last_market_data_timestamp=market.get("last_market_data_timestamp"),
+                data_source=market.get("data_source"), warmup_bars=int(market.get("warmup_bars") or 0),
+                duplicate_candles=int(market.get("duplicate_candles") or 0),
+                missing_candles=int(market.get("missing_candles") or 0),
+                out_of_order_candles=int(market.get("out_of_order_candles") or 0))
+        metrics = self.metrics(instance_id)
+        execution: dict = {
+            "current_equity": metrics.get("balance"),
+            "available_capital": None,
+            "realized_pnl": metrics.get("realized_pnl"),
+            "unrealized_pnl": None,
+            "return_pct": round(float(metrics.get("realized_pnl") or 0) / max(inst.capital_allocation, 1.0) * 100, 3),
+            "entry_mode": None,
+            "fill_model": None,
+            "position_sizing_mode": None,
+            "fixed_position_size": None,
+            "max_open_positions": None,
+            "leverage": None,  # leverage is not modelled by the paper engine
+            "pending_orders": None,
+        }
+        risk: dict = {"open_risk_amount": 0.0, "open_risk_pct": None}
+        if runtime is not None:
+            engine_object, paper, pipeline, _controls = runtime
+            marks = (engine or {}).get("last_prices") or {}
+            execution.update({
+                "current_equity": round(paper.equity(marks), 2),
+                "available_capital": round(paper.available_balance(), 2),
+                "realized_pnl": round(paper.realized_pnl(), 2),
+                "unrealized_pnl": round(paper.unrealized_pnl(marks), 2),
+                "entry_mode": (engine or {}).get("entry_mode"),
+                "fill_model": type(paper.fill_model).__name__,
+                "position_sizing_mode": pipeline.position_sizing_mode,
+                "fixed_position_size": pipeline.fixed_position_size if pipeline.position_sizing_mode == "fixed" else None,
+                "max_open_positions": pipeline.max_open_positions,
+                "pending_orders": (engine or {}).get("pending_orders"),
+            })
+            execution["return_pct"] = round((float(execution["current_equity"]) - inst.capital_allocation) /
+                                               max(inst.capital_allocation, 1.0) * 100, 3)
+            if current_position:
+                open_risk = abs(float(current_position.get("entry") or 0) - float(current_position.get("stop") or current_position.get("entry") or 0)) * float(current_position.get("size") or 0)
+                risk = {"open_risk_amount": round(open_risk, 2),
+                        "open_risk_pct": round(open_risk / max(float(execution["current_equity"] or 0), 1.0) * 100, 3)}
+        else:
+            # A stopped worker has no authoritative in-memory mark.  Its
+            # closed-trade balance is available, but available cash and any
+            # live open-position valuation are intentionally left unknown.
+            execution["current_equity"] = metrics.get("balance")
+        last_decision = None
+        if self.decision_store is not None:
+            try:
+                rows = self.decision_store.list(limit=1, instance_id=instance_id)
+                last_decision = rows[0] if rows else None
+            except Exception:  # noqa: BLE001 -- observability must not stop a worker
+                last_decision = None
+        configuration = {
+            "symbol": inst.symbol, "strategy": inst.strategy_label,
+            "strategy_key": inst.strategy_key, "strategy_version": inst.strategy_version,
+            "timeframe": inst.timeframe, "capital_allocation": inst.capital_allocation,
+            "risk_per_trade_pct": inst.risk_per_trade_pct,
+            "market_data_mode": inst.market_data_mode,
+        }
         return {**inst.to_dict(), "state": state, "engine": engine,
-                "current_position": current_position, "metrics": self.metrics(instance_id)}
+                "configuration": configuration, "execution": execution,
+                "risk": risk, "market_data": market, "current_position": current_position,
+                "performance": {**metrics, "net_pnl": execution.get("realized_pnl"),
+                                "return_pct": execution.get("return_pct")},
+                "strategy_health": metrics.get("strategy_health"),
+                "last_decision": last_decision, "metrics": metrics}
 
     def list(self) -> list[dict]:
         return [self.status(i) for i in self._instances]

@@ -41,6 +41,42 @@ def _manager():
     return manager
 
 
+@router.get("/instances/options")
+def instance_options():
+    """Authoritative options for the instance-creation screen.
+
+    The dashboard deliberately obtains these from the service rather than
+    carrying its own list, so an installed strategy/version or supported market
+    cannot silently diverge from what the worker can create.
+    """
+    from data.historical import SYMBOLS, TIMEFRAMES
+    versions_by_strategy: dict[str, list[str]] = {}
+    version_store = getattr(_wa, "version_store", None)
+    if version_store is not None:
+        for row in version_store.list():
+            key = str(row.get("strategy") or "")
+            label = str(row.get("label") or row.get("version") or "")
+            if key and label:
+                versions_by_strategy.setdefault(key, []).append(label)
+    strategies = []
+    for row in _wa._STRATEGY_CATALOG:
+        key = row["key"]
+        builtin = str(row.get("version") or "unversioned")
+        strategies.append({"key": key, "label": row["label"],
+                           "versions": list(dict.fromkeys([builtin, *versions_by_strategy.get(key, [])]))})
+    return {
+        "symbols": list(SYMBOLS), "timeframes": list(TIMEFRAMES),
+        "strategies": strategies,
+        # These are the presently implemented per-instance execution defaults,
+        # not editable UI choices.  The API exposes them so they remain honest
+        # and can become persisted options in a later additive migration.
+        "execution_defaults": {"position_sizing_mode": "auto", "entry_mode": "limit",
+                               "fill_model": "PerfectFill", "leverage": None,
+                               "max_open_positions": 3},
+        "market_data_mode": "paper_forward_live_only",
+    }
+
+
 def _start_instance(manager, instance_id: str, *, restart: bool = False):
     """Enter instance-first execution without mixing legacy account trades."""
     if _wa.engine.running:
@@ -90,6 +126,11 @@ def auto_select_instance(x_webhook_secret: Optional[str] = Header(default=None))
 def create_instance(body: InstanceCreate, x_webhook_secret: Optional[str] = Header(default=None)):
     _wa._check_secret(x_webhook_secret)
     strategy = _catalog(body.strategy)
+    from data.historical import SYMBOLS, TIMEFRAMES
+    if body.symbol.upper() not in SYMBOLS:
+        raise HTTPException(400, f"Unsupported pair '{body.symbol.upper()}'")
+    if body.timeframe not in TIMEFRAMES:
+        raise HTTPException(400, f"Unsupported timeframe '{body.timeframe}'")
     inst = _manager().create(symbol=body.symbol, strategy_key=strategy["key"], strategy_label=strategy["label"],
                              strategy_version=body.strategy_version or strategy.get("version", "unversioned"), timeframe=body.timeframe,
                              risk_per_trade_pct=body.risk_per_trade_pct,
