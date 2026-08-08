@@ -35,21 +35,21 @@ class Ledger(Protocol):
     # webhook events
     def insert_webhook_event(self, *, alert_id: str, symbol: str, side: str,
                              entry: Optional[float], stop: Optional[float],
-                             payload: dict, status: str, reason: str = "") -> str: ...
+                             payload: dict, status: str, reason: str = "", instance_id: str = "") -> str: ...
     def webhook_seen(self, alert_id: str, since_iso: str) -> bool: ...
     def get_webhook_events(self, limit: int = 500) -> list[dict]: ...
     # positions / trades
     def open_position(self, *, symbol: str, side: str, size: float, entry: float,
-                      stop: Optional[float]) -> str: ...
+                      stop: Optional[float], instance_id: str = "") -> str: ...
     def close_position(self, position_id: str, *, exit_price: float, pnl: float) -> None: ...
     def get_positions(self, status: Optional[str] = None) -> list[dict]: ...
     def record_paper_trade(self, trade: dict) -> str: ...
     def close_paper_trade(self, trade_id: str, *, exit_price: float, pnl: float, rr: float, size: float | None = None) -> None: ...
     def get_paper_trades(self) -> list[dict]: ...
     # logs / alerts
-    def log(self, *, level: str, stage: str, message: str, symbol: str = "") -> None: ...
+    def log(self, *, level: str, stage: str, message: str, symbol: str = "", instance_id: str = "") -> None: ...
     def get_logs(self, limit: int = 200) -> list[dict]: ...
-    def add_alert(self, *, severity: str, category: str, title: str, detail: str = "") -> None: ...
+    def add_alert(self, *, severity: str, category: str, title: str, detail: str = "", instance_id: str = "") -> None: ...
     def get_alerts(self, limit: int = 100) -> list[dict]: ...
 
 
@@ -81,18 +81,20 @@ class SqliteLedger:
             # migration keep an empty strategy_id and are reported as the
             # account's, never as a particular strategy's.
             ensure_column(self._c, "paper_trades", "strategy_id")
+            for _t in ("webhook_events", "positions", "paper_trades", "bot_logs", "alerts"):
+                ensure_column(self._c, _t, "instance_id")
             self._c.execute("CREATE INDEX IF NOT EXISTS idx_paper_strategy "
                             "ON paper_trades(strategy_id, closed_at)")
             self._c.commit()
 
     # ----------------------------------------------------------- webhook
-    def insert_webhook_event(self, *, alert_id, symbol, side, entry, stop, payload, status, reason=""):
+    def insert_webhook_event(self, *, alert_id, symbol, side, entry, stop, payload, status, reason="", instance_id=""):
         wid = _id()
         with self._lock:
             self._c.execute(
-                "INSERT INTO webhook_events(id,alert_id,symbol,side,entry,stop,payload_json,received_at,status,reason)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (wid, alert_id, symbol, side, entry, stop, json.dumps(payload), _now(), status, reason))
+                "INSERT INTO webhook_events(id,alert_id,symbol,side,entry,stop,payload_json,received_at,status,reason,instance_id)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (wid, alert_id, symbol, side, entry, stop, json.dumps(payload), _now(), status, reason, instance_id))
             self._c.commit()
         return wid
 
@@ -119,13 +121,13 @@ class SqliteLedger:
         return out
 
     # ----------------------------------------------------------- positions
-    def open_position(self, *, symbol, side, size, entry, stop):
+    def open_position(self, *, symbol, side, size, entry, stop, instance_id=""):
         pid = _id()
         with self._lock:
             self._c.execute(
-                "INSERT INTO positions(id,symbol,side,size,entry,stop,status,pnl,opened_at)"
-                " VALUES (?,?,?,?,?,?, 'open', 0, ?)",
-                (pid, symbol, side, size, entry, stop, _now()))
+                "INSERT INTO positions(id,symbol,side,size,entry,stop,status,pnl,opened_at,instance_id)"
+                " VALUES (?,?,?,?,?,?, 'open', 0, ?,?)",
+                (pid, symbol, side, size, entry, stop, _now(), instance_id))
             self._c.commit()
         return pid
 
@@ -145,15 +147,18 @@ class SqliteLedger:
         with self._lock:
             return [dict(r) for r in self._c.execute(q, args)]
 
-    def update_position_stop(self, *, symbol, stop) -> int:
+    def update_position_stop(self, *, symbol, stop, instance_id="") -> int:
         """Move the stop-loss on the OPEN position for a symbol (manual on-chart
         adjust). Only the stop is persisted here — the take-profit lives in the
         engine's in-memory managed state, matching how targets are held today.
         Returns the number of rows updated (0 if no open position)."""
         with self._lock:
-            cur = self._c.execute(
-                "UPDATE positions SET stop=? WHERE symbol=? AND status='open'",
-                (stop, symbol))
+            query = "UPDATE positions SET stop=? WHERE symbol=? AND status='open'"
+            args = [stop, symbol]
+            if instance_id:
+                query += " AND instance_id=?"
+                args.append(instance_id)
+            cur = self._c.execute(query, args)
             self._c.commit()
             return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
@@ -163,10 +168,10 @@ class SqliteLedger:
         with self._lock:
             self._c.execute(
                 "INSERT INTO paper_trades(id,alert_id,symbol,side,size,entry,stop,status,"
-                "opened_at,strategy_id) VALUES (?,?,?,?,?,?,?, 'open', ?,?)",
+                "opened_at,strategy_id,instance_id) VALUES (?,?,?,?,?,?,?, 'open', ?,?,?)",
                 (tid, trade.get("alert_id"), trade["symbol"], trade["side"], trade["size"],
                  trade["entry"], trade.get("stop"), _now(),
-                 trade.get("strategy_id") or ""))
+                 trade.get("strategy_id") or "", trade.get("instance_id") or ""))
             self._c.commit()
         return tid
 
@@ -197,11 +202,11 @@ class SqliteLedger:
             self._c.commit()
 
     # ----------------------------------------------------------- logs / alerts
-    def log(self, *, level, stage, message, symbol=""):
+    def log(self, *, level, stage, message, symbol="", instance_id=""):
         with self._lock:
             self._c.execute(
-                "INSERT INTO bot_logs(id,ts,symbol,level,stage,message) VALUES (?,?,?,?,?,?)",
-                (_id(), _now(), symbol, level, stage, message))
+                "INSERT INTO bot_logs(id,ts,symbol,level,stage,message,instance_id) VALUES (?,?,?,?,?,?,?)",
+                (_id(), _now(), symbol, level, stage, message, instance_id))
             self._c.commit()
 
     def get_logs(self, limit=200):
@@ -209,11 +214,11 @@ class SqliteLedger:
             return [dict(r) for r in self._c.execute(
                 "SELECT * FROM bot_logs ORDER BY ts DESC LIMIT ?", (limit,))]
 
-    def add_alert(self, *, severity, category, title, detail=""):
+    def add_alert(self, *, severity, category, title, detail="", instance_id=""):
         with self._lock:
             self._c.execute(
-                "INSERT INTO alerts(id,ts,severity,category,title,detail,read) VALUES (?,?,?,?,?,?,0)",
-                (_id(), _now(), severity, category, title, detail))
+                "INSERT INTO alerts(id,ts,severity,category,title,detail,read,instance_id) VALUES (?,?,?,?,?,?,0,?)",
+                (_id(), _now(), severity, category, title, detail, instance_id))
             self._c.commit()
 
     def get_alerts(self, limit=100):
@@ -259,13 +264,16 @@ class SupabaseLedger:
     def _t(self, name):  # pragma: no cover
         return self._db.table(name)
 
-    def insert_webhook_event(self, *, alert_id, symbol, side, entry, stop, payload, status, reason=""):  # pragma: no cover
+    def insert_webhook_event(self, *, alert_id, symbol, side, entry, stop, payload, status, reason="", instance_id=""):  # pragma: no cover
         wid = _id()
-        self._t("webhook_events").insert({
+        row = {
             "id": wid, "alert_id": alert_id, "symbol": symbol, "side": side,
             "entry": entry, "stop": stop, "payload_json": json.dumps(payload),
             "received_at": _now(), "status": status, "reason": reason,
-        }).execute()
+        }
+        if instance_id:
+            row["instance_id"] = instance_id
+        self._t("webhook_events").insert(row).execute()
         return wid
 
     def webhook_seen(self, alert_id, since_iso):  # pragma: no cover
@@ -283,11 +291,14 @@ class SupabaseLedger:
                 d["payload"] = {}
         return rows
 
-    def open_position(self, *, symbol, side, size, entry, stop):  # pragma: no cover
+    def open_position(self, *, symbol, side, size, entry, stop, instance_id=""):  # pragma: no cover
         pid = _id()
-        self._t("positions").insert({
+        row = {
             "id": pid, "symbol": symbol, "side": side, "size": size, "entry": entry,
-            "stop": stop, "status": "open", "pnl": 0, "opened_at": _now()}).execute()
+            "stop": stop, "status": "open", "pnl": 0, "opened_at": _now()}
+        if instance_id:
+            row["instance_id"] = instance_id
+        self._t("positions").insert(row).execute()
         return pid
 
     def close_position(self, position_id, *, exit_price, pnl):  # pragma: no cover
@@ -300,17 +311,24 @@ class SupabaseLedger:
             q = q.eq("status", status)
         return q.order("opened_at", desc=True).execute().data
 
-    def update_position_stop(self, *, symbol, stop) -> int:  # pragma: no cover
-        self._t("positions").update({"stop": stop})\
-            .eq("symbol", symbol).eq("status", "open").execute()
+    def update_position_stop(self, *, symbol, stop, instance_id="") -> int:  # pragma: no cover
+        q = self._t("positions").update({"stop": stop}).eq("symbol", symbol).eq("status", "open")
+        if instance_id:
+            q = q.eq("instance_id", instance_id)
+        q.execute()
         return 1
 
     def record_paper_trade(self, trade):  # pragma: no cover
         tid = trade.get("id") or _id()
-        self._t("paper_trades").insert({
+        row = {
             "id": tid, "alert_id": trade.get("alert_id"), "symbol": trade["symbol"],
             "side": trade["side"], "size": trade["size"], "entry": trade["entry"],
-            "stop": trade.get("stop"), "status": "open", "opened_at": _now()}).execute()
+            "stop": trade.get("stop"), "status": "open", "opened_at": _now()}
+        if trade.get("strategy_id"):
+            row["strategy_id"] = trade["strategy_id"]
+        if trade.get("instance_id"):
+            row["instance_id"] = trade["instance_id"]
+        self._t("paper_trades").insert(row).execute()
         return tid
 
     def close_paper_trade(self, trade_id, *, exit_price, pnl, rr, size=None):  # pragma: no cover
@@ -323,17 +341,22 @@ class SupabaseLedger:
     def get_paper_trades(self):  # pragma: no cover
         return self._t("paper_trades").select("*").order("opened_at", desc=True).execute().data
 
-    def log(self, *, level, stage, message, symbol=""):  # pragma: no cover
-        self._t("bot_logs").insert({"id": _id(), "ts": _now(), "symbol": symbol,
-                                    "level": level, "stage": stage, "message": message}).execute()
+    def log(self, *, level, stage, message, symbol="", instance_id=""):  # pragma: no cover
+        row = {"id": _id(), "ts": _now(), "symbol": symbol,
+               "level": level, "stage": stage, "message": message}
+        if instance_id:
+            row["instance_id"] = instance_id
+        self._t("bot_logs").insert(row).execute()
 
     def get_logs(self, limit=200):  # pragma: no cover
         return self._t("bot_logs").select("*").order("ts", desc=True).limit(limit).execute().data
 
-    def add_alert(self, *, severity, category, title, detail=""):  # pragma: no cover
-        self._t("alerts").insert({"id": _id(), "ts": _now(), "severity": severity,
-                                  "category": category, "title": title, "detail": detail,
-                                  "read": 0}).execute()
+    def add_alert(self, *, severity, category, title, detail="", instance_id=""):  # pragma: no cover
+        row = {"id": _id(), "ts": _now(), "severity": severity,
+               "category": category, "title": title, "detail": detail, "read": 0}
+        if instance_id:
+            row["instance_id"] = instance_id
+        self._t("alerts").insert(row).execute()
 
     def get_alerts(self, limit=100):  # pragma: no cover
         return self._t("alerts").select("*").order("ts", desc=True).limit(limit).execute().data

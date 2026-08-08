@@ -38,6 +38,7 @@ const BotHealthPage = lazy(() => import("./pages/BotHealth"));
 const StrategyProofPage = lazy(() => import("./pages/StrategyProof"));
 const OptimizationPage = lazy(() => import("./pages/Optimization"));
 const AllocationPage = lazy(() => import("./pages/Allocation"));
+const TradingInstancesPage = lazy(() => import("./pages/TradingInstances"));
 import { AppContext, parseHash, slug } from "./app-context";
 
 const MOBILE = "(max-width: 720px)";
@@ -81,6 +82,7 @@ export default function App() {
 
   const go = (page: string) => { window.location.hash = "/" + slug(page); setMobileNav(false); };
   const viewBot = (id: string) => { window.location.hash = "/bot/" + id; setMobileNav(false); };
+  const viewInstance = (id: string) => { window.location.hash = "/instance/" + id; setMobileNav(false); };
 
   const renderPage = () => {
     switch (active) {
@@ -95,6 +97,7 @@ export default function App() {
       // Paper Trading IS the Bot Observation Terminal (the heart of the app);
       // the classic account/blotter view lives on as "Paper Account".
       case "Paper Trading": return <BotTerminalPage />;
+      case "Trading Instances": return <TradingInstancesPage instanceId={route.instanceId} />;
       case "Paper Account": return <PaperTradingPage />;
       case "Live Trading": return <LiveTradingPage />;
       case "Portfolio": return <PortfolioPage />;
@@ -126,7 +129,7 @@ export default function App() {
   const title = active === "BotDetail" ? route.botId : active;
 
   return (
-    <AppContext.Provider value={{ go, viewBot, toast }}>
+    <AppContext.Provider value={{ go, viewBot, viewInstance, toast }}>
       <div className={`app ${collapsed ? "sidebar-collapsed" : ""} ${mobileNav ? "mobile-nav-open" : ""}`}>
         <Toasts items={toasts} />
         {mobileNav && <div className="nav-backdrop" onClick={() => setMobileNav(false)} aria-hidden />}

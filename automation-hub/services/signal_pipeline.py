@@ -185,6 +185,9 @@ class SignalPipeline:
         self.equity = equity
         self.risk_per_trade_pct = risk_per_trade_pct
         self.exposure_limit_pct = exposure_limit_pct
+        # Optional account-wide gate supplied by TradingInstanceManager. It is
+        # evaluated after instance sizing/caps but before paper execution.
+        self.global_entry_guard = None
         # "auto" sizes each entry from stop distance and risk. "fixed" uses a
         # deliberate base-asset quantity (for example 0.01 BTC), but still
         # passes every downstream exposure, portfolio, loss and risk-engine gate.
@@ -746,6 +749,15 @@ class SignalPipeline:
             # identical whether or not the engine ran cannot be audited.
             steps.append(Step("risk_engine", True,
                               "tradexa.risk unavailable in this deployment — veto not applied"))
+
+        if self.global_entry_guard is not None:
+            try:
+                allowed, reason = self.global_entry_guard(symbol=symbol, entry=entry, stop=stop, size=size)
+            except Exception as exc:  # fail closed: cross-instance risk must not silently disappear
+                return reject("global_risk", f"Global risk manager unavailable: {type(exc).__name__}")
+            if not allowed:
+                return reject("global_risk", reason)
+            steps.append(Step("global_risk", True, reason))
 
         # 6. paper execution (routed through the fill model)
         fill = self.paper.open(symbol=symbol, side=side, size=size, entry=entry, stop=stop,

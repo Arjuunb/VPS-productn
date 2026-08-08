@@ -5,6 +5,8 @@ export interface AppApi {
   go: (page: string) => void;
   /** Open a single bot's detail page (route #/bot/<id>). */
   viewBot: (id: string) => void;
+  /** Open one isolated Trading Instance (route #/instance/<id>). */
+  viewInstance: (id: string) => void;
   /** Show a transient toast notification. */
   toast: (msg: string, tone?: "success" | "error" | "info") => void;
 }
@@ -12,6 +14,7 @@ export interface AppApi {
 export const AppContext = createContext<AppApi>({
   go: () => {},
   viewBot: () => {},
+  viewInstance: () => {},
   toast: () => {},
 });
 
@@ -23,7 +26,7 @@ export const useApp = () => useContext(AppContext);
 // instead of a flat list of pages.
 export const NAV_GROUPS: { title: string | null; items: string[] }[] = [
   { title: null, items: ["Dashboard"] },
-  { title: "Trading", items: ["Strategy Studio", "Fleet Manager", "Paper Trading", "Replay", "Backtesting", "Optimization Lab", "Grid & DCA", "Live Trading"] },
+  { title: "Trading", items: ["Trading Instances", "Strategy Studio", "Fleet Manager", "Paper Trading", "Replay", "Backtesting", "Optimization Lab", "Grid & DCA", "Live Trading"] },
   { title: "Performance", items: ["Portfolio", "Allocation", "Analytics", "AI Intelligence"] },
   { title: "Records", items: ["Journal", "Decision Archive", "Memory"] },
   { title: "System", items: ["Market Data", "Risk Manager", "Bot Health", "Logs", "Settings"] },
@@ -55,6 +58,7 @@ export const slug = (page: string) => page.toLowerCase().replace(/ /g, "-");
 export interface Route {
   page: string;
   botId: string;
+  instanceId?: string;
   /** Deep-link target id — the decision cycle or trade to focus on arrival. */
   focusId?: string;
 }
@@ -63,6 +67,8 @@ export const parseHash = (): Route => {
   const h = window.location.hash.replace(/^#\/?/, "").trim();
   const bot = h.match(/^bot\/(.+)$/);
   if (bot) return { page: "BotDetail", botId: bot[1] };
+  const instance = h.match(/^instance\/([a-zA-Z0-9_-]+)$/);
+  if (instance) return { page: "Trading Instances", botId: "", instanceId: instance[1] };
   // shareable deep links to a single decision or trade (for audit/sharing)
   const dec = h.match(/^decision\/(.+)$/);
   if (dec) return { page: "Decision Archive", botId: "", focusId: decodeURIComponent(dec[1]) };

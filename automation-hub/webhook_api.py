@@ -200,6 +200,30 @@ def _make_strategy(symbol: str):
     return DecisionBrain(symbol)
 
 
+def _make_instance_strategy(key: str, symbol: str):
+    """Factory without mutable global settings — one instance, one strategy."""
+    if key == "ema":
+        from strategies.ema_strategy import EMAStrategy
+        return EMAStrategy(symbol)
+    if key == "supertrend":
+        from strategies.supertrend_strategy import SupertrendStrategy
+        return SupertrendStrategy(symbol)
+    if key == "donchian":
+        from strategies.donchian_strategy import DonchianStrategy
+        return DonchianStrategy(symbol)
+    if key == "ensemble":
+        from strategies.ensemble_strategy import ConfirmationEnsemble
+        return ConfirmationEnsemble(symbol)
+    if key == "smc":
+        from strategies.smc_strategy import SMCStrategy
+        return SMCStrategy(symbol)
+    if key == "liquidity_sweep":
+        from strategies.liquidity_sweep_strategy import LiquiditySweepStrategy
+        return LiquiditySweepStrategy(symbol)
+    from strategies.brain_strategy import DecisionBrain
+    return DecisionBrain(symbol)
+
+
 # WebSocket feed (live mode): push candles with REST fallback. Starts only if
 # ccxt.pro is available; otherwise the fetcher is a pure REST pass-through and
 # the watchdog/status endpoints report the degraded mode honestly.
@@ -227,6 +251,17 @@ engine.decisions = decision_store        # persist every accept/reject decision
 from data.cycle_store import CycleStore  # noqa: E402
 cycle_store = CycleStore(settings.cycles_db)
 engine.reports = cycle_store
+
+# Instance-first paper platform. It is additive during migration: legacy paper
+# endpoints remain intact, while every new instance owns isolated execution and
+# tagged ledger rows. Supabase instances activate after its additive SQL schema
+# has been applied; a missing schema never blocks the established application.
+from services.trading_instances import TradingInstanceManager  # noqa: E402
+instance_manager = TradingInstanceManager(
+    ledger, strategy_factory=_make_instance_strategy, live=settings.use_live_data,
+    live_poll_s=settings.live_poll_s,
+    fetcher=ws_feed.make_fetcher(_default_fetcher) if settings.use_live_data else None,
+)
 
 # Semi-auto / signal trading modes: the human-approval queue for entries.
 from services.approvals import ApprovalStore  # noqa: E402
@@ -1126,6 +1161,7 @@ import routers.symbols  # noqa: E402
 import routers.ai  # noqa: E402
 import routers.grid  # noqa: E402
 import routers.market_data  # noqa: E402
+import routers.instances  # noqa: E402
 router.include_router(routers.analytics.router)
 router.include_router(routers.bots.router)
 router.include_router(routers.engine.router)
@@ -1139,6 +1175,7 @@ router.include_router(routers.symbols.router)
 router.include_router(routers.ai.router)
 router.include_router(routers.grid.router)
 router.include_router(routers.market_data.router)
+router.include_router(routers.instances.router)
 
 
 # ───────────────────────────── server-side grid (paper, 24/7) ─────────────────
