@@ -358,11 +358,27 @@ class TradingInstanceManager:
         used_risk = sum(abs(float(p.get("entry", 0)) - float(p.get("stop") or p.get("entry", 0)))
                         * float(p.get("size", 0)) for p in open_positions)
         capital = sum(i.capital_allocation for i in self._instances.values() if i.mode == "trading") or 1.0
+        today = datetime.now(timezone.utc).date().isoformat()
+        today_pnl = sum(float(t.get("pnl") or 0) for t in self.ledger.get_paper_trades()
+                        if t.get("instance_id") in self._instances
+                        and str(t.get("closed_at") or "").startswith(today))
+        risk_limit = capital * self.max_global_risk_pct
+        daily_limit = capital * self.max_global_daily_loss_pct
+        if today_pnl <= -daily_limit:
+            risk_status, risk_message = "daily_loss_limit_reached", "Daily loss limit reached — new entries are paused"
+        elif risk_limit > 0 and used_risk / risk_limit >= 0.9:
+            risk_status, risk_message = "warning", "Risk capacity almost reached"
+        else:
+            risk_status, risk_message = "healthy", "Global risk within limits"
         return {"max_active_slots": self.max_slots, "active_slots": active,
                 "max_global_risk_pct": self.max_global_risk_pct,
                 "max_global_daily_loss_pct": self.max_global_daily_loss_pct,
                 "max_global_risk_amount": round(capital * self.max_global_risk_pct, 2),
-                "current_global_risk_amount": round(used_risk, 2)}
+                "current_global_risk_amount": round(used_risk, 2),
+                "total_open_positions": len(open_positions),
+                "today_pnl": round(today_pnl, 2),
+                "global_risk_status": risk_status,
+                "global_risk_message": risk_message}
 
     def restore_desired_instances(self) -> list[str]:
         """Restore independently desired workers after an application restart.
@@ -434,7 +450,24 @@ class TradingInstanceManager:
     def status(self, instance_id: str) -> dict:
         inst = self._instances[instance_id]; runtime = self._runtime.get(instance_id)
         engine = runtime[0].status() if runtime else None
+        current_position = None
         if engine is not None:
+            positions = runtime[1].positions()
+            position = positions[0] if positions else None
+            if position:
+                mark = engine.get("last_prices", {}).get(position["symbol"])
+                unrealized = None
+                if mark is not None:
+                    direction = position.get("side")
+                    unrealized = ((float(mark) - float(position["entry"])) * float(position["size"])
+                                  if direction == "long"
+                                  else (float(position["entry"]) - float(mark)) * float(position["size"]))
+                current_position = {
+                    "symbol": position["symbol"], "side": position.get("side"),
+                    "size": position.get("size"), "entry": position.get("entry"),
+                    "stop": position.get("stop"), "target": runtime[0]._targets.get(position["symbol"]),
+                    "mark": mark, "unrealized_pnl": round(unrealized, 2) if unrealized is not None else None,
+                }
             engine = {**engine, "open_positions": len(runtime[1].positions()),
                       "paper_balance": runtime[1].balance()}
         state = inst.state if engine is None else ("paused" if inst.state == "paused" else engine.get("lifecycle_state", inst.state))
@@ -446,7 +479,8 @@ class TradingInstanceManager:
             inst.last_error = engine.get("last_error") or engine.get("stop_reason") or ""
             inst.desired_running = False
             self.store.save(inst)
-        return {**inst.to_dict(), "state": state, "engine": engine, "metrics": self.metrics(instance_id)}
+        return {**inst.to_dict(), "state": state, "engine": engine,
+                "current_position": current_position, "metrics": self.metrics(instance_id)}
 
     def list(self) -> list[dict]:
         return [self.status(i) for i in self._instances]

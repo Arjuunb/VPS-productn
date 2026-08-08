@@ -57,6 +57,9 @@ def test_instance_platform_settings_persist_and_global_risk_sees_all_scoped_posi
     allowed, reason = reloaded._global_guard(first.id, "ETHUSDT", 100, 95, 1)
     assert not allowed
     assert "Global account risk exceeded" in reason
+    snapshot = reloaded.platform_status()
+    assert snapshot["total_open_positions"] == 1
+    assert snapshot["global_risk_status"] == "warning"
 
 
 def test_instances_api_returns_platform_status_and_validates_slot_change(monkeypatch):

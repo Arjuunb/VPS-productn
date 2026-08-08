@@ -181,6 +181,10 @@ class AutoStrategyEngine:
         self.last_bar_ts: Optional[str] = None      # timestamp of the last bar acted on
         self.last_activity: Optional[str] = None    # wall-clock of the last processed bar
         self.current_symbol: Optional[str] = None   # most recently processed market
+        # Last closed-candle price per symbol. It is telemetry only: execution
+        # still uses the bar passed through the pipeline, while dashboard
+        # consumers can calculate a clearly labelled unrealised paper P&L.
+        self.last_prices: dict[str, float] = {}
         self.last_source: Optional[str] = None       # data source ("live (ccxt)" / "bundled sample" / …)
         self._warned_fallback: set = set()           # symbols already warned (no per-poll spam)
         # Event bus (architecture phase 2). The engine PUBLISHES; it never
@@ -304,6 +308,7 @@ class AutoStrategyEngine:
             "autostart_enabled": self.autostart_enabled,
             "last_trade": self.last_trade,
             "current_symbol": self.current_symbol,
+            "last_prices": self.last_prices.copy(),
             "last_bar_ts": self.last_bar_ts,
             "last_activity": self.last_activity,
             "data_source": self.last_source,
@@ -510,6 +515,10 @@ class AutoStrategyEngine:
             self.last_bar_ts = str(getattr(bar, "timestamp", ""))
         self.last_activity = datetime.now(timezone.utc).isoformat()
         self.current_symbol = sym
+        try:
+            self.last_prices[sym] = float(bar.close)
+        except (TypeError, ValueError):
+            pass
         # Announce the closed bar. Only CLOSED bars reach this method, which is
         # the contract MarketDataReceived states. The bus isolates subscriber
         # errors, and this guard covers the remaining case — constructing the

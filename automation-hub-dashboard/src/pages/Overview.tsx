@@ -11,6 +11,7 @@ import ActivityFeed from "../components/activity/ActivityFeed";
 import RiskCenter from "../components/risk/RiskCenter";
 import RecentAlerts from "../components/alerts/RecentAlerts";
 import WhyNoTrades from "../components/cards/WhyNoTrades";
+import ActiveTradingInstances from "../components/instances/ActiveTradingInstances";
 
 // The polished layout — every card is now backed by live backend data (paper).
 export default function Overview() {
@@ -20,6 +21,7 @@ export default function Overview() {
       <WhyNoTrades />
       <DashboardHero />
       <MetricCards />
+      <ActiveTradingInstances />
 
       <div className="grid-mid">
         <Card

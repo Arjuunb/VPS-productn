@@ -656,6 +656,41 @@ a.brand:hover { opacity: 0.85; }
 .stat-sub { font-size: 11.5px; }
 .stat-spark { height: 30px; margin-top: auto; }
 
+/* Active Trading Instances — monitoring-only dashboard section. Instance
+   management remains intentionally on the dedicated instance route. */
+.active-instances-section { display: flex; flex-direction: column; gap: 14px; }
+.active-instances-title { display: flex; align-items: flex-end; justify-content: space-between; gap: 14px; margin-top: 4px; }
+.active-instances-title h2 { margin: 0; font-size: 16px; letter-spacing: -0.2px; }
+.active-instances-title p { margin: 4px 0 0; color: var(--dim); font-size: 11.5px; }
+.instance-summary-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; }
+.instance-summary-row .stat-card { min-height: 84px; }
+.instance-summary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+.instance-summary-card { border: 1px solid var(--card-border); background: linear-gradient(180deg, var(--card-elevated), var(--card-1)); border-radius: var(--radius); padding: 15px; cursor: pointer; box-shadow: var(--shadow), inset 0 1px 0 rgba(255,255,255,0.025); transition: border-color .18s ease, transform .18s ease; }
+.instance-summary-card:hover, .instance-summary-card:focus-visible { border-color: rgba(124,185,232,.6); transform: translateY(-1px); outline: none; }
+.instance-summary-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+.instance-summary-head > div { display: flex; flex-direction: column; min-width: 0; }
+.instance-summary-head b { font-size: 15px; }
+.instance-summary-head span { color: var(--dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.instance-summary-meta { color: var(--dim); font-size: 11px; margin-top: 8px; text-transform: capitalize; }
+.instance-summary-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 9px 12px; margin: 14px 0; }
+.instance-summary-stats > div { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; font-size: 12px; }
+.instance-summary-stats span { color: var(--dim); }
+.instance-position, .instance-wait { min-height: 56px; border-radius: 8px; border: 1px solid var(--card-border-soft); background: #131315; padding: 9px 10px; display: flex; flex-direction: column; gap: 2px; font-size: 11px; }
+.instance-position > span { color: var(--dim); }
+.instance-wait { color: var(--dim); justify-content: center; }
+.instance-summary-foot { display: flex; align-items: center; gap: 8px; margin-top: 12px; color: var(--dim); font-size: 10.5px; }
+.instance-summary-foot > span:nth-child(2) { flex: 1; text-align: right; }
+.instance-summary-foot > div { display: flex; gap: 5px; }
+.instance-risk-notice { border-radius: 9px; padding: 10px 12px; font-size: 12px; font-weight: 600; }
+.instance-risk-notice.amber { color: var(--amber); border: 1px solid rgba(234,181,79,.3); background: rgba(234,181,79,.1); }
+.instance-risk-notice.red { color: var(--red); border: 1px solid rgba(239,68,68,.3); background: rgba(239,68,68,.1); }
+.instance-empty { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 70px; }
+.instance-empty p { color: var(--dim); font-size: 12px; margin: 0; }
+.best-instance-insight { display: flex; align-items: center; gap: 10px; padding: 11px 13px; border: 1px solid rgba(34,197,94,.25); border-radius: 10px; background: rgba(34,197,94,.07); color: var(--text); text-align: left; }
+.best-instance-insight:hover { background: rgba(34,197,94,.12); }
+.best-instance-insight span { color: var(--dim); font-size: 11.5px; }
+.best-instance-insight b { color: var(--green); font-size: 12.5px; }
+
 /* page grids */
 .grid-2-1 { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; }
 .grid-2-1 .span-2 { grid-column: auto; }
@@ -749,12 +784,22 @@ a.brand:hover { opacity: 0.85; }
 
 @media (max-width: 1200px) {
   .stat-row, .stat-row.six { grid-template-columns: repeat(3, 1fr); }
+  .instance-summary-row { grid-template-columns: repeat(3, 1fr); }
+  .instance-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .strategy-grid, .grid-3-eq { grid-template-columns: 1fr 1fr; }
 }
 @media (max-width: 900px) {
   .grid-2-1, .grid-2-eq, .grid-3-eq, .strategy-grid { grid-template-columns: 1fr; }
   .stat-row, .stat-row.six { grid-template-columns: repeat(2, 1fr); }
+  .instance-summary-row { grid-template-columns: repeat(2, 1fr); }
   .form-grid-3 { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 600px) {
+  .active-instances-title, .instance-empty { align-items: flex-start; flex-direction: column; }
+  .instance-summary-row, .instance-summary-grid { grid-template-columns: 1fr; }
+  .instance-summary-foot { flex-wrap: wrap; }
+  .instance-summary-foot > span:nth-child(2) { text-align: left; flex: auto; }
+  .best-instance-insight { align-items: flex-start; flex-direction: column; gap: 3px; }
 }
 
 /* button variants + interaction polish (per-bot detail, run state) */
