@@ -25,6 +25,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+# ``python scripts/<name>.py`` puts only ``scripts/`` on sys.path.  The
+# production container's working directory is ``automation-hub`` but it is not
+# automatically importable in that invocation, so add both package roots before
+# importing Hub modules.  This is read-only bootstrap wiring, not a runtime
+# configuration change.
+_HUB_ROOT = Path(__file__).resolve().parents[1]
+_PROJECT_ROOT = _HUB_ROOT.parent
+for _path in (_HUB_ROOT, _PROJECT_ROOT):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
 from data.market_data_v2 import TF_MS, normalize_symbol
 from services.performance import summarize
 
