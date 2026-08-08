@@ -10,6 +10,7 @@ run through the built-in strategy simulator with the same quality gate.
 from __future__ import annotations
 
 from typing import Optional
+from strategies.builtin_versions import builtin_strategy_version
 
 # The strategy options the control bar offers.
 PRESETS: dict = {
@@ -33,9 +34,9 @@ STRATEGY_OPTIONS = list(PRESETS)
 
 # Real strategy registry the selector pulls from (id / version / metadata).
 REGISTRY = [
-    {"id": "decision_brain", "name": "Decision Brain", "version": "1.0", "kind": "builtin",
+    {"id": "decision_brain", "name": "Decision Brain", "version": builtin_strategy_version("brain"), "kind": "builtin",
      "timeframes": ["1h", "4h"], "description": "Multi-factor trend + regime + momentum"},
-    {"id": "trend_following", "name": "Trend Following", "version": "1.0", "kind": "builtin",
+    {"id": "trend_following", "name": "Trend Following", "version": builtin_strategy_version("supertrend"), "kind": "builtin",
      "timeframes": ["4h", "1d"], "description": "Supertrend ATR trend-following"},
     {"id": "supply_demand", "name": "Supply/Demand", "version": "1.0", "kind": "builtin",
      "timeframes": ["15m", "4h"], "description": "SMC: liquidity sweep + CHoCH/BOS + FVG"},

@@ -1,0 +1,82 @@
+"""Immutable provenance for source-controlled built-in strategies.
+
+Custom strategies already keep editable version snapshots.  The two established
+built-ins below are code-defined, so a label such as ``Supertrend`` alone is
+not sufficient to reproduce a paper record.  This registry makes the preserved
+production baseline explicit and pairs it with a deterministic signal fixture
+in ``tests/test_builtin_strategy_versions.py``.
+
+Changing either strategy's observable behaviour requires a new semantic version
+and a new fixture fingerprint.  Do not edit an existing version in place.
+"""
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from types import MappingProxyType
+from typing import Mapping
+
+
+@dataclass(frozen=True)
+class BuiltinStrategyVersion:
+    key: str
+    version: str
+    label: str
+    source_ref: str
+    source_blob: str
+    defaults: tuple[tuple[str, float | int], ...]
+    fixture: str
+    fixture_signal_count: int
+    fixture_signal_sha256: str
+
+    def public(self) -> dict:
+        """Return safe, API-ready provenance without a mutable object."""
+        row = asdict(self)
+        row["defaults"] = dict(self.defaults)
+        return row
+
+
+# ``source_ref`` records the earliest preserved production baseline.  It does
+# *not* assert a profitable historical run; there is no such run in Git or the
+# checked-in ledger.  ``source_blob`` is the Git blob at that baseline and is
+# useful when matching an exported trade journal to the source that produced it.
+BUILTIN_STRATEGY_VERSIONS: Mapping[str, BuiltinStrategyVersion] = MappingProxyType({
+    "brain": BuiltinStrategyVersion(
+        key="brain",
+        version="1.0.0",
+        label="Decision Brain",
+        source_ref="v1.0.0-production (5d0782c)",
+        source_blob="8906671d8cd46688f4ba5d86d7cea55966eaee4f",
+        defaults=(("fast", 12), ("slow", 26), ("trend", 50), ("rsi_period", 14),
+                  ("conviction_threshold", 0.56), ("rr_target", 3.0)),
+        fixture="BTCUSDT bundled 1h sample, 2,000 bars, causal signal stream",
+        fixture_signal_count=56,
+        fixture_signal_sha256="8714cd53d8e29f9e96801a3f64b5c925dbf332db19bccef18145d47f04c27339",
+    ),
+    "supertrend": BuiltinStrategyVersion(
+        key="supertrend",
+        version="1.0.0",
+        label="Supertrend",
+        source_ref="v1.0.0-production (5d0782c)",
+        source_blob="b0dda664b3f03f20ea0af982f9999c7e10e6ea64",
+        defaults=(("period", 10), ("mult", 3.0), ("atr_period", 14),
+                  ("atr_mult", 1.5), ("rr_target", 2.5)),
+        fixture="BTCUSDT bundled 1h sample, 2,000 bars, causal signal stream",
+        fixture_signal_count=22,
+        fixture_signal_sha256="f811f8fd7c7d67ce8bc7cbb3719760f12801566960c284dd4deaff7863c68b98",
+    ),
+})
+
+
+def builtin_strategy_version(key: str) -> str:
+    """The immutable version label for a known built-in strategy.
+
+    Unknown/legacy strategies deliberately remain labelled ``unversioned`` so
+    callers cannot imply reproducibility that the repository cannot provide.
+    """
+    entry = BUILTIN_STRATEGY_VERSIONS.get(key)
+    return entry.version if entry else "unversioned"
+
+
+def builtin_strategy_metadata(key: str) -> dict:
+    entry = BUILTIN_STRATEGY_VERSIONS.get(key)
+    return entry.public() if entry else {"key": key, "version": "unversioned"}

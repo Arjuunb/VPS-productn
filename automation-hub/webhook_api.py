@@ -22,6 +22,7 @@ from services.auto_engine import AutoStrategyEngine
 from services.controls import TradingControl
 from services.market_quality import MarketQualityConfig, MarketQualityGate
 from services.signal_pipeline import SignalPipeline
+from strategies.builtin_versions import builtin_strategy_version
 
 # --- Phase 1 singletons (one ledger / paper account / control switch) ---
 _BOOT = time.time()
@@ -836,8 +837,10 @@ class FillModelBody(BaseModel):
 
 _STRATEGY_CATALOG = [
     {"key": "brain", "label": "Decision Brain",
+     "version": builtin_strategy_version("brain"),
      "desc": "Multi-factor trend: EMA trend + filter, momentum, RSI, regime; conviction-weighted sizing"},
-    {"key": "supertrend", "label": "Supertrend", "desc": "ATR trend-following indicator"},
+    {"key": "supertrend", "label": "Supertrend", "version": builtin_strategy_version("supertrend"),
+     "desc": "ATR trend-following indicator"},
     {"key": "donchian", "label": "Donchian Breakout", "desc": "Classic Turtle channel breakout"},
     {"key": "ensemble", "label": "Confirmation Ensemble",
      "desc": "Trades only when 2 of 3 agree (EMA + Supertrend + Donchian)"},

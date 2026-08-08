@@ -12,7 +12,9 @@ router = APIRouter()
 class InstanceCreate(BaseModel):
     symbol: str = Field(..., min_length=3, max_length=30)
     strategy: str = Field("brain", min_length=1)
-    strategy_version: str = Field("builtin-1", min_length=1, max_length=80)
+    # Omitted means use the immutable catalogue version.  Explicit historical
+    # labels remain accepted for existing clients and imported records.
+    strategy_version: Optional[str] = Field(default=None, min_length=1, max_length=80)
     timeframe: str = Field("5m", min_length=2, max_length=8)
     risk_per_trade_pct: float = Field(0.005, gt=0, le=0.05)
     capital_allocation: float = Field(..., gt=0)
@@ -89,7 +91,7 @@ def create_instance(body: InstanceCreate, x_webhook_secret: Optional[str] = Head
     _wa._check_secret(x_webhook_secret)
     strategy = _catalog(body.strategy)
     inst = _manager().create(symbol=body.symbol, strategy_key=strategy["key"], strategy_label=strategy["label"],
-                             strategy_version=body.strategy_version, timeframe=body.timeframe,
+                             strategy_version=body.strategy_version or strategy.get("version", "unversioned"), timeframe=body.timeframe,
                              risk_per_trade_pct=body.risk_per_trade_pct,
                              capital_allocation=body.capital_allocation, mode=body.mode)
     _wa.ledger.log(level="info", stage="instance", message=f"Instance created: {inst.symbol} {inst.strategy_label} {inst.strategy_version}", symbol=inst.symbol)
