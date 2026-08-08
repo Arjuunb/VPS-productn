@@ -583,8 +583,16 @@ class AutoStrategyEngine:
     def _record_market_snapshot(self, symbol, closed) -> None:
         newest = closed[-1]
         self.last_closed_candle = newest.timestamp.isoformat()
-        age = (datetime.now(timezone.utc) - newest.timestamp).total_seconds()
-        allowed_age = _TF_SECONDS.get(self.timeframe, 3600) * 1.5
+        # OHLCV providers timestamp a candle at its *open*.  ``newest`` is
+        # already known to be closed (the caller removed the forming bar), so
+        # freshness begins when that interval closes, not at its open.  Using
+        # the raw timestamp made an otherwise current 5m candle appear five
+        # minutes older than it is and could exhaust reconnects before the
+        # next provider candle arrived.
+        interval = _TF_SECONDS.get(self.timeframe, 3600)
+        raw_age = (datetime.now(timezone.utc) - newest.timestamp).total_seconds()
+        age = max(0.0, raw_age - interval)
+        allowed_age = interval * 1.5
         if age > allowed_age:
             self.market_data_status = "stale"
             raise EngineFeedError(f"{symbol} market data stale: age={age:.0f}s allowed={allowed_age:.0f}s")

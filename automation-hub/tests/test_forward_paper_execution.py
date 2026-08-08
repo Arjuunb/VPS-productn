@@ -57,6 +57,16 @@ def test_stale_live_data_is_fail_closed_before_any_strategy_processing():
     assert engine.market_data_status == "stale"
 
 
+def test_freshness_starts_when_the_closed_candle_closes():
+    """Provider OHLCV timestamps are candle-open times, not close times."""
+    engine = _engine()
+    # A 5m candle which opened 9m30s ago closed 4m30s ago.  It is still within
+    # the 7m30s forward-paper freshness guard and must not be treated as stale.
+    recently_closed = _bar(datetime.now(timezone.utc) - timedelta(minutes=9, seconds=30))
+    engine._record_market_snapshot("BTCUSDT", [recently_closed])
+    assert engine.market_data_status == "healthy"
+
+
 def test_forward_fetcher_does_not_fall_back_when_provider_is_unavailable(monkeypatch):
     monkeypatch.setattr("data.live_data.fetch_ohlcv", lambda *args, **kwargs: None)
     monkeypatch.setattr("data.live_data.last_error", lambda *_args: "provider offline")
