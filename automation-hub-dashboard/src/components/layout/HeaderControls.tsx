@@ -31,9 +31,6 @@ export default function HeaderControls() {
     {lead ? <button className="hdr-chip" onClick={() => app.viewInstance(lead.id)} title="Open active instance details">
       <b>{lead.symbol} · {lead.strategy_label}</b><span className="dim">{lead.timeframe}</span>
     </button> : <button className="hdr-chip" onClick={() => app.go("Trading Instances")}><b>Create instance</b><Icon name="plus" size={12} /></button>}
-    <button className="hdr-chip" onClick={() => app.go("Paper Trading")} title="Open Paper Trading terminal">
-      <Icon name="bot" size={13} /><span className="hide-sm">Terminal</span>
-    </button>
-    <button className="hdr-chip hdr-gear" onClick={() => app.go("Settings")} title="Global account settings"><Icon name="settings" size={13} /></button>
+    <button className="hdr-chip hdr-gear" onClick={() => app.go("Paper Trading")} title="Open Paper Trading terminal"><Icon name="settings" size={13} /></button>
   </div>;
 }
