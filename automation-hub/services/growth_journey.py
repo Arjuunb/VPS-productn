@@ -15,6 +15,15 @@ def _r(x, nd=2):
     return round(float(x), nd)
 
 
+def _net_r(trade: dict) -> float:
+    """Realized R after modeled fees when entry risk is available."""
+    risk = float(trade.get("risk_amount") or 0.0)
+    pnl = trade.get("pnl")
+    if risk > 0 and pnl is not None:
+        return float(pnl) / risk
+    return float(trade.get("actual_rr") or 0.0)
+
+
 def build_growth(rows: list[dict]) -> dict:
     """Summarise remembered trades (any order; sorted internally by close)."""
     closed = [t for t in rows if t.get("result") in ("win", "loss", "breakeven")]
@@ -25,10 +34,10 @@ def build_growth(rows: list[dict]) -> dict:
     closed.sort(key=lambda t: t.get("closed_at") or "")
     wins = [t for t in closed if t["result"] == "win"]
     losses = [t for t in closed if t["result"] == "loss"]
-    rr = [float(t.get("actual_rr") or 0.0) for t in closed]
+    rr = [_net_r(t) for t in closed]
     pnl = [float(t.get("pnl") or 0.0) for t in closed]
-    win_r = [float(t.get("actual_rr") or 0.0) for t in wins]
-    loss_r = [float(t.get("actual_rr") or 0.0) for t in losses]
+    win_r = [_net_r(t) for t in wins]
+    loss_r = [_net_r(t) for t in losses]
     gross_win = sum(x for x in rr if x > 0)
     gross_loss = -sum(x for x in rr if x < 0)
 
@@ -57,7 +66,7 @@ def build_growth(rows: list[dict]) -> dict:
         m = months[key]
         m["trades"] += 1
         m["wins"] += 1 if t["result"] == "win" else 0
-        m["net_r"] += float(t.get("actual_rr") or 0.0)
+        m["net_r"] += _net_r(t)
     monthly = [{"month": k, "trades": v["trades"], "net_r": _r(v["net_r"]),
                 "win_rate": _r(100 * v["wins"] / v["trades"], 1)}
                for k, v in sorted(months.items())][-12:]
@@ -69,7 +78,7 @@ def build_growth(rows: list[dict]) -> dict:
             g = groups[name]
             g["trades"] += 1
             g["wins"] += 1 if t["result"] == "win" else 0
-            g["net_r"] += float(t.get("actual_rr") or 0.0)
+            g["net_r"] += _net_r(t)
         out = [{"name": k, "trades": v["trades"], "net_r": _r(v["net_r"]),
                 "win_rate": _r(100 * v["wins"] / v["trades"], 1)}
                for k, v in groups.items()]
@@ -100,7 +109,9 @@ def build_growth(rows: list[dict]) -> dict:
         "monthly": monthly,
         "by_strategy": split("strategy"),
         "by_symbol": split("symbol"),
-        "grades": dict(sorted(grades.items())),
+        # These are post-trade review grades, not predictive setup grades.
+        "outcome_grades": dict(sorted(grades.items())),
+        "grades": dict(sorted(grades.items())),  # backward-compatible API
         "sample_note": ("early sample — fewer than 30 remembered trades; "
                         "treat every number as provisional" if n < 30 else
                         "meaningful sample (30+ remembered trades)"),

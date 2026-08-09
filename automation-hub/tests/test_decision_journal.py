@@ -84,13 +84,13 @@ def test_store_roundtrip_and_evolution_staging():
 
 
 # ─────────────────────────── pipeline integration ───────────────────────────
-def _pipe_with_journal():
+def _pipe_with_journal(fill_model=None):
     from data.ledger import SqliteLedger
     from execution.paper_engine import PaperExecutionEngine
     from services.controls import TradingControl
     from services.signal_pipeline import SignalPipeline
     led = SqliteLedger(":memory:")
-    paper = PaperExecutionEngine(led)
+    paper = PaperExecutionEngine(led, fill_model=fill_model)
     pipe = SignalPipeline(led, paper, TradingControl(), equity=10_000,
                           risk_per_trade_pct=0.01, exposure_limit_pct=0.5,
                           max_total_exposure_pct=1.0, adaptive_risk=False,
@@ -138,6 +138,34 @@ def test_pipeline_records_full_journal_on_open_and_close():
     assert jc["sections"]["review"]["grade"] in ("A", "B")
     assert "evolution" in jc["sections"]
     assert jc["sections"]["evolution"]["take_similar_again"] is True
+
+
+def test_journal_uses_actual_realistic_exit_and_net_r():
+    from services.fill_model import RealisticFill
+
+    fills = RealisticFill(spread_pct=0.002, slippage_pct=0, latency_pct=0,
+                          taker_fee_pct=0.001, maker_fee_pct=0.001)
+    pipe, _paper = _pipe_with_journal(fills)
+    opened = pipe.process({
+        "alert_id": "real-open", "symbol": "BTCUSDT", "side": "BUY",
+        "entry": 100.0, "stop": 95.0, "target": 110.0, "confidence": 1.0,
+        "strategy": "Supertrend", "timeframe": "5m", "mode": "paper",
+    })
+    assert opened.accepted
+    closed = pipe.process({
+        "alert_id": "real-close", "symbol": "BTCUSDT", "side": "CLOSE",
+        "entry": 100.0, "exit_reason": "manual-close",
+    })
+    assert closed.accepted
+
+    journal = pipe.journal.store.get(opened.fill["trade_id"])
+    executed_exit = closed.fill["price"]
+    assert executed_exit < 100.0
+    assert journal["exit"] == executed_exit
+    assert journal["sections"]["exit_decision"]["gross_price_rr"] < 0
+    assert journal["actual_rr"] == pytest.approx(
+        journal["pnl"] / journal["risk_amount"], abs=1e-3)
+    assert journal["sections"]["review"]["grade"] not in ("A", "B")
 
 
 # ─────────────────────────── endpoints ───────────────────────────

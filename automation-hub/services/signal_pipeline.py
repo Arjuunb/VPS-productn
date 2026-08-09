@@ -269,6 +269,9 @@ class SignalPipeline:
         self.skipped = None
         # Permanent trade memory: composes the closed trade into a forever record.
         self.trade_memory = None
+        # Server-owned execution provenance captured with every journal entry.
+        # Instance workers populate this; clients cannot override it.
+        self.journal_context: dict[str, object] = {}
         self._halted = False
         self._halt_reason = ""
         # Drawdown is measured from this baseline; a manual Resume rebaselines to
@@ -381,6 +384,10 @@ class SignalPipeline:
             return self._process(payload)
 
     def _process(self, payload: dict) -> PipelineResult:
+        # Copy before adding server-owned evidence so one worker cannot mutate a
+        # payload later reused by another instance or caller.
+        payload = dict(payload)
+        payload["journal_execution"] = dict(self.journal_context)
         symbol = payload["symbol"]
         side = str(payload["side"]).upper()
         entry = float(payload["entry"])
@@ -465,7 +472,10 @@ class SignalPipeline:
             if self.journal is not None and _open_tid:
                 try:
                     self.journal.record_exit(
-                        trade_id=_open_tid, exit_price=entry, pnl=fill.pnl,
+                        # The fill model may move an exit through spread and
+                        # slippage. Journal the executed price, never the
+                        # requested trigger price.
+                        trade_id=_open_tid, exit_price=fill.price, pnl=fill.pnl,
                         exit_reason=payload.get("exit_reason")
                         or ("opposite-signal" if side not in _CLOSE_SIDES else "manual-close"),
                         mfe_r=payload.get("mfe_r"), mae_r=payload.get("mae_r"))
@@ -480,7 +490,7 @@ class SignalPipeline:
             self.ledger.insert_webhook_event(alert_id=alert_id, symbol=symbol, side=side,
                                               entry=entry, stop=stop, payload=payload, status="accepted")
             self.ledger.log(level="info", stage="execution",
-                            message=f"{symbol} closed @ {entry} (PnL {fill.pnl:+.2f})", symbol=symbol)
+                            message=f"{symbol} closed @ {fill.price} (PnL {fill.pnl:+.2f})", symbol=symbol)
             self.ledger.add_alert(severity="info", category="trade",
                                   title=f"Position closed — {symbol}", detail=f"PnL {fill.pnl:+.2f}")
             self._notify("trade", f"📉 {symbol} closed", f"PnL {fill.pnl:+.2f}")

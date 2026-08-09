@@ -536,10 +536,13 @@ class TradingInstanceManager:
     def __init__(self, ledger: Ledger, *, strategy_factory: Callable[[str, str], object],
                  live: bool, live_poll_s: float, fetcher=None, max_slots: int = 1,
                  max_global_risk_pct: float = 0.02, max_global_daily_loss_pct: float = 0.05,
-                 paper_account_capital: float = 10_000.0, decision_store=None):
+                 paper_account_capital: float = 10_000.0, decision_store=None,
+                 decision_journal=None, trade_memory=None):
         self.ledger, self.store = ledger, InstanceStore(ledger)
         self.strategy_factory, self.live, self.live_poll_s, self.fetcher = strategy_factory, live, live_poll_s, fetcher
         self.decision_store = decision_store
+        self.decision_journal = decision_journal
+        self.trade_memory = trade_memory
         # Forward trading intentionally does not inherit HUB_USE_LIVE_DATA. It
         # always uses the strict provider-only adapter; a missing provider is a
         # fail-closed market-data error, never a replay fallback.
@@ -714,6 +717,20 @@ class TradingInstanceManager:
                                       maximum_risk_amount=inst.maximum_risk_amount,
                                       minimum_equity=inst.minimum_equity)
             pipeline.global_entry_guard = lambda **kw: self._global_guard(instance_id, **kw)
+            # Trading Instances use the same explainable close/review/memory
+            # lifecycle as the legacy pipeline, but retain immutable instance
+            # provenance so evidence is never silently blended.
+            pipeline.journal = self.decision_journal
+            pipeline.trade_memory = self.trade_memory
+            pipeline.journal_context = {
+                "instance_id": inst.id,
+                "strategy_version": inst.strategy_version,
+                "market_data_mode": inst.market_data_mode,
+                "fill_model": inst.fill_model,
+                "execution_mode": inst.execution_mode,
+                "exchange": inst.exchange,
+                "instrument_type": inst.instrument_type,
+            }
             forward = inst.mode == "trading"
             exchange = (inst.exchange if inst.exchange != "inherit"
                         else (os.environ.get("HUB_EXCHANGE", "binance").strip() or "binance"))

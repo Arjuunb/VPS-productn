@@ -89,9 +89,9 @@ def grade_trade(*, result: str, actual_rr: float, planned_rr: float,
     r = actual_rr
     if not risk_ok:
         return "F"                                   # risk was violated — worst
-    if r >= max(1.5, 0.6 * planned_rr) and followed_strategy:
+    if result == "win" and r >= max(1.5, 0.6 * planned_rr) and followed_strategy:
         return "A"
-    if r > 0 and followed_strategy:
+    if result == "win" and r > 0 and followed_strategy:
         return "B"
     if r > -1.0 and followed_strategy:
         return "C"                                   # a controlled loss, on process
@@ -227,6 +227,7 @@ class DecisionJournal:
         sizing = payload.get("journal_sizing") or {}
         engine_guardrails = payload.get("journal_engine") or {}
         quality_gate = payload.get("journal_quality_gate") or {}
+        provenance = payload.get("journal_execution") or {}
         sections = {
             "entry_decision": {
                 "main_reason": reason or "Strategy signal fired.",
@@ -256,6 +257,15 @@ class DecisionJournal:
                 "entry_sizing": sizing,
                 "engine_guardrails": engine_guardrails,
                 "final_risk_decision": "Allowed — all risk gates passed.",
+            },
+            "provenance": {
+                "instance_id": provenance.get("instance_id"),
+                "strategy_version": provenance.get("strategy_version"),
+                "market_data_mode": provenance.get("market_data_mode") or "unknown",
+                "fill_model": provenance.get("fill_model") or "unknown",
+                "execution_mode": provenance.get("execution_mode") or mode,
+                "exchange": provenance.get("exchange") or "unknown",
+                "instrument_type": provenance.get("instrument_type") or "unknown",
             },
         }
         self.store.record_entry({
@@ -287,7 +297,12 @@ class DecisionJournal:
         planned_rr = j.get("planned_rr") or 0.0
         risk_dist = abs((entry or 0) - (stop or 0)) or 1.0
         move = (exit_price - entry) if side == "long" else (entry - exit_price)
-        actual_rr = round(move / risk_dist, 3)
+        gross_rr = round(move / risk_dist, 3)
+        # PnL is net of modeled commissions while the price move is gross.
+        # Grade and stored actual R on the net result when entry risk was
+        # captured; otherwise retain the historical gross-price fallback.
+        risk_amount = float(j.get("risk_amount") or 0.0)
+        actual_rr = round(pnl / risk_amount, 3) if risk_amount > 0 else gross_rr
         result = "win" if pnl > 0 else "loss" if pnl < 0 else "breakeven"
         review = build_review(side=side, planned_rr=planned_rr, actual_rr=actual_rr,
                               result=result, exit_reason=exit_reason,
@@ -298,7 +313,11 @@ class DecisionJournal:
                                             j.get("regime"), side, actual_rr)
         evolution = build_evolution({**stage, "setup_key": setup_key})
         exit_decision = {"exit_reason": exit_reason, "exit_price": exit_price,
-                         "actual_rr": actual_rr, "pnl": round(pnl, 2), "result": result,
+                         "actual_rr": actual_rr, "net_rr": actual_rr,
+                         "gross_price_rr": gross_rr,
+                         "rr_basis": ("net_pnl / entry_risk" if risk_amount > 0
+                                      else "gross price move / stop distance"),
+                         "pnl": round(pnl, 2), "result": result,
                          # lifecycle telemetry (in R); honest "not tracked" for
                          # positions adopted without management state
                          "max_profit_r": mfe_r if mfe_r is not None else "not tracked",

@@ -18,10 +18,10 @@ For every trade, `services/trade_memory.compose_memory()` builds:
 
 | # | Category | Source | Honest gaps |
 |---|----------|--------|-------------|
-| 1 | **Trade Information** | journal row | fees = `0.00 (paper — fees not modeled)`; risk % only if equity known |
+| 1 | **Trade Information** | journal row | includes Trading Instance / market-data provenance when captured; fees = `0.00 (paper — fees not modeled)`; risk % only if equity known |
 | 2 | **Market Context** | brain snapshot | funding rate / Fear & Greed / BTC dominance / support / resistance → `not captured` (no live provider wired) |
 | 3 | **Technical Analysis** | brain snapshot + entry checklist | EMA/RSI are real; MACD/VWAP/Bollinger/order-blocks/FVG/BOS/CHoCH → `Not checked` unless the strategy actually computed them |
-| 4 | **Strategy** | journal + decision | name, timeframe, setup grade, confidence, brain score, regime |
+| 4 | **Strategy** | journal + decision | name, timeframe, pre-trade setup-quality grade, confidence, brain score, regime |
 | 5 | **Execution** | decision + checklist | why opened / why closed, conditions passed / failed |
 | 6 | **Emotion & Journal** | manual | your own note (e.g. "FOMO", "entered early") via PATCH |
 | 7 | **Trade Outcome** | journal review | result, profit/loss, RR, mistakes, lessons, improvement notes |
@@ -63,8 +63,8 @@ numeric feature vector (side, RR, confidence, brain score, RSI, ATR%, …).
 ## Pattern recognition & coaching
 
 `services/memory_insights.build_review()` computes, from the real memory:
-win rate / expectancy / avg-RR by **weekday, symbol, strategy, session, setup
-grade**; best/worst setups & sessions; the **mistake library** (ranked by
+win rate / net-R expectancy / average PnL by **weekday, symbol, strategy, session, pre-trade
+setup-quality grade**; best/worst setups & sessions; the **mistake library** (ranked by
 frequency, flags repeats); **winning patterns**; average hold; and
 Sharpe/Sortino/expectancy/max-drawdown (Sharpe/Sortino reuse
 `performance._risk_adjusted`, per-trade R basis).
@@ -74,6 +74,20 @@ the London session"* is only emitted when the bucket is large enough
 (`_MIN_BUCKET = 5`), and every claim carries its stage:
 `early-signal (<10)` → `building` → `evidence (≥30)`. Thin data yields an
 explicit *insufficient-data* / *no-signal* message instead of a fabricated edge.
+
+The post-trade A-F review grade is retained as an **outcome grade** for audit
+purposes, but is never used to claim a predictive setup edge. Setup-quality
+groups use only scores captured before entry, preventing hindsight leakage.
+New Trading Instance trades also retain instance ID, market-data mode, exchange,
+execution mode and fill model. The dashboard separately counts
+`paper_forward + RealisticFill` trades so replay/unknown/idealized fills cannot
+silently masquerade as live-readiness evidence.
+Strategy ranking, entry-quality patterns and automated coaching use that
+forward-realistic subset. The complete mixed archive remains visible for audit
+and historical comparison, but cannot elect a production strategy.
+Net-R expectancy is calculated as realized PnL divided by captured entry risk,
+so modeled commission is included and different capital allocations remain
+comparable. Dollar expectancy is exposed separately as `expectancy_pnl`.
 
 Reviews run **nightly** (with weekly/monthly/yearly rollups) via the existing
 `DailyTasks` hook, and can be triggered on demand.
@@ -92,6 +106,7 @@ Reviews run **nightly** (with weekly/monthly/yearly rollups) via the existing
 | PATCH | `/trade-memory/{id}/notes` | attach manual note *(secret)* |
 | DELETE | `/trade-memory/{id}` | permanently forget one trade *(secret)* |
 | POST | `/trade-memory/backfill` | import already-closed journal trades *(secret)* |
+| POST | `/trade-memory/rebuild` | recompose derived memories after upgrades; preserves notes *(secret)* |
 | POST | `/trade-memory/reviews/run` | run reviews now *(secret)* |
 
 ## Dashboard

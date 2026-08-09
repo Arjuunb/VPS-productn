@@ -26,6 +26,7 @@ _SESSIONS = (
     ("London", 7, 16), ("New York", 12, 21),
 )
 _WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+_SETUP_GRADE_BASIS = "pretrade_quality_v1"
 
 
 def _parse_ts(ts) -> Optional[datetime]:
@@ -65,6 +66,39 @@ def _num(v):
         return None
 
 
+def _pretrade_setup_grade(journal: dict, entry_decision: dict) -> dict:
+    """Grade entry quality without looking at the eventual trade result.
+
+    The former memory composer copied the journal's post-trade A-F review into
+    ``setup_grade``.  Since that review is partly calculated from realised R,
+    grouping performance by it leaked the answer and made A grades look
+    predictively perfect.  Use the quality-gate score captured at entry, then
+    the entry-time brain/confidence scores as honest fallbacks.
+    """
+    candidates = (
+        (entry_decision.get("quality_gate_score"), "quality_gate_score"),
+        (journal.get("brain_score"), "brain_score"),
+        (journal.get("confidence"), "confidence_score"),
+    )
+    score = source = None
+    for raw, label in candidates:
+        value = _num(raw)
+        if value is not None:
+            score, source = value, label
+            break
+    if score is None:
+        return {"grade": "Unscored", "score": None, "source": "not captured",
+                "basis": _SETUP_GRADE_BASIS}
+    # Accept either 0..1 confidence or the normal 0..100 score scale.
+    if 0 <= score <= 1:
+        score *= 100
+    score = max(0.0, min(100.0, score))
+    grade = ("A" if score >= 80 else "B" if score >= 70 else
+             "C" if score >= 60 else "D" if score >= 50 else "F")
+    return {"grade": grade, "score": round(score, 2), "source": source,
+            "basis": _SETUP_GRADE_BASIS}
+
+
 def compose_memory(journal: dict, *, decision: Optional[dict] = None,
                    exchange: str = "paper", notes: str = "") -> dict:
     """Build the permanent 8-category memory for one CLOSED journal trade."""
@@ -75,6 +109,8 @@ def compose_memory(journal: dict, *, decision: Optional[dict] = None,
     evolution = s.get("evolution", {}) or {}
     entry_dec = s.get("entry_decision", {}) or {}
     exit_dec = s.get("exit_decision", {}) or {}
+    provenance = s.get("provenance", {}) or {}
+    setup_quality = _pretrade_setup_grade(journal, entry_dec)
 
     created = _parse_ts(journal.get("created_at"))
     closed = _parse_ts(journal.get("closed_at"))
@@ -97,7 +133,9 @@ def compose_memory(journal: dict, *, decision: Optional[dict] = None,
         "trade_id": journal.get("trade_id"),
         "date": created.date().isoformat() if created else _NOT_CAPTURED,
         "time_utc": created.strftime("%H:%M:%S UTC") if created else _NOT_CAPTURED,
-        "exchange": exchange,
+        "exchange": provenance.get("exchange") or exchange,
+        "instance_id": provenance.get("instance_id") or _NOT_CAPTURED,
+        "market_data_mode": provenance.get("market_data_mode") or _NOT_CAPTURED,
         "symbol": journal.get("symbol"),
         "direction": "Long" if journal.get("side") == "long" else "Short",
         "entry": entry,
@@ -139,19 +177,24 @@ def compose_memory(journal: dict, *, decision: Optional[dict] = None,
         "macd": snap.get("macd", _NOT_CHECKED),
         "vwap": snap.get("vwap", _NOT_CHECKED),
         "bollinger_bands": snap.get("bollinger", _NOT_CHECKED),
-        "order_blocks": _smc_read(checklist, "order_block"),
-        "fair_value_gaps": _smc_read(checklist, "fvg"),
-        "supply_demand": _smc_read(checklist, "supply") or _smc_read(checklist, "demand"),
-        "break_of_structure": _smc_read(checklist, "bos") or _smc_read(checklist, "break_of_structure"),
-        "change_of_character": _smc_read(checklist, "choch") or _smc_read(checklist, "change_of_character"),
+        "order_blocks": _smc_read_any(checklist, "order_block", "order block"),
+        "fair_value_gaps": _smc_read_any(checklist, "fvg", "fair value gap"),
+        "supply_demand": _smc_read_any(checklist, "supply", "demand"),
+        "break_of_structure": _smc_read_any(checklist, "bos", "break of structure"),
+        "change_of_character": _smc_read_any(checklist, "choch", "change of character"),
     }
 
     # ---- 4. Strategy ----------------------------------------------------------
     strategy = {
         "name": journal.get("strategy"),
-        "version": snap.get("strategy_version") or (decision or {}).get("strategy_version") or _NOT_CAPTURED,
+        "version": (provenance.get("strategy_version") or snap.get("strategy_version")
+                    or (decision or {}).get("strategy_version") or _NOT_CAPTURED),
         "timeframe": journal.get("timeframe"),
-        "setup_grade": journal.get("grade") or review.get("grade") or _NOT_CAPTURED,
+        "setup_grade": setup_quality["grade"],
+        "setup_quality_score": setup_quality["score"],
+        "setup_grade_source": setup_quality["source"],
+        "setup_grade_basis": setup_quality["basis"],
+        "outcome_grade": journal.get("grade") or review.get("grade") or _NOT_CAPTURED,
         "confidence_score": _num(journal.get("confidence")),
         "brain_score": _num(journal.get("brain_score")),
         "regime": journal.get("regime") or _NOT_CAPTURED,
@@ -165,6 +208,10 @@ def compose_memory(journal: dict, *, decision: Optional[dict] = None,
         "why_closed": exit_dec.get("exit_reason") or _NOT_CAPTURED,
         "conditions_passed": passed,
         "conditions_failed": failed if failed else ["None — all evaluated gates passed."],
+        "fill_model": provenance.get("fill_model") or _NOT_CAPTURED,
+        "execution_mode": provenance.get("execution_mode") or journal.get("mode") or _NOT_CAPTURED,
+        "data_exchange": provenance.get("exchange") or exchange,
+        "instrument_type": provenance.get("instrument_type") or _NOT_CAPTURED,
     }
 
     # ---- 6. Emotion & Journal (manual) ---------------------------------------
@@ -337,12 +384,13 @@ def ask(store, insights_fn, q: str, limit: int = 50) -> dict:
     # "which setup / strategy has the highest expectancy?"
     if "expectancy" in ql or ("highest" in ql and ("setup" in ql or "strategy" in ql)):
         ins = insights_fn()
-        by = ins.get("by_strategy", [])
+        by = ins.get("by_strategy_live_ready", [])
         ranked = sorted(by, key=lambda r: r.get("expectancy", 0), reverse=True)
         return {"query": q, "kind": "expectancy",
                 "answer": (f"Highest expectancy: {ranked[0]['strategy']} at "
                            f"{ranked[0]['expectancy']:+.3f}R/trade over {ranked[0]['trades']} trades."
-                           if ranked else "No closed trades yet to rank expectancy."),
+                           if ranked else "No paper-forward trades with RealisticFill exist yet; "
+                           "historical or ideal-fill results are not used to rank live readiness."),
                 "ranking": ranked, "trades": []}
 
     # "repeated mistakes" / mistake library
@@ -404,9 +452,24 @@ def _smc_read(checklist: dict, name: str) -> str:
     """Pull a smart-money-concept read from the entry checklist, honestly."""
     for group in ("entry_reads", "confluence", "smc"):
         for item in (checklist.get(group) or []):
-            rule = str(item.get("rule", "")).lower()
+            rule = str(item.get("rule") or item.get("name") or "").lower()
             if name in rule:
-                return item.get("detail") or (str(item.get("ok")))
+                status = str(item.get("status") or "").strip().lower()
+                if status in ("not checked", "neutral"):
+                    return _NOT_CHECKED
+                if item.get("detail"):
+                    return item["detail"]
+                if "ok" in item:
+                    return str(bool(item["ok"]))
+                return item.get("status") or _NOT_CHECKED
+    return _NOT_CHECKED
+
+
+def _smc_read_any(checklist: dict, *names: str) -> str:
+    for name in names:
+        value = _smc_read(checklist, name)
+        if value != _NOT_CHECKED:
+            return value
     return _NOT_CHECKED
 
 
@@ -418,8 +481,19 @@ def _conditions(checklist: dict, decision: Optional[dict]) -> tuple[list, list]:
     if not passed and not failed:
         for group in ("entry_reads", "risk_gates", "confluence"):
             for item in (checklist.get(group) or []):
-                label = item.get("detail") or item.get("rule") or ""
-                (passed if item.get("ok") else failed).append(label)
+                label = item.get("detail") or item.get("name") or item.get("rule") or ""
+                status = str(item.get("status") or "").strip().lower()
+                if "ok" in item:
+                    outcome = bool(item.get("ok"))
+                elif "passed" in item:
+                    outcome = bool(item.get("passed"))
+                elif status == "passed":
+                    outcome = True
+                elif status == "failed":
+                    outcome = False
+                else:
+                    continue  # neutral / not checked is neither pass nor fail
+                (passed if outcome else failed).append(label)
     return passed, failed
 
 

@@ -350,9 +350,11 @@ def trader_profile(insights: dict) -> dict:
         if _exp(b) < 0:
             weaknesses.append(f"{_bucket_name(b)} is a losing symbol ({_exp(b):.2f}R).")
             break
-    for b in (ins.get("by_strategy") or [])[:1]:
+    # Strategy recommendations must be based on executable forward evidence,
+    # never on replay or ideal fills retained for historical comparison.
+    for b in (ins.get("by_strategy_live_ready") or [])[:1]:
         if _exp(b) > 0:
-            strengths.append(f"Most profitable strategy: {_bucket_name(b)} (+{_exp(b):.2f}R).")
+            strengths.append(f"Best forward-realistic strategy: {_bucket_name(b)} (+{_exp(b):.2f}R).")
     for pat in (ins.get("winning_patterns") or [])[:2]:
         strengths.append(f"Repeatable edge: {_bucket_name(pat)}.")
     for m in (ins.get("mistakes") or [])[:3]:

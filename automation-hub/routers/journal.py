@@ -207,6 +207,13 @@ def trade_memory_backfill(x_webhook_secret: Optional[str] = Header(default=None)
     return _wa.trade_memory.backfill()
 
 
+@router.post("/trade-memory/rebuild")
+def trade_memory_rebuild(x_webhook_secret: Optional[str] = Header(default=None)):
+    """Recompose derived memories after composer upgrades, preserving notes."""
+    _wa._check_secret(x_webhook_secret)
+    return _wa.trade_memory.rebuild()
+
+
 @router.post("/trade-memory/reviews/run")
 def trade_memory_run_reviews(x_webhook_secret: Optional[str] = Header(default=None)):
     """Run the nightly/weekly/monthly/yearly reviews now (on-demand)."""

@@ -169,6 +169,39 @@ def test_worker_start_uses_persisted_instance_execution_not_legacy_runtime(monke
     assert pipeline.max_open_positions == 1
 
 
+def test_instance_worker_wires_journal_memory_and_server_owned_provenance(monkeypatch):
+    from services.auto_engine import AutoStrategyEngine
+
+    ledger = SqliteLedger(":memory:")
+    journal = object()
+    memory = object()
+    manager = TradingInstanceManager(
+        ledger, strategy_factory=_factory, live=False, live_poll_s=60,
+        decision_journal=journal, trade_memory=memory,
+    )
+    instance = manager.create(
+        symbol="ETHUSDT", strategy_key="supertrend", strategy_label="Supertrend",
+        strategy_version="1.0.0", timeframe="15m", risk_per_trade_pct=0.005,
+        capital_allocation=1_000, fill_model="RealisticFill", exchange="kraken",
+    )
+    monkeypatch.setattr(AutoStrategyEngine, "start", lambda self: True)
+
+    manager.start(instance.id)
+    pipeline = manager._runtime[instance.id][2]
+
+    assert pipeline.journal is journal
+    assert pipeline.trade_memory is memory
+    assert pipeline.journal_context == {
+        "instance_id": instance.id,
+        "strategy_version": "1.0.0",
+        "market_data_mode": "paper_forward",
+        "fill_model": "RealisticFill",
+        "execution_mode": "paper",
+        "exchange": "kraken",
+        "instrument_type": "spot",
+    }
+
+
 def test_instance_fill_model_is_persisted_and_constructed_per_worker(monkeypatch):
     from services.auto_engine import AutoStrategyEngine
     from services.fill_model import PerfectFill, RealisticFill

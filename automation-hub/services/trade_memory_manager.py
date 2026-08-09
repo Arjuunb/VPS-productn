@@ -8,6 +8,8 @@ Responsibilities:
     monthly (1st) and yearly (Jan 1) rollups, each persisted.
   * ``backfill()`` — one-shot import of already-closed journal trades so the
     memory isn't empty on first deploy.
+  * ``rebuild()`` — explicitly recompose derived memories from the journal
+    while preserving manual notes.
   * thin ``insights`` / ``ask`` / ``similar`` pass-throughs for the router.
 """
 from __future__ import annotations
@@ -109,6 +111,23 @@ class TradeMemoryManager:
         except Exception as e:  # noqa: BLE001
             print(f"[trade-memory] backfill failed: {type(e).__name__}: {e}")
         return {"backfilled": added, "total": self.store.count()}
+
+    def rebuild(self) -> dict:
+        """Recompose all closed memories from their authoritative journals.
+
+        Memory rows are derived records, so this is safe and idempotent. The
+        normal ``remember`` path preserves any manual notes already attached.
+        Nothing is deleted when a journal row cannot be recomposed.
+        """
+        rebuilt = failed = 0
+        for journal in self.journal_store.list(limit=100000):
+            if journal.get("status") != "closed" or not journal.get("trade_id"):
+                continue
+            if self.remember(journal["trade_id"]):
+                rebuilt += 1
+            else:
+                failed += 1
+        return {"rebuilt": rebuilt, "failed": failed, "total": self.store.count()}
 
     # -------------------------------------------------------------- reviews
     def insights(self) -> dict:

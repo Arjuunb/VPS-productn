@@ -18,13 +18,19 @@ type Mem = {
   notes: string; sections?: Record<string, Record<string, unknown>>;
 };
 type Bucket = Record<string, unknown> & {
-  trades: number; win_rate: number; expectancy: number; avg_rr: number; pnl: number;
+  trades: number; win_rate: number; expectancy: number; expectancy_r?: number;
+  expectancy_pnl?: number; avg_rr: number; pnl: number;
 };
 type Insights = {
   sample: number; overall: Bucket; sharpe_ratio: number; sortino_ratio: number;
   max_drawdown_abs: number; avg_hold_seconds: number | null;
   by_symbol: Bucket[]; by_strategy: Bucket[]; by_session: Bucket[];
+  by_strategy_live_ready?: Bucket[]; live_ready_overall?: Bucket;
   by_weekday: Bucket[]; by_setup_grade: Bucket[];
+  setup_quality_coverage?: { scored: number; unscored: number; eligible?: number; pct: number; basis: string };
+  evidence_provenance?: { paper_forward_realistic: number; other_or_unknown: number;
+    market_data_modes: Record<string, number>; fill_models: Record<string, number>;
+    live_readiness_note: string };
   mistakes: { mistake: string; count: number; loss_attributed: number; repeated: boolean }[];
   winning_patterns: Bucket[]; evidence_note: string;
   coaching: { statement: string; stage: string; metric: unknown }[];
@@ -53,7 +59,7 @@ interface Growth {
   span?: { first: string | null; last: string | null };
   monthly?: { month: string; trades: number; net_r: number; win_rate: number }[];
   by_strategy?: GrowthRow[]; by_symbol?: GrowthRow[];
-  grades?: Record<string, number>; sample_note?: string;
+  grades?: Record<string, number>; outcome_grades?: Record<string, number>; sample_note?: string;
 }
 
 function MiniSplit({ title, rows }: { title: string; rows: GrowthRow[] }) {
@@ -127,8 +133,9 @@ function GrowthJourney() {
           </div>
 
           <p className="dim" style={{ margin: 0, fontSize: 11 }}>
-            {Object.entries(g.grades ?? {}).map(([k, v]) => `${k}×${v}`).join(" · ") || ""}
-            {Object.keys(g.grades ?? {}).length ? " — " : ""}{g.sample_note}
+            {Object.keys(g.outcome_grades ?? g.grades ?? {}).length ? "Post-trade grades: " : ""}
+            {Object.entries(g.outcome_grades ?? g.grades ?? {}).map(([k, v]) => `${k}×${v}`).join(" · ") || ""}
+            {Object.keys(g.outcome_grades ?? g.grades ?? {}).length ? " — " : ""}{g.sample_note}
           </p>
         </div>
       )}
@@ -216,7 +223,7 @@ export default function MemoryPage() {
         <StatCard label="Win rate" value={ins ? `${ins.overall.win_rate}%` : "—"}
                   sub={ins ? `${ins.overall.trades} closed` : ""} tone={ins && ins.overall.win_rate >= 50 ? "green" : "default"} />
         <StatCard label="Expectancy" value={ins ? signed(ins.overall.expectancy) : "—"}
-                  sub="per trade ($)" tone={ins && ins.overall.expectancy >= 0 ? "green" : "red"} />
+                  sub="net R per trade" tone={ins && ins.overall.expectancy >= 0 ? "green" : "red"} />
         <StatCard label="Sharpe · Sortino" value={ins ? `${ins.sharpe_ratio} · ${ins.sortino_ratio}` : "—"}
                   sub="per-trade R basis" />
       </div>
@@ -226,6 +233,20 @@ export default function MemoryPage() {
       {ins && (
         <Card title="AI Knowledge Base — data-driven coaching">
           <p className="dim" style={{ marginTop: 0 }}>{ins.evidence_note}</p>
+          {ins.setup_quality_coverage && (
+            <p className="dim" style={{ marginTop: -4 }}>
+              Pre-trade quality coverage: {ins.setup_quality_coverage.scored}/{ins.setup_quality_coverage.eligible ?? 0} eligible trades
+              ({ins.setup_quality_coverage.pct}%). {ins.setup_quality_coverage.unscored > 0
+                ? `${ins.setup_quality_coverage.unscored} legacy/unscored trades are excluded from setup claims.`
+                : "No outcome-derived grades are used for setup claims."}
+            </p>
+          )}
+          {ins.evidence_provenance && (
+            <p className="dim" style={{ marginTop: -4 }}>
+              Live-readiness evidence: {ins.evidence_provenance.paper_forward_realistic}/{ins.sample}
+              {" "}trades used forward data with RealisticFill. {ins.evidence_provenance.live_readiness_note}
+            </p>
+          )}
           <ul style={{ margin: 0, paddingLeft: 18 }}>
             {ins.coaching.map((c, i) => (
               <li key={i} style={{ marginBottom: 8 }}>
@@ -238,10 +259,10 @@ export default function MemoryPage() {
 
       {/* ── Winning patterns + Mistake library ──────────────────────── */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
-        <Card title="Winning Patterns">
+        <Card title="Entry-quality Evidence">
           {ins && ins.winning_patterns.length ? (
             <div className="tablewrap"><table className="data-table">
-              <thead><tr><th>Setup grade</th><th>Trades</th><th>Win %</th><th>Expectancy</th><th>Avg RR</th></tr></thead>
+              <thead><tr><th>Pre-trade grade</th><th>Trades</th><th>Win %</th><th>Expectancy (R)</th><th>Avg R</th></tr></thead>
               <tbody>
                 {ins.winning_patterns.map((b, i) => (
                   <tr key={i}>
@@ -253,7 +274,7 @@ export default function MemoryPage() {
                 ))}
               </tbody>
             </table></div>
-          ) : <EmptyState text="No proven winning pattern yet (needs ≥ 5 trades in a bucket)." />}
+          ) : <EmptyState text="No entry-quality pattern yet (needs ≥ 5 trades scored before outcome)." />}
         </Card>
         <Card title="Mistake Library">
           {ins && ins.mistakes.length ? (
@@ -295,7 +316,7 @@ export default function MemoryPage() {
           <div className="tablewrap"><table className="data-table">
             <thead>
               <tr><th></th><th>Closed</th><th>Symbol</th><th>Side</th><th>Result</th>
-                <th>Grade</th><th>RR</th><th>PnL</th><th>Session</th><th>Weekday</th></tr>
+                <th>Outcome grade</th><th>RR</th><th>PnL</th><th>Session</th><th>Weekday</th></tr>
             </thead>
             <tbody>
               {rows.map((m) => {
@@ -389,7 +410,7 @@ function Breakdown({ rows, label, k }: { rows: Bucket[]; label: string; k: strin
   if (!rows.length) return <EmptyState text={`No ${label} data yet.`} />;
   return (
     <div className="tablewrap"><table className="data-table">
-      <thead><tr><th>{label}</th><th>Trades</th><th>Win %</th><th>Expectancy</th></tr></thead>
+      <thead><tr><th>{label}</th><th>Trades</th><th>Win %</th><th>Expectancy (R)</th></tr></thead>
       <tbody>
         {rows.map((b, i) => (
           <tr key={i}>

@@ -154,6 +154,15 @@ trade_memory = TradeMemoryManager(
     starting_balance=account_store.initial_capital())
 # the pipeline calls this after the decision journal closes a trade
 pipeline.trade_memory = trade_memory
+pipeline.journal_context = {
+    "instance_id": None,
+    "strategy_version": builtin_strategy_version(settings.auto_strategy),
+    "market_data_mode": "legacy_live" if settings.use_live_data else "legacy_replay",
+    "fill_model": type(paper.fill_model).__name__,
+    "execution_mode": "paper",
+    "exchange": _os.environ.get("HUB_EXCHANGE", "paper"),
+    "instrument_type": "spot",
+}
 # import already-closed journal trades so the memory isn't empty on first boot
 trade_memory.backfill()
 
@@ -263,6 +272,8 @@ instance_manager = TradingInstanceManager(
     live_poll_s=settings.live_poll_s,
     fetcher=ws_feed.make_fetcher(_default_fetcher) if settings.use_live_data else None,
     decision_store=decision_store,
+    decision_journal=pipeline.journal,
+    trade_memory=trade_memory,
 )
 
 # Semi-auto / signal trading modes: the human-approval queue for entries.
