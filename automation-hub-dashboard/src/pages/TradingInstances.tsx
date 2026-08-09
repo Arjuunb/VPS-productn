@@ -3,12 +3,12 @@ import AreaLine from "../components/chart/AreaLine";
 import Card from "../components/common/Card";
 import Icon from "../components/common/Icon";
 import { Badge, Field, PageHeader, StatCard } from "../components/common/ui";
-import { apiPost, apiPostJson, useLive } from "../lib/api";
+import { apiPatchJson, apiPost, apiPostJson, useLive } from "../lib/api";
 import { useApp } from "../app-context";
 
 type Metric = Record<string, any>;
 type MarketData = { market_data_mode?: string; market_data_status?: string; last_market_data_timestamp?: string; last_processed_candle_timestamp?: string; market_data_age_seconds?: number | null; warmup_bars?: number; duplicate_candles?: number; missing_candles?: number; out_of_order_candles?: number; reconnect_attempt?: number; data_source?: string; freshness_thresholds_seconds?: { healthy_under: number; disconnected_over: number } };
-type Instance = { id: string; symbol: string; strategy_key: string; strategy_label: string; strategy_version: string; timeframe: string; risk_per_trade_pct: number; capital_allocation: number; sizing_mode?: string; fixed_position_size?: number; fixed_quantity?: number; profit_reinvestment?: boolean; maximum_risk_amount?: number | null; minimum_equity?: number | null; starting_equity?: number; current_realized_equity?: number; entry_mode?: string; fill_model?: string; execution_mode?: string; market_data_mode?: string; mode: string; state: string; created_at: string; started_at?: string | null; stopped_at?: string | null; last_error?: string; metrics: Metric; performance?: Metric; execution?: Metric; risk?: Metric; engine?: Metric | null; market_data?: MarketData; current_position?: Metric | null; strategy_health?: Metric | null; last_decision?: Metric | null };
+type Instance = { id: string; symbol: string; strategy_key: string; strategy_label: string; strategy_version: string; timeframe: string; risk_per_trade_pct: number; capital_allocation: number; max_open_positions?: number; sizing_mode?: string; fixed_position_size?: number; fixed_quantity?: number; profit_reinvestment?: boolean; maximum_risk_amount?: number | null; minimum_equity?: number | null; starting_equity?: number; current_realized_equity?: number; entry_mode?: string; fill_model?: string; execution_mode?: string; market_data_mode?: string; mode: string; state: string; created_at: string; started_at?: string | null; stopped_at?: string | null; last_error?: string; metrics: Metric; performance?: Metric; execution?: Metric; risk?: Metric; engine?: Metric | null; market_data?: MarketData; current_position?: Metric | null; strategy_health?: Metric | null; last_decision?: Metric | null };
 type InstancesResponse = { instances: Instance[]; max_active_slots: number; active_slots: number; total_instances?: number; max_global_risk_pct: number; max_global_risk_amount: number; current_global_risk_amount: number; paper_account_capital?: number; total_allocated_capital?: number; total_current_equity?: number; available_paper_capital?: number; today_pnl?: number; today_trades?: number; total_open_positions?: number; global_risk_status?: string; market_data_status?: string; global_status?: string; instance_counts?: Record<string, number> };
 type Options = { symbols: string[]; timeframes: string[]; strategies: { key: string; label: string; versions: string[] }[]; execution_defaults: { position_sizing_mode?: string; entry_mode?: string; fill_model?: string; leverage?: number | null; max_open_positions?: number }; sizing_modes?: { key: string; label: string; implemented: boolean }[]; market_data_mode: string };
 
@@ -52,7 +52,11 @@ export default function TradingInstancesPage({ instanceId }: { instanceId?: stri
   const [filters, setFilters] = useState({ status: "", pair: "", strategy: "", timeframe: "", version: "", query: "", sort: "newest" });
   const [busy, setBusy] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
-  const [form, setForm] = useState({ symbol: "", strategy: "", strategy_version: "", timeframe: "", risk: "0.5", capital: "1000", sizing_mode: "fixed_starting_equity_percent", fixed_quantity: "", profit_reinvestment: false, maximum_risk_amount: "", minimum_equity: "", entry_mode: "limit" });
+  const [form, setForm] = useState({ symbol: "", strategy: "", strategy_version: "", timeframe: "", risk: "0.5", capital: "1000", max_open_positions: "3", sizing_mode: "fixed_starting_equity_percent", fixed_quantity: "", profit_reinvestment: false, maximum_risk_amount: "", minimum_equity: "", entry_mode: "limit" });
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editBusy, setEditBusy] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+  const [editForm, setEditForm] = useState({ strategy: "", strategy_version: "", timeframe: "", risk: "", capital: "", max_open_positions: "", sizing_mode: "fixed_starting_equity_percent", fixed_quantity: "", profit_reinvestment: false, maximum_risk_amount: "", minimum_equity: "", entry_mode: "limit" });
 
   useEffect(() => {
     const firstStrategy = options.data?.strategies[0];
@@ -91,13 +95,14 @@ export default function TradingInstancesPage({ instanceId }: { instanceId?: stri
   const inactive = (state: string) => filtered.filter((row) => row.state === state);
   const current = rows.find((row) => row.id === (instanceId ?? selected)) ?? rows[0];
   const formStrategy = options.data?.strategies.find((row) => row.key === form.strategy);
+  const editStrategy = options.data?.strategies.find((row) => row.key === editForm.strategy);
 
   const create = async () => {
     if (busy || !form.symbol || !form.strategy || !form.strategy_version || !form.timeframe) return;
     setCreateError(null);
     setBusy(true);
     try {
-      const created = await apiPostJson<{ instance: Instance }>("/instances", { symbol: form.symbol, strategy: form.strategy, strategy_version: form.strategy_version, timeframe: form.timeframe, risk_per_trade_pct: Number(form.risk) / 100, capital_allocation: Number(form.capital), mode: "trading", sizing_mode: form.sizing_mode, fixed_quantity: Number(form.fixed_quantity || 0), profit_reinvestment: form.profit_reinvestment, maximum_risk_amount: form.maximum_risk_amount ? Number(form.maximum_risk_amount) : null, minimum_equity: form.minimum_equity ? Number(form.minimum_equity) : null, entry_mode: form.entry_mode, fill_model: "PerfectFill" });
+      const created = await apiPostJson<{ instance: Instance }>("/instances", { symbol: form.symbol, strategy: form.strategy, strategy_version: form.strategy_version, timeframe: form.timeframe, risk_per_trade_pct: Number(form.risk) / 100, capital_allocation: Number(form.capital), max_open_positions: Number(form.max_open_positions), mode: "trading", sizing_mode: form.sizing_mode, fixed_quantity: Number(form.fixed_quantity || 0), profit_reinvestment: form.profit_reinvestment, maximum_risk_amount: form.maximum_risk_amount ? Number(form.maximum_risk_amount) : null, minimum_equity: form.minimum_equity ? Number(form.minimum_equity) : null, entry_mode: form.entry_mode, fill_model: "PerfectFill" });
       // Cards are rendered only from the authoritative GET /instances poll.
       // Never append the POST payload optimistically: creation may fail while
       // Supabase validates the durable per-instance market cursor.
@@ -114,6 +119,52 @@ export default function TradingInstancesPage({ instanceId }: { instanceId?: stri
   const action = async (id: string, name: string) => {
     try { await apiPost(`/instances/${id}/${name}`); live.refetch(); app.toast(`Instance ${name} completed`, "success"); }
     catch (error) { app.toast(error instanceof Error ? error.message : `Could not ${name} instance`, "error"); }
+  };
+  const beginEdit = (instance: Instance) => {
+    setEditError(null);
+    setEditingId(instance.id);
+    setEditForm({
+      strategy: instance.strategy_key,
+      strategy_version: instance.strategy_version,
+      timeframe: instance.timeframe,
+      risk: String(instance.risk_per_trade_pct * 100),
+      capital: String(instance.capital_allocation),
+      max_open_positions: String(instance.max_open_positions ?? 3),
+      sizing_mode: instance.sizing_mode ?? "fixed_starting_equity_percent",
+      fixed_quantity: String(instance.fixed_quantity ?? instance.fixed_position_size ?? ""),
+      profit_reinvestment: Boolean(instance.profit_reinvestment),
+      maximum_risk_amount: instance.maximum_risk_amount == null ? "" : String(instance.maximum_risk_amount),
+      minimum_equity: instance.minimum_equity == null ? "" : String(instance.minimum_equity),
+      entry_mode: instance.entry_mode ?? "limit",
+    });
+  };
+  const saveEdit = async () => {
+    if (!current || editingId !== current.id || editBusy) return;
+    setEditBusy(true);
+    setEditError(null);
+    try {
+      await apiPatchJson<{ instance: Instance }>(`/instances/${current.id}`, {
+        strategy: editForm.strategy,
+        strategy_version: editForm.strategy_version,
+        timeframe: editForm.timeframe,
+        risk_per_trade_pct: Number(editForm.risk) / 100,
+        capital_allocation: Number(editForm.capital),
+        max_open_positions: Number(editForm.max_open_positions),
+        sizing_mode: editForm.sizing_mode,
+        fixed_quantity: Number(editForm.fixed_quantity || 0),
+        profit_reinvestment: editForm.profit_reinvestment,
+        ...(editForm.maximum_risk_amount ? { maximum_risk_amount: Number(editForm.maximum_risk_amount) } : {}),
+        ...(editForm.minimum_equity ? { minimum_equity: Number(editForm.minimum_equity) } : {}),
+        entry_mode: editForm.entry_mode,
+      });
+      live.refetch();
+      setEditingId(null);
+      app.toast("Trading Instance configuration saved", "success");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not save instance configuration";
+      setEditError(message);
+      app.toast(message, "error");
+    } finally { setEditBusy(false); }
   };
 
   const marketLegend = current?.market_data?.freshness_thresholds_seconds;
@@ -143,6 +194,7 @@ export default function TradingInstancesPage({ instanceId }: { instanceId?: stri
           <Field label="Timeframe"><select value={form.timeframe} onChange={(e) => setForm({ ...form, timeframe: e.target.value })}>{(options.data?.timeframes ?? []).map((value) => <option key={value}>{value}</option>)}</select></Field>
           <Field label="Capital allocation"><input value={form.capital} onChange={(e) => setForm({ ...form, capital: e.target.value })} inputMode="decimal" /></Field>
           <Field label="Risk per trade (%)"><input value={form.risk} onChange={(e) => setForm({ ...form, risk: e.target.value })} inputMode="decimal" /></Field>
+          <Field label="Maximum open positions"><input type="number" min="1" max="50" step="1" value={form.max_open_positions} onChange={(e) => setForm({ ...form, max_open_positions: e.target.value })} /></Field>
           <Field label="Sizing mode"><select value={form.sizing_mode} onChange={(e) => setForm({ ...form, sizing_mode: e.target.value })}>{(options.data?.sizing_modes ?? []).filter((value) => value.implemented).map((value) => <option key={value.key} value={value.key}>{value.label}</option>)}</select></Field>
           {form.sizing_mode === "fixed_quantity" && <Field label="Fixed quantity" hint="base-asset units on every trade"><input value={form.fixed_quantity} onChange={(e) => setForm({ ...form, fixed_quantity: e.target.value })} inputMode="decimal" /></Field>}
           {form.sizing_mode === "dynamic_current_equity_percent" && <Field label="Profit reinvestment" hint="losses always reduce risk"><select value={form.profit_reinvestment ? "on" : "off"} onChange={(e) => setForm({ ...form, profit_reinvestment: e.target.value === "on" })}><option value="off">Off — freeze upside risk</option><option value="on">On — compound realized profit</option></select></Field>}
@@ -202,6 +254,27 @@ export default function TradingInstancesPage({ instanceId }: { instanceId?: stri
         {current.last_error && <div className="instance-risk-notice amber"><b>{titleCase(current.state)}</b><br />{current.last_error}</div>}
         <div className="form-grid-2"><Detail label="Last decision" value={current.last_decision ? `${titleCase(current.last_decision.decision)} · ${current.last_decision.side ?? "No side"}` : "Not available"} /><Detail label="Decision reason" value={current.last_decision?.reason ?? "Not available"} /><Detail label="Strategy health" value={current.strategy_health?.status ?? "Not available"} /><Detail label="Health sample" value={current.strategy_health?.sample_size ?? "Not available"} /><Detail label="Starting / realized equity" value={`${money(current.execution?.starting_equity)} / ${money(current.execution?.current_realized_equity)}`} /><Detail label="Unrealized / mark-to-market" value={`${signedMoney(current.execution?.unrealized_pnl)} / ${money(current.execution?.mark_to_market_equity)}`} /><Detail label="Gross P&L / fees / net" value={`${signedMoney(current.execution?.gross_realized_pnl)} / ${money(current.execution?.fees_paid)} / ${signedMoney(current.execution?.realized_pnl)}`} /><Detail label="Available capital" value={money(current.execution?.available_capital)} /><Detail label="Sizing / basis / next risk" value={`${titleCase(current.sizing_mode)} / ${money(current.execution?.risk_basis)} / ${money(current.execution?.next_trade_risk_amount)}`} /><Detail label="Risk cap / equity floor" value={`${money(current.maximum_risk_amount)} / ${money(current.minimum_equity)}`} /></div>
         {current.current_position ? <details style={{ marginTop: 8 }}><summary style={{ cursor: "pointer" }}>Open position · {current.current_position.side} {current.current_position.symbol}</summary><div className="form-grid-2" style={{ marginTop: 10 }}><Detail label="Entry / current" value={`${number(current.current_position.entry, 8)} / ${number(current.current_position.mark, 8)}`} /><Detail label="Stop / target" value={`${number(current.current_position.stop, 8)} / ${number(current.current_position.target, 8)}`} /><Detail label="Quantity / risk" value={`${number(current.current_position.size, 8)} / ${money(current.current_position.risk_amount)}`} /><Detail label="Current R / P&L" value={`${number(current.current_position.current_r, 3)}R / ${signedMoney(current.current_position.unrealized_pnl)}`} /><Detail label="Duration" value={duration(current.current_position.duration_seconds)} /></div></details> : <p className="dim" style={{ marginTop: 12 }}>No open position for this instance.</p>}
+        {editingId !== current.id ? <button className="btn btn-soft" style={{ marginTop: 10 }} onClick={() => beginEdit(current)}><Icon name="settings" size={14} /> Edit complete configuration</button> : <details open style={{ marginTop: 12 }}>
+          <summary style={{ cursor: "pointer", fontWeight: 700 }}>Instance configuration</summary>
+          <p className="dim" style={{ margin: "8px 0" }}>Changes are saved to this instance only. Execution changes safely rebuild a running worker. Allocation cannot change after the first trade, and configuration changes are rejected while a position is open.</p>
+          <div className="form-grid-2">
+            <Field label="Strategy"><select value={editForm.strategy} onChange={(e) => { const strategy = options.data?.strategies.find((row) => row.key === e.target.value); setEditForm({ ...editForm, strategy: e.target.value, strategy_version: strategy?.versions[0] ?? "" }); }}>{(options.data?.strategies ?? []).map((value) => <option key={value.key} value={value.key}>{value.label}</option>)}</select></Field>
+            <Field label="Strategy version"><select value={editForm.strategy_version} onChange={(e) => setEditForm({ ...editForm, strategy_version: e.target.value })}>{(editStrategy?.versions ?? []).map((value) => <option key={value}>{value}</option>)}</select></Field>
+            <Field label="Timeframe"><select value={editForm.timeframe} onChange={(e) => setEditForm({ ...editForm, timeframe: e.target.value })}>{(options.data?.timeframes ?? []).map((value) => <option key={value}>{value}</option>)}</select></Field>
+            <Field label="Capital allocation"><input value={editForm.capital} onChange={(e) => setEditForm({ ...editForm, capital: e.target.value })} inputMode="decimal" /></Field>
+            <Field label="Risk per trade (%)"><input value={editForm.risk} onChange={(e) => setEditForm({ ...editForm, risk: e.target.value })} inputMode="decimal" /></Field>
+            <Field label="Maximum open positions"><input type="number" min="1" max="50" step="1" value={editForm.max_open_positions} onChange={(e) => setEditForm({ ...editForm, max_open_positions: e.target.value })} /></Field>
+            <Field label="Sizing mode"><select value={editForm.sizing_mode} onChange={(e) => setEditForm({ ...editForm, sizing_mode: e.target.value })}>{(options.data?.sizing_modes ?? []).filter((value) => value.implemented).map((value) => <option key={value.key} value={value.key}>{value.label}</option>)}</select></Field>
+            {editForm.sizing_mode === "fixed_quantity" && <Field label="Fixed quantity" hint="base-asset units on every trade"><input value={editForm.fixed_quantity} onChange={(e) => setEditForm({ ...editForm, fixed_quantity: e.target.value })} inputMode="decimal" /></Field>}
+            {editForm.sizing_mode === "dynamic_current_equity_percent" && <Field label="Profit reinvestment" hint="losses always reduce risk"><select value={editForm.profit_reinvestment ? "on" : "off"} onChange={(e) => setEditForm({ ...editForm, profit_reinvestment: e.target.value === "on" })}><option value="off">Off — freeze upside risk</option><option value="on">On — compound realized profit</option></select></Field>}
+            <Field label="Maximum risk amount" hint="blank keeps the existing cap"><input value={editForm.maximum_risk_amount} placeholder="No additional cap" onChange={(e) => setEditForm({ ...editForm, maximum_risk_amount: e.target.value })} inputMode="decimal" /></Field>
+            <Field label="Minimum equity" hint="blank keeps the existing floor"><input value={editForm.minimum_equity} placeholder="No equity floor" onChange={(e) => setEditForm({ ...editForm, minimum_equity: e.target.value })} inputMode="decimal" /></Field>
+            <Field label="Entry mode"><select value={editForm.entry_mode} onChange={(e) => setEditForm({ ...editForm, entry_mode: e.target.value })}><option value="limit">Limit</option><option value="market">Market</option></select></Field>
+            <Field label="Fill / market data"><input readOnly value={`${current.fill_model ?? "PerfectFill"} · Paper Forward — Live Only`} /></Field>
+          </div>
+          {editError && <div className="instance-risk-notice red" role="alert" style={{ marginTop: 10 }}>{editError}</div>}
+          <div className="row-actions" style={{ justifyContent: "flex-start", gap: 8, marginTop: 10 }}><button className="btn btn-primary" disabled={editBusy} onClick={() => void saveEdit()}>{editBusy ? "Saving…" : "Save configuration"}</button><button className="btn btn-soft" disabled={editBusy} onClick={() => { setEditingId(null); setEditError(null); }}>Cancel</button></div>
+        </details>}
       </Card>
     </div>}
 
