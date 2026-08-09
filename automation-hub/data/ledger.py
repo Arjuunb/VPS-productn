@@ -78,7 +78,10 @@ class Ledger(Protocol):
     def close_position(self, position_id: str, *, exit_price: float, pnl: float) -> None: ...
     def get_positions(self, status: Optional[str] = None, instance_id: str = "") -> list[dict]: ...
     def record_paper_trade(self, trade: dict) -> str: ...
-    def close_paper_trade(self, trade_id: str, *, exit_price: float, pnl: float, rr: float, size: float | None = None) -> None: ...
+    def close_paper_trade(self, trade_id: str, *, exit_price: float, pnl: float, rr: float,
+                          size: float | None = None, fees: float = 0.0,
+                          realized_pnl: float | None = None,
+                          equity_after_close: float | None = None) -> None: ...
     def get_paper_trades(self, instance_id: str = "") -> list[dict]: ...
     # logs / alerts
     def log(self, *, level: str, stage: str, message: str, symbol: str = "", instance_id: str = "") -> None: ...
@@ -115,6 +118,14 @@ class SqliteLedger:
             # migration keep an empty strategy_id and are reported as the
             # account's, never as a particular strategy's.
             ensure_column(self._c, "paper_trades", "strategy_id")
+            for _name, _definition in (
+                ("sizing_mode", "TEXT"), ("sizing_engine_version", "TEXT"),
+                ("risk_basis_at_entry", "REAL"), ("risk_pct_at_entry", "REAL"),
+                ("risk_amount_at_entry", "REAL"), ("equity_before_trade", "REAL"),
+                ("equity_after_close", "REAL"), ("fees", "REAL NOT NULL DEFAULT 0"),
+                ("realized_pnl", "REAL"),
+            ):
+                ensure_column(self._c, "paper_trades", _name, _definition)
             for _t in ("webhook_events", "positions", "paper_trades", "bot_logs", "alerts"):
                 ensure_column(self._c, _t, "instance_id")
             self._c.execute("CREATE INDEX IF NOT EXISTS idx_paper_strategy "
@@ -207,25 +218,36 @@ class SqliteLedger:
         with self._lock:
             self._c.execute(
                 "INSERT INTO paper_trades(id,alert_id,symbol,side,size,entry,stop,status,"
-                "opened_at,strategy_id,instance_id) VALUES (?,?,?,?,?,?,?, 'open', ?,?,?)",
+                "opened_at,strategy_id,instance_id,sizing_mode,sizing_engine_version,"
+                "risk_basis_at_entry,risk_pct_at_entry,risk_amount_at_entry,equity_before_trade,fees) "
+                "VALUES (?,?,?,?,?,?,?, 'open', ?,?,?,?,?,?,?,?,?,0)",
                 (tid, trade.get("alert_id"), trade["symbol"], trade["side"], trade["size"],
                  trade["entry"], trade.get("stop"), _now(),
-                 trade.get("strategy_id") or "", trade.get("instance_id") or ""))
+                 trade.get("strategy_id") or "", trade.get("instance_id") or "",
+                 trade.get("sizing_mode"), trade.get("sizing_engine_version"),
+                 trade.get("risk_basis_at_entry"), trade.get("risk_pct_at_entry"),
+                 trade.get("risk_amount_at_entry"), trade.get("equity_before_trade")))
             self._c.commit()
         return tid
 
-    def close_paper_trade(self, trade_id, *, exit_price, pnl, rr, size=None):
+    def close_paper_trade(self, trade_id, *, exit_price, pnl, rr, size=None,
+                          fees=0.0, realized_pnl=None, equity_after_close=None):
         with self._lock:
+            values = (exit_price, pnl, rr, fees,
+                      pnl if realized_pnl is None else realized_pnl,
+                      equity_after_close, _now())
             if size is None:
                 self._c.execute(
-                    "UPDATE paper_trades SET status='closed', exit=?, pnl=?, rr=?, closed_at=? WHERE id=?",
-                    (exit_price, pnl, rr, _now(), trade_id))
+                    "UPDATE paper_trades SET status='closed', exit=?, pnl=?, rr=?, fees=?, "
+                    "realized_pnl=?, equity_after_close=?, closed_at=? WHERE id=?",
+                    (*values, trade_id))
             else:
                 # M-9: a partial close records the ACTUALLY-closed size on the
                 # closed row (not the original full size), so per-trade R is right.
                 self._c.execute(
-                    "UPDATE paper_trades SET status='closed', exit=?, pnl=?, rr=?, size=?, closed_at=? WHERE id=?",
-                    (exit_price, pnl, rr, size, _now(), trade_id))
+                    "UPDATE paper_trades SET status='closed', exit=?, pnl=?, rr=?, fees=?, "
+                    "realized_pnl=?, equity_after_close=?, size=?, closed_at=? WHERE id=?",
+                    (*values[:-1], size, values[-1], trade_id))
             self._c.commit()
 
     def get_paper_trades(self, instance_id=""):
@@ -384,12 +406,18 @@ class SupabaseLedger:
             row["strategy_id"] = trade["strategy_id"]
         if trade.get("instance_id"):
             row["instance_id"] = trade["instance_id"]
+        for key in ("sizing_mode", "sizing_engine_version", "risk_basis_at_entry",
+                    "risk_pct_at_entry", "risk_amount_at_entry", "equity_before_trade"):
+            if trade.get(key) is not None:
+                row[key] = trade[key]
         self._t("paper_trades").insert(row).execute()
         return tid
 
-    def close_paper_trade(self, trade_id, *, exit_price, pnl, rr, size=None):  # pragma: no cover
+    def close_paper_trade(self, trade_id, *, exit_price, pnl, rr, size=None,
+                          fees=0.0, realized_pnl=None, equity_after_close=None):  # pragma: no cover
         patch = {"status": "closed", "exit": exit_price, "pnl": pnl, "rr": rr,
-                 "closed_at": _now()}
+                 "fees": fees, "realized_pnl": pnl if realized_pnl is None else realized_pnl,
+                 "equity_after_close": equity_after_close, "closed_at": _now()}
         if size is not None:
             patch["size"] = size   # M-9: closed row shows the actually-closed size
         self._t("paper_trades").update(patch).eq("id", trade_id).execute()

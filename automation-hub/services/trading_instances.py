@@ -21,6 +21,10 @@ from services.controls import TradingControl
 from services.performance import summarize
 from services.signal_pipeline import SignalPipeline
 from services.strategy_health import StrategyHealthMonitor
+from tradexa.risk.position_sizing import (
+    FIXED_QUANTITY, FIXED_STARTING_EQUITY_PERCENT, PositionSizingService,
+    SIZING_ENGINE_VERSION, SIZING_MODES, normalize_sizing_mode,
+)
 
 
 def _now() -> str:
@@ -95,8 +99,16 @@ class TradingInstance:
     max_open_positions: int = 3
     # These execution values are persisted with the worker; legacy autonomous
     # engine settings are never consulted when an instance starts or restores.
-    sizing_mode: str = "auto"
+    sizing_mode: str = FIXED_STARTING_EQUITY_PERCENT
     fixed_position_size: float = 0.0
+    fixed_quantity: float = 0.0
+    profit_reinvestment: bool = False
+    maximum_risk_amount: Optional[float] = None
+    minimum_equity: Optional[float] = None
+    starting_equity: float = 0.0
+    current_realized_equity: float = 0.0
+    risk_basis: float = 0.0
+    sizing_engine_version: str = SIZING_ENGINE_VERSION
     entry_mode: str = "limit"
     fill_model: str = "PerfectFill"
     execution_mode: str = "paper"
@@ -173,7 +185,8 @@ class ResearchExecutionEngine(PaperExecutionEngine):
     without pretending that a simulated order was placed.
     """
     def open(self, *, symbol: str, side: str, size: float, entry: float,
-             stop: Optional[float], alert_id: str = "", maker: bool = False) -> FillResult:
+             stop: Optional[float], alert_id: str = "", maker: bool = False,
+             sizing_context: Optional[dict] = None) -> FillResult:
         return FillResult("rejected", symbol, side.lower(), 0.0, entry)
 
 
@@ -183,7 +196,10 @@ CREATE TABLE IF NOT EXISTS trading_instances (
  strategy_label TEXT NOT NULL, strategy_version TEXT NOT NULL, timeframe TEXT NOT NULL,
  risk_per_trade_pct REAL NOT NULL, capital_allocation REAL NOT NULL,
  max_open_positions INTEGER NOT NULL DEFAULT 3,
- sizing_mode TEXT NOT NULL DEFAULT 'auto', fixed_position_size REAL NOT NULL DEFAULT 0,
+ sizing_mode TEXT NOT NULL DEFAULT 'fixed_starting_equity_percent', fixed_position_size REAL NOT NULL DEFAULT 0,
+ fixed_quantity REAL NOT NULL DEFAULT 0, profit_reinvestment INTEGER NOT NULL DEFAULT 0,
+ maximum_risk_amount REAL, minimum_equity REAL, starting_equity REAL,
+ current_realized_equity REAL, risk_basis REAL, sizing_engine_version TEXT NOT NULL DEFAULT 'v2',
  entry_mode TEXT NOT NULL DEFAULT 'limit', fill_model TEXT NOT NULL DEFAULT 'PerfectFill',
  execution_mode TEXT NOT NULL DEFAULT 'paper',
  mode TEXT NOT NULL, market_data_mode TEXT NOT NULL DEFAULT 'paper_forward', state TEXT NOT NULL, desired_running INTEGER NOT NULL DEFAULT 0,
@@ -216,10 +232,17 @@ CREATE INDEX IF NOT EXISTS idx_instance_symbol_strategy ON trading_instances(sym
 class InstanceStore:
     """SQLite in development; Supabase tables in production after the additive migration."""
     _REMOTE_SCHEMA = {
+        "paper_trades": (
+            "id", "instance_id", "sizing_mode", "sizing_engine_version",
+            "risk_basis_at_entry", "risk_pct_at_entry", "risk_amount_at_entry",
+            "equity_before_trade", "equity_after_close", "fees", "realized_pnl",
+        ),
         "trading_instances": (
             "id", "symbol", "strategy_key", "strategy_label", "strategy_version",
             "timeframe", "risk_per_trade_pct", "capital_allocation", "max_open_positions",
-            "sizing_mode", "fixed_position_size", "entry_mode", "fill_model",
+            "sizing_mode", "fixed_position_size", "fixed_quantity", "profit_reinvestment",
+            "maximum_risk_amount", "minimum_equity", "starting_equity",
+            "current_realized_equity", "risk_basis", "sizing_engine_version", "entry_mode", "fill_model",
             "execution_mode", "mode", "market_data_mode", "state", "desired_running",
             "created_at", "started_at", "stopped_at", "updated_at", "last_error",
         ),
@@ -250,8 +273,16 @@ class InstanceStore:
                 ensure_column(ledger._c, "trading_instances", "market_data_mode",
                               "TEXT NOT NULL DEFAULT 'paper_forward'")
                 for name, definition in (
-                    ("sizing_mode", "TEXT NOT NULL DEFAULT 'auto'"),
+                    ("sizing_mode", "TEXT NOT NULL DEFAULT 'fixed_starting_equity_percent'"),
                     ("fixed_position_size", "REAL NOT NULL DEFAULT 0"),
+                    ("fixed_quantity", "REAL NOT NULL DEFAULT 0"),
+                    ("profit_reinvestment", "INTEGER NOT NULL DEFAULT 0"),
+                    ("maximum_risk_amount", "REAL"),
+                    ("minimum_equity", "REAL"),
+                    ("starting_equity", "REAL"),
+                    ("current_realized_equity", "REAL"),
+                    ("risk_basis", "REAL"),
+                    ("sizing_engine_version", "TEXT NOT NULL DEFAULT 'v2'"),
                     ("entry_mode", "TEXT NOT NULL DEFAULT 'limit'"),
                     ("fill_model", "TEXT NOT NULL DEFAULT 'PerfectFill'"),
                     ("execution_mode", "TEXT NOT NULL DEFAULT 'paper'"),
@@ -260,6 +291,14 @@ class InstanceStore:
                     ("stopped_at", "TEXT"),
                 ):
                     ensure_column(ledger._c, "trading_instances", name, definition)
+                ledger._c.execute("""UPDATE trading_instances SET sizing_mode=CASE
+                    WHEN sizing_mode IN ('auto','fixed_starting_equity_pct') THEN 'fixed_starting_equity_percent'
+                    WHEN sizing_mode IN ('fixed','fixed_position') THEN 'fixed_quantity'
+                    ELSE sizing_mode END""")
+                ledger._c.execute("UPDATE trading_instances SET fixed_quantity=fixed_position_size WHERE fixed_quantity=0 AND fixed_position_size>0")
+                ledger._c.execute("UPDATE trading_instances SET starting_equity=capital_allocation WHERE starting_equity IS NULL OR starting_equity<=0")
+                ledger._c.execute("UPDATE trading_instances SET current_realized_equity=capital_allocation WHERE current_realized_equity IS NULL")
+                ledger._c.execute("UPDATE trading_instances SET risk_basis=capital_allocation WHERE risk_basis IS NULL")
                 ensure_column(ledger._c, "trading_instance_platform_settings",
                               "paper_account_capital", "REAL NOT NULL DEFAULT 10000")
                 ensure_column(ledger._c, "instance_market_state",
@@ -304,8 +343,8 @@ class InstanceStore:
         else:
             with self.ledger._lock:
                 self.ledger._c.execute("""INSERT INTO trading_instances
-                (id,symbol,strategy_key,strategy_label,strategy_version,timeframe,risk_per_trade_pct,capital_allocation,max_open_positions,sizing_mode,fixed_position_size,entry_mode,fill_model,execution_mode,mode,market_data_mode,state,desired_running,created_at,started_at,stopped_at,updated_at,last_error)
-                VALUES (:id,:symbol,:strategy_key,:strategy_label,:strategy_version,:timeframe,:risk_per_trade_pct,:capital_allocation,:max_open_positions,:sizing_mode,:fixed_position_size,:entry_mode,:fill_model,:execution_mode,:mode,:market_data_mode,:state,:desired_running,:created_at,:started_at,:stopped_at,:updated_at,:last_error)""", row)
+                (id,symbol,strategy_key,strategy_label,strategy_version,timeframe,risk_per_trade_pct,capital_allocation,max_open_positions,sizing_mode,fixed_position_size,fixed_quantity,profit_reinvestment,maximum_risk_amount,minimum_equity,starting_equity,current_realized_equity,risk_basis,sizing_engine_version,entry_mode,fill_model,execution_mode,mode,market_data_mode,state,desired_running,created_at,started_at,stopped_at,updated_at,last_error)
+                VALUES (:id,:symbol,:strategy_key,:strategy_label,:strategy_version,:timeframe,:risk_per_trade_pct,:capital_allocation,:max_open_positions,:sizing_mode,:fixed_position_size,:fixed_quantity,:profit_reinvestment,:maximum_risk_amount,:minimum_equity,:starting_equity,:current_realized_equity,:risk_basis,:sizing_engine_version,:entry_mode,:fill_model,:execution_mode,:mode,:market_data_mode,:state,:desired_running,:created_at,:started_at,:stopped_at,:updated_at,:last_error)""", row)
                 self.ledger._c.commit()
 
     def delete(self, instance_id: str) -> None:
@@ -332,7 +371,18 @@ class InstanceStore:
         else:
             with self.ledger._lock:
                 rows = [dict(r) for r in self.ledger._c.execute("SELECT * FROM trading_instances ORDER BY created_at DESC")]
-        return [TradingInstance(**{**r, "desired_running": bool(r.get("desired_running"))}) for r in rows]
+        result = []
+        for raw in rows:
+            r = dict(raw)
+            r["desired_running"] = bool(r.get("desired_running"))
+            r["profit_reinvestment"] = bool(r.get("profit_reinvestment"))
+            r["sizing_mode"] = normalize_sizing_mode(r.get("sizing_mode"))
+            r["fixed_quantity"] = float(r.get("fixed_quantity") or r.get("fixed_position_size") or 0)
+            r["starting_equity"] = float(r.get("capital_allocation") or 0) if r.get("starting_equity") is None else float(r["starting_equity"])
+            r["current_realized_equity"] = r["starting_equity"] if r.get("current_realized_equity") is None else float(r["current_realized_equity"])
+            r["risk_basis"] = r["starting_equity"] if r.get("risk_basis") is None else float(r["risk_basis"])
+            result.append(TradingInstance(**r))
+        return result
 
     def save(self, instance: TradingInstance) -> None:
         instance.updated_at = _now()
@@ -349,6 +399,11 @@ class InstanceStore:
                         risk_per_trade_pct=:risk_per_trade_pct, capital_allocation=:capital_allocation,
                         max_open_positions=:max_open_positions,
                         sizing_mode=:sizing_mode, fixed_position_size=:fixed_position_size,
+                        fixed_quantity=:fixed_quantity, profit_reinvestment=:profit_reinvestment,
+                        maximum_risk_amount=:maximum_risk_amount, minimum_equity=:minimum_equity,
+                        starting_equity=:starting_equity, current_realized_equity=:current_realized_equity,
+                        risk_basis=:risk_basis,
+                        sizing_engine_version=:sizing_engine_version,
                         entry_mode=:entry_mode, fill_model=:fill_model, execution_mode=:execution_mode,
                         market_data_mode=:market_data_mode, state=:state, desired_running=:desired_running,
                         started_at=:started_at, stopped_at=:stopped_at,
@@ -490,7 +545,11 @@ class TradingInstanceManager:
     def create(self, *, symbol: str, strategy_key: str, strategy_label: str, strategy_version: str,
                timeframe: str, risk_per_trade_pct: float, capital_allocation: float, mode: str = "trading",
                max_open_positions: int = 3,
-               sizing_mode: str = "auto", fixed_position_size: float = 0.0,
+               sizing_mode: str = FIXED_STARTING_EQUITY_PERCENT,
+               fixed_position_size: float = 0.0, fixed_quantity: float | None = None,
+               profit_reinvestment: bool = False,
+               maximum_risk_amount: float | None = None,
+               minimum_equity: float | None = None,
                entry_mode: str = "limit", fill_model: str = "PerfectFill") -> TradingInstance:
         with self._lock:
             # This must precede every insert.  A partially installed Supabase
@@ -499,10 +558,16 @@ class TradingInstanceManager:
             self.store.assert_runtime_schema()
             if mode not in ("trading", "research"):
                 raise ValueError("mode must be trading or research")
-            if sizing_mode not in ("auto", "fixed"):
-                raise ValueError("sizing_mode must be 'auto' or 'fixed'")
-            if sizing_mode == "fixed" and fixed_position_size <= 0:
-                raise ValueError("fixed_position_size must be greater than zero for fixed sizing")
+            sizing_mode = normalize_sizing_mode(sizing_mode)
+            quantity = float(fixed_quantity if fixed_quantity is not None else fixed_position_size)
+            if sizing_mode not in SIZING_MODES:
+                raise ValueError(f"sizing_mode must be one of {', '.join(SIZING_MODES)}")
+            if sizing_mode == FIXED_QUANTITY and quantity <= 0:
+                raise ValueError("fixed_quantity must be greater than zero for fixed quantity sizing")
+            if maximum_risk_amount is not None and float(maximum_risk_amount) <= 0:
+                raise ValueError("maximum_risk_amount must be greater than zero")
+            if minimum_equity is not None and not 0 < float(minimum_equity) <= float(capital_allocation):
+                raise ValueError("minimum_equity must be greater than zero and no more than the allocation")
             if entry_mode not in ("limit", "market"):
                 raise ValueError("entry_mode must be 'limit' or 'market'")
             if fill_model != "PerfectFill":
@@ -526,7 +591,15 @@ class TradingInstanceManager:
                                    timeframe=timeframe, risk_per_trade_pct=risk_per_trade_pct,
                                    capital_allocation=capital_allocation, max_open_positions=int(max_open_positions),
                                    sizing_mode=sizing_mode,
-                                   fixed_position_size=fixed_position_size, entry_mode=entry_mode,
+                                   fixed_position_size=quantity, fixed_quantity=quantity,
+                                   profit_reinvestment=bool(profit_reinvestment),
+                                   maximum_risk_amount=maximum_risk_amount,
+                                   minimum_equity=minimum_equity,
+                                   starting_equity=capital_allocation,
+                                   current_realized_equity=capital_allocation,
+                                   risk_basis=capital_allocation,
+                                   sizing_engine_version=SIZING_ENGINE_VERSION,
+                                   entry_mode=entry_mode,
                                    fill_model=fill_model, mode=mode,
                                    market_data_mode="paper_forward" if mode == "trading" else "replay")
             self.store.create(inst)
@@ -592,7 +665,16 @@ class TradingInstanceManager:
             scoped = InstanceLedger(self.ledger, instance_id)
             controls = TradingControl()
             engine_type = ResearchExecutionEngine if inst.mode == "research" else PaperExecutionEngine
-            paper = engine_type(scoped, inst.capital_allocation)
+            paper = engine_type(scoped, inst.starting_equity)
+            inst.current_realized_equity = paper.current_realized_equity()
+            def persist_realized_equity(value: float) -> None:
+                inst.current_realized_equity = float(value)
+                inst.risk_basis = PositionSizingService.risk_basis(
+                    mode=inst.sizing_mode, starting_equity=inst.starting_equity,
+                    current_realized_equity=inst.current_realized_equity,
+                    profit_reinvestment=inst.profit_reinvestment)
+                self.store.save(inst)
+            paper.equity_listener = persist_realized_equity
             # Ledger rows retain the immutable instance identity and a stable
             # strategy/version attribution without borrowing legacy state.
             paper.strategy_id = f"{inst.strategy_key}:{inst.strategy_version}"
@@ -600,7 +682,11 @@ class TradingInstanceManager:
                                       risk_per_trade_pct=inst.risk_per_trade_pct, exposure_limit_pct=0.05,
                                       max_open_positions=inst.max_open_positions,
                                       position_sizing_mode=inst.sizing_mode,
-                                      fixed_position_size=inst.fixed_position_size)
+                                      fixed_position_size=inst.fixed_quantity,
+                                      equity_provider=paper.current_realized_equity,
+                                      profit_reinvestment=inst.profit_reinvestment,
+                                      maximum_risk_amount=inst.maximum_risk_amount,
+                                      minimum_equity=inst.minimum_equity)
             pipeline.global_entry_guard = lambda **kw: self._global_guard(instance_id, **kw)
             forward = inst.mode == "trading"
             market = self.store.market_state(instance_id) if forward else {}
@@ -661,7 +747,12 @@ class TradingInstanceManager:
 
     def update_configuration(self, instance_id: str, *, capital_allocation: float | None = None,
                              risk_per_trade_pct: float | None = None, sizing_mode: str | None = None,
-                             fixed_position_size: float | None = None, entry_mode: str | None = None,
+                             fixed_position_size: float | None = None,
+                             fixed_quantity: float | None = None,
+                             profit_reinvestment: bool | None = None,
+                             maximum_risk_amount: float | None = None,
+                             minimum_equity: float | None = None,
+                             entry_mode: str | None = None,
                              max_open_positions: int | None = None,
                              strategy_key: str | None = None, strategy_label: str | None = None,
                              strategy_version: str | None = None, timeframe: str | None = None) -> TradingInstance:
@@ -675,19 +766,31 @@ class TradingInstanceManager:
         with self._lock:
             inst = self._instances[instance_id]
             open_positions = InstanceLedger(self.ledger, instance_id).get_positions("open")
+            trade_history = self.ledger.get_paper_trades(instance_id=instance_id)
             prior_state = inst.state
             had_runtime = instance_id in self._runtime
             candidate_capital = float(capital_allocation if capital_allocation is not None else inst.capital_allocation)
             if candidate_capital <= 0:
                 raise ValueError("capital_allocation must be greater than zero")
+            if (capital_allocation is not None and trade_history
+                    and abs(candidate_capital - inst.capital_allocation) > 0.0000001):
+                raise ValueError("Capital allocation is immutable after the first trade; create a new instance")
             if risk_per_trade_pct is not None and not 0 < float(risk_per_trade_pct) <= 0.05:
                 raise ValueError("risk_per_trade_pct must be in (0, 0.05]")
-            candidate_mode = sizing_mode if sizing_mode is not None else inst.sizing_mode
-            if candidate_mode not in ("auto", "fixed"):
-                raise ValueError("sizing_mode must be 'auto' or 'fixed'")
-            candidate_fixed = float(fixed_position_size if fixed_position_size is not None else inst.fixed_position_size)
-            if candidate_fixed < 0 or (candidate_mode == "fixed" and candidate_fixed <= 0):
-                raise ValueError("fixed_position_size must be greater than zero for fixed sizing")
+            candidate_mode = normalize_sizing_mode(sizing_mode if sizing_mode is not None else inst.sizing_mode)
+            if candidate_mode not in SIZING_MODES:
+                raise ValueError(f"sizing_mode must be one of {', '.join(SIZING_MODES)}")
+            supplied_quantity = fixed_quantity if fixed_quantity is not None else fixed_position_size
+            candidate_fixed = float(supplied_quantity if supplied_quantity is not None else inst.fixed_quantity)
+            if candidate_fixed < 0 or (candidate_mode == FIXED_QUANTITY and candidate_fixed <= 0):
+                raise ValueError("fixed_quantity must be greater than zero for fixed quantity sizing")
+            candidate_reinvest = bool(profit_reinvestment if profit_reinvestment is not None else inst.profit_reinvestment)
+            candidate_max_risk = maximum_risk_amount if maximum_risk_amount is not None else inst.maximum_risk_amount
+            candidate_floor = minimum_equity if minimum_equity is not None else inst.minimum_equity
+            if candidate_max_risk is not None and float(candidate_max_risk) <= 0:
+                raise ValueError("maximum_risk_amount must be greater than zero")
+            if candidate_floor is not None and not 0 < float(candidate_floor) <= candidate_capital:
+                raise ValueError("minimum_equity must be greater than zero and no more than the allocation")
             candidate_entry = entry_mode if entry_mode is not None else inst.entry_mode
             if candidate_entry not in ("limit", "market"):
                 raise ValueError("entry_mode must be 'limit' or 'market'")
@@ -699,7 +802,8 @@ class TradingInstanceManager:
             if inst.mode == "trading" and allocated_elsewhere + candidate_capital > self.paper_account_capital + 1e-9:
                 raise ValueError("Capital allocation exceeds paper account capacity")
             rebuild_required = any(value is not None for value in (
-                capital_allocation, sizing_mode, fixed_position_size, entry_mode,
+                capital_allocation, sizing_mode, fixed_position_size, fixed_quantity,
+                profit_reinvestment, maximum_risk_amount, minimum_equity, entry_mode,
                 strategy_key, strategy_label, strategy_version, timeframe,
             ))
             if rebuild_required and open_positions:
@@ -711,7 +815,17 @@ class TradingInstanceManager:
             inst.capital_allocation = candidate_capital
             inst.risk_per_trade_pct = float(risk_per_trade_pct if risk_per_trade_pct is not None else inst.risk_per_trade_pct)
             inst.max_open_positions = candidate_max
-            inst.sizing_mode, inst.fixed_position_size, inst.entry_mode = candidate_mode, candidate_fixed, candidate_entry
+            inst.sizing_mode = candidate_mode
+            inst.fixed_position_size = candidate_fixed
+            inst.fixed_quantity = candidate_fixed
+            inst.profit_reinvestment = candidate_reinvest
+            inst.maximum_risk_amount = candidate_max_risk
+            inst.minimum_equity = candidate_floor
+            inst.entry_mode = candidate_entry
+            if capital_allocation is not None and not trade_history:
+                inst.starting_equity = candidate_capital
+                inst.current_realized_equity = candidate_capital
+                inst.risk_basis = candidate_capital
             inst.strategy_key = strategy_key or inst.strategy_key
             inst.strategy_label = strategy_label or inst.strategy_label
             inst.strategy_version = strategy_version or inst.strategy_version
@@ -895,7 +1009,7 @@ class TradingInstanceManager:
                 continue
         out.update({
             "average_rr": round(sum(rr) / len(rr), 3) if rr else 0.0,
-            "fees": round(runtime[1].fees_paid(), 8) if runtime else 0.0,
+            "fees": round(runtime[1].fees_paid(), 8) if runtime else round(sum(float(t.get("fees") or 0) for t in trades), 8),
             "slippage": 0.0,  # execution-quality captures this when a non-perfect fill model is configured
             "average_trade_duration_seconds": round(sum(durations) / len(durations), 1) if durations else 0.0,
             "consecutive_wins": self._current_streak(trades, positive=True),
@@ -998,8 +1112,13 @@ class TradingInstanceManager:
         metrics = self.metrics(instance_id)
         execution: dict = {
             "current_equity": metrics.get("balance"),
+            "starting_equity": inst.starting_equity,
+            "current_realized_equity": metrics.get("balance"),
+            "mark_to_market_equity": metrics.get("balance"),
             "available_capital": None,
             "realized_pnl": metrics.get("realized_pnl"),
+            "gross_realized_pnl": round(float(metrics.get("realized_pnl") or 0) + float(metrics.get("fees") or 0), 2),
+            "fees_paid": metrics.get("fees", 0.0),
             "unrealized_pnl": None,
             "return_pct": round(float(metrics.get("realized_pnl") or 0) / max(inst.capital_allocation, 1.0) * 100, 3),
             "entry_mode": None,
@@ -1014,15 +1133,24 @@ class TradingInstanceManager:
         if runtime is not None:
             engine_object, paper, pipeline, _controls = runtime
             marks = (engine or {}).get("last_prices") or {}
+            realized_equity = paper.current_realized_equity()
+            unrealized_pnl = paper.unrealized_pnl(marks)
+            fees_paid = paper.fees_paid()
             execution.update({
                 "current_equity": round(paper.equity(marks), 2),
+                "starting_equity": round(paper.starting_balance, 2),
+                "current_realized_equity": round(realized_equity, 2),
+                "mark_to_market_equity": round(realized_equity + unrealized_pnl, 2),
                 "available_capital": round(paper.available_balance(), 2),
                 "realized_pnl": round(paper.realized_pnl(), 2),
-                "unrealized_pnl": round(paper.unrealized_pnl(marks), 2),
+                "gross_realized_pnl": round(paper.gross_realized_pnl(), 2),
+                "fees_paid": round(fees_paid, 2),
+                "unrealized_pnl": round(unrealized_pnl, 2),
                 "entry_mode": (engine or {}).get("entry_mode"),
                 "fill_model": type(paper.fill_model).__name__,
                 "position_sizing_mode": pipeline.position_sizing_mode,
-                "fixed_position_size": pipeline.fixed_position_size if pipeline.position_sizing_mode == "fixed" else None,
+                "fixed_quantity": pipeline.fixed_position_size if pipeline.position_sizing_mode == FIXED_QUANTITY else None,
+                "profit_reinvestment": pipeline.profit_reinvestment,
                 "max_open_positions": pipeline.max_open_positions,
                 "pending_orders": (engine or {}).get("pending_orders"),
             })
@@ -1037,6 +1165,42 @@ class TradingInstanceManager:
             # closed-trade balance is available, but available cash and any
             # live open-position valuation are intentionally left unknown.
             execution["current_equity"] = metrics.get("balance")
+            execution["current_realized_equity"] = metrics.get("balance")
+            execution["mark_to_market_equity"] = metrics.get("balance")
+        accounting_changed = False
+        observed_realized = execution.get("current_realized_equity")
+        if observed_realized is not None and abs(inst.current_realized_equity - float(observed_realized)) > 0.0000001:
+            inst.current_realized_equity = float(observed_realized)
+            accounting_changed = True
+        basis, next_risk = PositionSizingService.risk_budget(
+            mode=inst.sizing_mode,
+            starting_equity=inst.starting_equity,
+            current_realized_equity=float(inst.current_realized_equity if execution.get("current_realized_equity") is None else execution["current_realized_equity"]),
+            risk_per_trade_pct=inst.risk_per_trade_pct,
+            profit_reinvestment=inst.profit_reinvestment,
+            maximum_risk_amount=inst.maximum_risk_amount,
+        )
+        execution.update({
+            "risk_basis": round(basis, 2),
+            "next_trade_risk_amount": round(next_risk, 2),
+            "next_trade_quantity": inst.fixed_quantity if inst.sizing_mode == FIXED_QUANTITY else None,
+            "next_trade_quantity_note": ("configured fixed quantity" if inst.sizing_mode == FIXED_QUANTITY
+                                         else "calculated after the strategy supplies entry and stop"),
+            "sizing_engine_version": inst.sizing_engine_version,
+        })
+        if abs(inst.risk_basis - basis) > 0.0000001:
+            inst.risk_basis = basis
+            accounting_changed = True
+        if accounting_changed:
+            self.store.save(inst)
+        risk.update({
+            "risk_basis": round(basis, 2),
+            "next_trade_max_risk": round(next_risk, 2),
+            "maximum_risk_amount": inst.maximum_risk_amount,
+            "minimum_equity": inst.minimum_equity,
+            "risk_halted": bool(inst.minimum_equity is not None and
+                                float(execution.get("current_realized_equity") or 0) < inst.minimum_equity),
+        })
         last_decision = None
         if self.decision_store is not None:
             try:
@@ -1051,6 +1215,14 @@ class TradingInstanceManager:
             "max_open_positions": inst.max_open_positions,
             "risk_per_trade_pct": inst.risk_per_trade_pct,
             "sizing_mode": inst.sizing_mode, "fixed_position_size": inst.fixed_position_size,
+            "fixed_quantity": inst.fixed_quantity,
+            "profit_reinvestment": inst.profit_reinvestment,
+            "maximum_risk_amount": inst.maximum_risk_amount,
+            "minimum_equity": inst.minimum_equity,
+            "starting_equity": inst.starting_equity,
+            "current_realized_equity": inst.current_realized_equity,
+            "risk_basis": inst.risk_basis,
+            "sizing_engine_version": inst.sizing_engine_version,
             "entry_mode": inst.entry_mode, "fill_model": inst.fill_model,
             "execution_mode": inst.execution_mode, "market_data_mode": inst.market_data_mode,
         }

@@ -5,24 +5,23 @@ Risk a fixed % of equity per trade based on stop distance, reusing the tested
 """
 from __future__ import annotations
 
-from bot.risk import RiskConfig
-
 from database.models import RiskRules
+from tradexa.risk.position_sizing import (
+    DYNAMIC_CURRENT_EQUITY_PERCENT, InstrumentMetadata, PositionSizingRequest,
+    PositionSizingService,
+)
 
 
 def size_position(equity: float, entry: float, stop: float,
                   rules: RiskRules) -> float:
     """Return position quantity, capped by per-trade risk and max notional."""
-    cfg = RiskConfig(
+    result = PositionSizingService.calculate(PositionSizingRequest(
+        mode=DYNAMIC_CURRENT_EQUITY_PERCENT, entry_price=entry,
+        stop_price=stop, starting_equity=equity,
+        current_realized_equity=equity,
         risk_per_trade_pct=rules.risk_per_trade_pct,
-        max_daily_loss_pct=rules.max_daily_loss_pct,
-        max_open_positions=rules.max_open_positions,
-    )
-    risk_per_unit = abs(entry - stop)
-    if risk_per_unit <= 0 or equity <= 0:
-        return 0.0
-    qty = (equity * cfg.risk_per_trade_pct) / risk_per_unit
-    max_notional = equity * cfg.max_position_pct
-    if entry > 0 and qty * entry > max_notional:
-        qty = max_notional / entry
+        profit_reinvestment=True,
+        instrument=InstrumentMetadata(maximum_notional=equity * 0.25),
+    ))
+    qty = result.quantity if result.approved else 0.0
     return max(qty, 0.0)

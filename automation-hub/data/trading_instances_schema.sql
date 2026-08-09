@@ -2,6 +2,15 @@
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS strategy_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS sizing_mode TEXT;
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS sizing_engine_version TEXT;
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS risk_basis_at_entry DOUBLE PRECISION;
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS risk_pct_at_entry DOUBLE PRECISION;
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS risk_amount_at_entry DOUBLE PRECISION;
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS equity_before_trade DOUBLE PRECISION;
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS equity_after_close DOUBLE PRECISION;
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS fees DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS realized_pnl DOUBLE PRECISION;
 ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE bot_logs ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT '';
@@ -32,14 +41,39 @@ ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS last_error TEXT NOT NULL 
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS market_data_mode TEXT NOT NULL DEFAULT 'paper_forward';
 -- Instance-owned execution configuration.  Existing rows retain the prior
 -- paper defaults; no legacy global setting is copied or guessed.
-ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS sizing_mode TEXT NOT NULL DEFAULT 'auto';
+ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS sizing_mode TEXT NOT NULL DEFAULT 'fixed_starting_equity_percent';
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS fixed_position_size DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS fixed_quantity DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS profit_reinvestment BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS maximum_risk_amount DOUBLE PRECISION;
+ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS minimum_equity DOUBLE PRECISION;
+ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS starting_equity DOUBLE PRECISION;
+ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS current_realized_equity DOUBLE PRECISION;
+ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS risk_basis DOUBLE PRECISION;
+ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS sizing_engine_version TEXT NOT NULL DEFAULT 'v2';
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS entry_mode TEXT NOT NULL DEFAULT 'limit';
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS fill_model TEXT NOT NULL DEFAULT 'PerfectFill';
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS execution_mode TEXT NOT NULL DEFAULT 'paper';
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS stopped_at TIMESTAMPTZ;
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS max_open_positions INTEGER NOT NULL DEFAULT 3;
+-- Legacy "auto" used a fixed constructor-time equity snapshot. Preserve that
+-- behaviour explicitly; operators must opt into dynamic compounding.
+UPDATE trading_instances
+SET sizing_mode = CASE
+  WHEN sizing_mode IN ('auto', 'fixed_starting_equity_pct') THEN 'fixed_starting_equity_percent'
+  WHEN sizing_mode IN ('fixed', 'fixed_position') THEN 'fixed_quantity'
+  ELSE sizing_mode
+END;
+UPDATE trading_instances SET fixed_quantity = fixed_position_size
+ WHERE fixed_quantity = 0 AND fixed_position_size > 0;
+UPDATE trading_instances SET starting_equity = capital_allocation
+ WHERE starting_equity IS NULL OR starting_equity <= 0;
+UPDATE trading_instances SET current_realized_equity = capital_allocation
+ WHERE current_realized_equity IS NULL;
+UPDATE trading_instances SET risk_basis = capital_allocation
+ WHERE risk_basis IS NULL;
+ALTER TABLE trading_instances ALTER COLUMN sizing_mode SET DEFAULT 'fixed_starting_equity_percent';
 CREATE TABLE IF NOT EXISTS instance_metrics (
  instance_id TEXT PRIMARY KEY REFERENCES trading_instances(id) ON DELETE CASCADE,
  data_json JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL

@@ -13,12 +13,14 @@ import threading
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Callable, Optional
 
-from database.models import RiskRules
 from data.ledger import Ledger
 from execution.paper_engine import PaperExecutionEngine, _dir
-from risk.position_sizing import size_position
+from tradexa.risk.position_sizing import (
+    FIXED_QUANTITY, PositionSizingRequest, PositionSizingService,
+    normalize_sizing_mode,
+)
 
 # Position-sizing arithmetic (architecture phase 3). Gathering the factors is
 # still this object's job — they come from stateful collaborators that live
@@ -178,21 +180,32 @@ class SignalPipeline:
         equity_throttle: bool = True,
         position_sizing_mode: str = "auto",
         fixed_position_size: float = 0.0,
+        equity_provider: Optional[Callable[[], float]] = None,
+        profit_reinvestment: bool = False,
+        maximum_risk_amount: Optional[float] = None,
+        minimum_equity: Optional[float] = None,
     ):
         self.ledger = ledger
         self.paper = paper
         self.controls = controls
         self.equity = equity
+        self.starting_equity = float(equity)
+        self.equity_provider = equity_provider
         self.risk_per_trade_pct = risk_per_trade_pct
         self.exposure_limit_pct = exposure_limit_pct
         # Optional account-wide gate supplied by TradingInstanceManager. It is
         # evaluated after instance sizing/caps but before paper execution.
         self.global_entry_guard = None
-        # "auto" sizes each entry from stop distance and risk. "fixed" uses a
-        # deliberate base-asset quantity (for example 0.01 BTC), but still
-        # passes every downstream exposure, portfolio, loss and risk-engine gate.
-        self.position_sizing_mode = "fixed" if position_sizing_mode == "fixed" else "auto"
+        raw_sizing_mode = str(position_sizing_mode or "auto")
+        # Keep the legacy global settings API's public auto/fixed values stable.
+        # Trading Instances pass and persist canonical Stage 3 values.
+        self.position_sizing_mode = (raw_sizing_mode if raw_sizing_mode in ("auto", "fixed")
+                                     else normalize_sizing_mode(raw_sizing_mode))
         self.fixed_position_size = max(0.0, float(fixed_position_size))
+        self.profit_reinvestment = bool(profit_reinvestment)
+        self.maximum_risk_amount = (float(maximum_risk_amount)
+                                    if maximum_risk_amount is not None else None)
+        self.minimum_equity = float(minimum_equity) if minimum_equity is not None else None
         self.dedup = DuplicateGuard(ledger, dedup_window_s)
         # Fail-closed pre-trade safety gate (default = strong defaults).
         self.quality = quality or MarketQualityGate()
@@ -306,7 +319,7 @@ class SignalPipeline:
         return _RiskEngine(limits)
 
     def _risk_context(self, *, symbol: str, side: str, entry: float, stop: float,
-                      confidence: float, payload: dict):
+                      confidence: float, payload: dict, equity: Optional[float] = None):
         """Assemble what the engine reads. Every figure comes from the same
         source the corresponding pipeline gate uses — the daily P&L from
         ``_today_pnl``, the exposure from ``paper.positions()`` — so the two
@@ -334,7 +347,7 @@ class SignalPipeline:
                 confidence=confidence,
                 strategy_id=str(payload.get("strategy", "") or "")),
             account=_AccountState(
-                equity=self.equity,
+                equity=float(self._current_realized_equity() if equity is None else equity),
                 # The loss windows are measured against the SAME base the
                 # pipeline's own gates use (paper.starting_balance), not
                 # against current equity — otherwise the same P&L would clear
@@ -352,6 +365,12 @@ class SignalPipeline:
             # rather than describing a bot that is running when it is not.
             kill_switch_engaged=bool(self._halted) or not self.controls.trading_allowed(),
             kill_switch_reason=self._halt_reason or "trading halted")
+
+    def _current_realized_equity(self) -> float:
+        """Fresh authoritative realized equity; unrealized P&L is excluded."""
+        if self.equity_provider is not None:
+            return float(self.equity_provider())
+        return float(self.paper.balance())
 
     def process(self, payload: dict) -> PipelineResult:
         with self._proc_lock:
@@ -640,13 +659,27 @@ class SignalPipeline:
             allocator=af, event=econ_risk, boost=bf, context=xf, side=sfm,
             streak=self._streak_factor())
         eff_risk = _effective_risk(self.risk_per_trade_pct, factors)
-        auto_size = size_position(self.equity, entry, stop, RiskRules(risk_per_trade_pct=eff_risk))
-        manual_sizing = self.position_sizing_mode == "fixed"
-        size = self.fixed_position_size if manual_sizing else auto_size
-        if size <= 0:
-            reason = ("Manual position quantity is not configured" if manual_sizing
-                      else "Computed position size is zero")
-            return reject("sizing", reason)
+        realized_equity = self._current_realized_equity()
+        active_sizing_mode = normalize_sizing_mode(self.position_sizing_mode)
+        sizing = PositionSizingService.calculate(PositionSizingRequest(
+            mode=active_sizing_mode,
+            entry_price=entry,
+            stop_price=stop,
+            starting_equity=self.starting_equity,
+            current_realized_equity=realized_equity,
+            risk_per_trade_pct=eff_risk,
+            fixed_quantity=self.fixed_position_size,
+            profit_reinvestment=self.profit_reinvestment,
+            maximum_risk_amount=self.maximum_risk_amount,
+            minimum_equity=self.minimum_equity,
+        ))
+        manual_sizing = sizing.mode == FIXED_QUANTITY
+        size = sizing.quantity
+        if not sizing.approved:
+            if sizing.reason == "instance equity floor reached":
+                self._halted = True
+                self._halt_reason = sizing.reason
+            return reject("sizing", sizing.reason)
         # Immutable-at-entry evidence for the decision journal. This is a
         # receipt of the factors already used above, not a second sizing path.
         # Values are overwritten server-side so a webhook cannot fabricate the
@@ -654,10 +687,14 @@ class SignalPipeline:
         payload["journal_sizing"] = {
             "base_risk_pct": round(self.risk_per_trade_pct * 100, 4),
             "effective_risk_pct": round(eff_risk * 100, 4),
-            "mode": "manual_fixed" if manual_sizing else "automatic_risk",
+            "mode": sizing.mode,
+            "sizing_engine_version": sizing.sizing_engine_version,
+            "risk_basis_at_entry": round(sizing.risk_basis, 10),
+            "risk_amount_at_entry": round(sizing.risk_amount, 10),
+            "equity_before_trade": round(realized_equity, 10),
             "configured_fixed_size": round(self.fixed_position_size, 10) if manual_sizing else None,
             "computed_size": round(size, 10),
-            "risk_model_size": round(auto_size, 10),
+            "risk_model_size": round(size, 10),
             "modifiers": {
                 "confidence": round(factors.confidence, 4),
                 "kelly": round(factors.kelly, 4),
@@ -673,15 +710,15 @@ class SignalPipeline:
         }
         if manual_sizing:
             steps.append(Step("risk", True,
-                              f"manual fixed quantity {size:.6f}; risk-model reference "
-                              f"{auto_size:.6f}; exposure and portfolio caps still apply"))
+                              f"manual fixed quantity {size:.6f}; risk {sizing.risk_amount:.2f}; "
+                              "exposure and portfolio caps still apply"))
         else:
             steps.append(Step("risk", True,
                               f"{_describe_factors(factors)}"
                               f" → risk {eff_risk*100:.2f}% sized {size:.6f}"))
 
         # 5. exposure limit (cap notional to the per-trade limit)
-        max_size = (self.exposure_limit_pct * self.equity) / entry if entry > 0 else 0.0
+        max_size = (self.exposure_limit_pct * realized_equity) / entry if entry > 0 else 0.0
         if size > max_size:
             size = max_size
             steps.append(Step("exposure", True, f"capped to {self.exposure_limit_pct*100:.0f}% exposure"))
@@ -695,7 +732,7 @@ class SignalPipeline:
         # portfolio-level ceiling every production bot enforces.
         if self.max_total_exposure_pct > 0:
             open_notional = sum(p["size"] * p["entry"] for p in self.paper.positions())
-            budget = self.max_total_exposure_pct * self.equity - open_notional
+            budget = self.max_total_exposure_pct * realized_equity - open_notional
             if budget <= 0:
                 return reject("portfolio_exposure",
                               f"Portfolio exposure {open_notional:.0f} already at the "
@@ -737,7 +774,7 @@ class SignalPipeline:
         if self.risk_engine is not None:
             decision = self.risk_engine.evaluate(self._risk_context(
                 symbol=symbol, side=side, entry=entry, stop=stop,
-                confidence=confidence, payload=payload))
+                confidence=confidence, payload=payload, equity=realized_equity))
             if not decision.approved:
                 return reject("risk_engine", decision.explain())
             steps.append(Step("risk_engine", True,
@@ -761,7 +798,15 @@ class SignalPipeline:
 
         # 6. paper execution (routed through the fill model)
         fill = self.paper.open(symbol=symbol, side=side, size=size, entry=entry, stop=stop,
-                               alert_id=alert_id, maker=bool(payload.get("maker")))
+                               alert_id=alert_id, maker=bool(payload.get("maker")),
+                               sizing_context={
+                                   "sizing_mode": sizing.mode,
+                                   "sizing_engine_version": sizing.sizing_engine_version,
+                                   "risk_basis_at_entry": sizing.risk_basis,
+                                   "risk_pct_at_entry": eff_risk,
+                                   "risk_amount_at_entry": abs(entry - stop) * size,
+                                   "equity_before_trade": realized_equity,
+                               })
         if fill.action == "rejected":
             return reject("execution", "Order rejected at fill (execution model)")
         entry, size = fill.price, fill.size          # actual filled price / size
@@ -789,7 +834,7 @@ class SignalPipeline:
                     symbol=symbol, side=_dir(side),
                     strategy=payload.get("strategy", brain_reason.split(" ")[0] or "Strategy"),
                     timeframe=payload.get("timeframe", ""), entry=entry, stop=stop,
-                    target=payload.get("target"), size=size, equity=self.equity,
+                    target=payload.get("target"), size=size, equity=realized_equity,
                     confidence=confidence, brain_score=payload.get("brain_score"),
                     regime=payload.get("regime", ""), steps=steps, payload=payload)
             except Exception:  # noqa: BLE001 — journaling must never block trading

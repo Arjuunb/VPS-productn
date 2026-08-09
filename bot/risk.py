@@ -20,6 +20,10 @@ from datetime import date, datetime
 from typing import Optional
 
 from bot.types import AccountSnapshot, Signal
+from tradexa.risk.position_sizing import (
+    DYNAMIC_CURRENT_EQUITY_PERCENT, PositionSizingRequest,
+    PositionSizingService, normalize_sizing_mode,
+)
 
 
 @dataclass
@@ -34,6 +38,12 @@ class RiskConfig:
     # stop — i.e. it can only make sizing MORE conservative, never less.
     atr_stop_mult: float = 0.0
     atr_period: int = 14
+    sizing_mode: str = DYNAMIC_CURRENT_EQUITY_PERCENT
+    fixed_quantity: float = 0.0
+    starting_equity: Optional[float] = None
+    profit_reinvestment: bool = True
+    maximum_risk_amount: Optional[float] = None
+    minimum_equity: Optional[float] = None
 
     def __post_init__(self) -> None:
         if not 0 < self.risk_per_trade_pct <= 1:
@@ -50,6 +60,7 @@ class RiskConfig:
             raise ValueError("atr_stop_mult must be >= 0")
         if self.atr_period < 1:
             raise ValueError("atr_period must be >= 1")
+        self.sizing_mode = normalize_sizing_mode(self.sizing_mode)
 
 
 @dataclass
@@ -66,6 +77,8 @@ class RiskManager:
         self.cfg = config or RiskConfig()
         self.state = RiskState()
         self._atr_cache: float = 0.0  # last ATR fed via update_atr()
+        self._starting_equity: Optional[float] = self.cfg.starting_equity
+        self._realized_equity: Optional[float] = self.cfg.starting_equity
 
     def update_atr(self, atr_value: float) -> None:
         """Feed the latest ATR (in price units) for ATR-based stop widening.
@@ -90,6 +103,9 @@ class RiskManager:
             # First bar ever — anchor to its date.
             self.state.day = today
             self.state.starting_equity_today = equity
+            if self._starting_equity is None:
+                self._starting_equity = equity
+                self._realized_equity = equity
         elif today != self.state.day:
             # New day — reset all daily state, equity anchored at day's first bar.
             self.state = RiskState(day=today, starting_equity_today=equity)
@@ -124,8 +140,8 @@ class RiskManager:
         if len(account.positions) >= self.cfg.max_open_positions:
             return False, 0.0, "Max open positions reached"
 
-        # Risk-based position sizing
-        risk_dollars = account.equity * self.cfg.risk_per_trade_pct
+        # Shared sizing service. The realized basis changes only on a close;
+        # mark-to-market gains cannot compound future risk.
         risk_per_unit = abs(signal.entry - signal.stop_loss)
         if risk_per_unit <= 0:
             return False, 0.0, "Invalid stop loss (zero distance to entry)"
@@ -137,7 +153,22 @@ class RiskManager:
             if atr_stop > risk_per_unit:
                 risk_per_unit = atr_stop
 
-        qty = risk_dollars / risk_per_unit
+        effective_stop = signal.entry - risk_per_unit
+        sized = PositionSizingService.calculate(PositionSizingRequest(
+            mode=self.cfg.sizing_mode,
+            entry_price=signal.entry,
+            stop_price=effective_stop,
+            starting_equity=float(account.equity if self._starting_equity is None else self._starting_equity),
+            current_realized_equity=float(account.equity if self._realized_equity is None else self._realized_equity),
+            risk_per_trade_pct=self.cfg.risk_per_trade_pct,
+            fixed_quantity=self.cfg.fixed_quantity,
+            profit_reinvestment=self.cfg.profit_reinvestment,
+            maximum_risk_amount=self.cfg.maximum_risk_amount,
+            minimum_equity=self.cfg.minimum_equity,
+        ))
+        if not sized.approved:
+            return False, 0.0, sized.reason
+        qty = sized.quantity
 
         # Cap notional
         max_notional = account.equity * self.cfg.max_position_pct
@@ -152,6 +183,8 @@ class RiskManager:
     # ------------------------------------------------------ post-trade
     def on_trade_closed(self, pnl: float, now: datetime) -> None:
         self.state.realized_pnl_today += pnl
+        if self._realized_equity is not None:
+            self._realized_equity += pnl
         if pnl < 0:
             self.state.last_loss_time = now
             self.state.cooldown_left = self.cfg.cooldown_bars_after_loss

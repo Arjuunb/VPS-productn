@@ -19,8 +19,12 @@ class InstanceCreate(BaseModel):
     risk_per_trade_pct: float = Field(0.005, gt=0, le=0.05)
     capital_allocation: float = Field(..., gt=0)
     mode: str = Field("trading")
-    sizing_mode: str = Field("auto")
+    sizing_mode: str = Field("fixed_starting_equity_percent")
     fixed_position_size: float = Field(0.0, ge=0)
+    fixed_quantity: Optional[float] = Field(default=None, ge=0)
+    profit_reinvestment: bool = False
+    maximum_risk_amount: Optional[float] = Field(default=None, gt=0)
+    minimum_equity: Optional[float] = Field(default=None, gt=0)
     entry_mode: str = Field("limit")
     fill_model: str = Field("PerfectFill")
     max_open_positions: int = Field(3, ge=1, le=50)
@@ -31,6 +35,10 @@ class InstanceUpdate(BaseModel):
     risk_per_trade_pct: Optional[float] = Field(default=None, gt=0, le=0.05)
     sizing_mode: Optional[str] = None
     fixed_position_size: Optional[float] = Field(default=None, ge=0)
+    fixed_quantity: Optional[float] = Field(default=None, ge=0)
+    profit_reinvestment: Optional[bool] = None
+    maximum_risk_amount: Optional[float] = Field(default=None, gt=0)
+    minimum_equity: Optional[float] = Field(default=None, gt=0)
     entry_mode: Optional[str] = None
     max_open_positions: Optional[int] = Field(default=None, ge=1, le=50)
     strategy: Optional[str] = Field(default=None, min_length=1)
@@ -88,13 +96,13 @@ def instance_options():
         # These are the presently implemented per-instance execution defaults,
         # not editable UI choices.  The API exposes them so they remain honest
         # and can become persisted options in a later additive migration.
-        "execution_defaults": {"position_sizing_mode": "auto", "entry_mode": "limit",
+        "execution_defaults": {"position_sizing_mode": "fixed_starting_equity_percent", "entry_mode": "limit",
                                "fill_model": "PerfectFill", "leverage": None,
                                "max_open_positions": 3, "max_quick_risk_pct": 0.01},
         "sizing_modes": [
-            {"key": "auto", "label": "Dynamic Current Equity %", "implemented": True},
-            {"key": "fixed", "label": "Fixed Quantity", "implemented": True},
-            {"key": "fixed_starting_equity_pct", "label": "Fixed Starting Equity %", "implemented": False},
+            {"key": "fixed_starting_equity_percent", "label": "Fixed Starting Equity %", "implemented": True},
+            {"key": "dynamic_current_equity_percent", "label": "Dynamic Current Equity %", "implemented": True},
+            {"key": "fixed_quantity", "label": "Fixed Quantity", "implemented": True},
         ],
         "market_data_mode": "paper_forward_live_only",
     }
@@ -162,6 +170,10 @@ def create_instance(body: InstanceCreate, x_webhook_secret: Optional[str] = Head
                                  risk_per_trade_pct=body.risk_per_trade_pct,
                                  capital_allocation=body.capital_allocation, mode=body.mode,
                                  sizing_mode=body.sizing_mode, fixed_position_size=body.fixed_position_size,
+                                 fixed_quantity=body.fixed_quantity,
+                                 profit_reinvestment=body.profit_reinvestment,
+                                 maximum_risk_amount=body.maximum_risk_amount,
+                                 minimum_equity=body.minimum_equity,
                                  entry_mode=body.entry_mode, fill_model=body.fill_model,
                                  max_open_positions=body.max_open_positions)
     except ValueError as exc:
@@ -216,7 +228,11 @@ def update_instance(instance_id: str, body: InstanceUpdate,
         inst = _manager().update_configuration(
             instance_id, capital_allocation=body.capital_allocation,
             risk_per_trade_pct=body.risk_per_trade_pct, sizing_mode=body.sizing_mode,
-            fixed_position_size=body.fixed_position_size, entry_mode=body.entry_mode,
+            fixed_position_size=body.fixed_position_size, fixed_quantity=body.fixed_quantity,
+            profit_reinvestment=body.profit_reinvestment,
+            maximum_risk_amount=body.maximum_risk_amount,
+            minimum_equity=body.minimum_equity,
+            entry_mode=body.entry_mode,
             max_open_positions=body.max_open_positions,
             strategy_key=strategy["key"] if strategy else None,
             strategy_label=strategy["label"] if strategy else None,

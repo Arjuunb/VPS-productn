@@ -41,6 +41,15 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     exit       REAL,
     pnl        REAL,
     rr         REAL,
+    sizing_mode TEXT,
+    sizing_engine_version TEXT,
+    risk_basis_at_entry REAL,
+    risk_pct_at_entry REAL,
+    risk_amount_at_entry REAL,
+    equity_before_trade REAL,
+    equity_after_close REAL,
+    fees REAL NOT NULL DEFAULT 0,
+    realized_pnl REAL,
     status     TEXT NOT NULL,          -- open | closed
     source     TEXT NOT NULL DEFAULT 'paper',   -- paper | backtest | live (dataset separation)
     opened_at  TEXT NOT NULL,

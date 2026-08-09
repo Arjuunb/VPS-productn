@@ -43,6 +43,7 @@ class PaperExecutionEngine:
         # optional data.account_store.AccountStore — persists the account snapshot
         # (current equity / available / realized) so capital survives a restart.
         self.account_store = None
+        self.equity_listener = None  # optional callable(current_realized_equity)
         # H-5: history() is read ~10x per signal (PnL/streak/Kelly/curve).
         # Cache the closed-trade list and invalidate on any write, so one
         # process() call scans the ledger once, not ten times.
@@ -90,6 +91,14 @@ class PaperExecutionEngine:
     def realized_pnl(self) -> float:
         return sum((t.get("pnl") or 0.0) for t in self.history())
 
+    def gross_realized_pnl(self) -> float:
+        """Realized P&L before fees; legacy ``pnl`` remains net of fees."""
+        return self.realized_pnl() + self.fees_paid()
+
+    def current_realized_equity(self) -> float:
+        """Authoritative compounding basis (starting capital + net closes)."""
+        return self.balance()
+
     def balance(self) -> float:
         return self.starting_balance + self.realized_pnl()
 
@@ -115,11 +124,17 @@ class PaperExecutionEngine:
     def _persist_account_snapshot(self) -> None:
         """Save the account state to the persistent store so it survives a
         backend restart. Never raises into the trading path."""
+        realized_equity = self.balance()
+        if self.equity_listener is not None:
+            try:
+                self.equity_listener(realized_equity)
+            except Exception:  # noqa: BLE001 — observability must not block trading
+                pass
         if self.account_store is None:
             return
         try:
             self.account_store.update_snapshot(
-                current_equity=self.balance(),
+                current_equity=realized_equity,
                 available_balance=self.available_balance(),
                 realized_pnl=self.realized_pnl())
         except Exception:  # noqa: BLE001 — persistence must never block trading
@@ -127,7 +142,8 @@ class PaperExecutionEngine:
 
     # --------------------------------------------------------------- actions
     def open(self, *, symbol: str, side: str, size: float, entry: float,
-             stop: Optional[float], alert_id: str = "", maker: bool = False) -> FillResult:
+             stop: Optional[float], alert_id: str = "", maker: bool = False,
+             sizing_context: Optional[dict] = None) -> FillResult:
         direction = _dir(side)
         # route the entry through the fill model (price/size/rejection);
         # maker fills (resting limits) execute at the limit price exactly
@@ -139,12 +155,16 @@ class PaperExecutionEngine:
             self.quality.record(symbol=symbol, side=action, intended=entry,
                                 filled=f["price"], kind="entry", maker=maker)
         entry, size = f["price"], f["size"]
+        entry_sizing = dict(sizing_context or {})
+        if stop is not None:
+            entry_sizing["risk_amount_at_entry"] = abs(entry - float(stop)) * size
         pid = self.ledger.open_position(symbol=symbol, side=direction, size=size,
                                         entry=entry, stop=stop)
         tid = self.ledger.record_paper_trade({
             "alert_id": alert_id, "symbol": symbol, "side": direction,
             "size": size, "entry": entry, "stop": stop,
             "strategy_id": self.strategy_id,
+            **entry_sizing,
         })
         self._invalidate_history()
         return FillResult("opened", symbol, direction, size, entry, 0.0, pid, tid)
@@ -164,23 +184,27 @@ class PaperExecutionEngine:
         gross = self._pnl(pos["side"], closed_size, pos["entry"], exit_price)
         fee = self._round_trip_fee(closed_size, pos["entry"], exit_price)
         pnl = gross - fee          # realized P&L on the closed fraction, net of fees
+        equity_before_close = self.balance()
         rr = self._rr(pos, exit_price)
         remainder = pos["size"] - closed_size
         self.ledger.close_position(pos["id"], exit_price=exit_price, pnl=pnl)
         self.ledger.open_position(symbol=symbol, side=pos["side"], size=remainder,
                                   entry=pos["entry"], stop=pos.get("stop"))
-        for t in self.ledger.get_paper_trades():
-            if t["symbol"] == symbol and t["status"] == "open":
-                # M-9: the closed row records the CLOSED size (not the full
-                # original), so per-trade R analytics (Growth Journey / Kelly)
-                # see closed_size vs partial pnl — not full size vs partial pnl.
-                self.ledger.close_paper_trade(t["id"], exit_price=exit_price,
-                                              pnl=pnl, rr=rr, size=closed_size)
-                break
+        open_trade = next((t for t in self.ledger.get_paper_trades()
+                           if t["symbol"] == symbol and t["status"] == "open"), None)
+        if open_trade:
+            self.ledger.close_paper_trade(open_trade["id"], exit_price=exit_price,
+                                          pnl=pnl, rr=rr, size=closed_size,
+                                          fees=fee, realized_pnl=pnl,
+                                          equity_after_close=equity_before_close + pnl)
         self.ledger.record_paper_trade({
             "alert_id": "", "symbol": symbol, "side": pos["side"],
             "size": remainder, "entry": pos["entry"], "stop": pos.get("stop"),
             "strategy_id": self.strategy_id,
+            **({key: open_trade.get(key) for key in (
+                "sizing_mode", "sizing_engine_version", "risk_basis_at_entry",
+                "risk_pct_at_entry", "risk_amount_at_entry", "equity_before_trade",
+            )} if open_trade else {}),
         })
         self._invalidate_history()
         self._persist_account_snapshot()
@@ -201,11 +225,14 @@ class PaperExecutionEngine:
         gross = self._pnl(pos["side"], pos["size"], pos["entry"], exit_price)
         fee = self._round_trip_fee(pos["size"], pos["entry"], exit_price)
         pnl = gross - fee          # realized P&L is net of commission
+        equity_before_close = self.balance()
         rr = self._rr(pos, exit_price)
         self.ledger.close_position(pos["id"], exit_price=exit_price, pnl=pnl)
         for t in self.ledger.get_paper_trades():
             if t["symbol"] == symbol and t["status"] == "open":
-                self.ledger.close_paper_trade(t["id"], exit_price=exit_price, pnl=pnl, rr=rr)
+                self.ledger.close_paper_trade(t["id"], exit_price=exit_price, pnl=pnl, rr=rr,
+                                              fees=fee, realized_pnl=pnl,
+                                              equity_after_close=equity_before_close + pnl)
                 break
         self._invalidate_history()
         self._persist_account_snapshot()
@@ -230,6 +257,9 @@ class PaperExecutionEngine:
     def fees_paid(self) -> float:
         """Total commission booked across all closed trades (recomputed from the
         round-trip notional), for transparency in the account/analytics view."""
+        persisted = sum(float(t.get("fees") or 0) for t in self.history())
+        if persisted > 0:
+            return round(persisted, 8)
         rate = self._fee_rate(maker=False)
         if rate <= 0:
             return 0.0

@@ -113,7 +113,7 @@ def test_instance_execution_configuration_is_persisted_and_does_not_inherit_lega
     assert saved["configuration"]["symbol"] == "BTCUSDT"
     assert saved["configuration"]["strategy_key"] == "brain"
     assert saved["configuration"]["timeframe"] == "5m"
-    assert saved["configuration"]["sizing_mode"] == "fixed"
+    assert saved["configuration"]["sizing_mode"] == "fixed_quantity"
     assert saved["configuration"]["fixed_position_size"] == 0.02
     assert saved["configuration"]["entry_mode"] == "market"
 
@@ -150,7 +150,7 @@ def test_worker_start_uses_persisted_instance_execution_not_legacy_runtime(monke
     assert engine.symbols == ["ETHUSDT"]
     assert engine.timeframe == "15m"
     assert engine.entry_mode == "market"
-    assert pipeline.position_sizing_mode == "fixed"
+    assert pipeline.position_sizing_mode == "fixed_quantity"
     assert pipeline.fixed_position_size == 3.0
     assert pipeline.max_open_positions == 1
 

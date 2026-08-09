@@ -27,6 +27,12 @@ from tradexa.risk.engine import RiskDecision, RiskEngine
 from tradexa.risk.limits import CONSERVATIVE, PIPELINE_PARITY, STRICT, RiskLimits
 from tradexa.risk.rules import BLOCKING_RULES, QUANTITY_RULES, RuleResult
 from tradexa.risk.sizing import RiskFactors, describe_factors, effective_risk
+from tradexa.risk.position_sizing import (
+    DYNAMIC_CURRENT_EQUITY_PERCENT, FIXED_QUANTITY,
+    FIXED_STARTING_EQUITY_PERCENT, InstrumentMetadata,
+    PositionSizingRequest, PositionSizingResult, PositionSizingService,
+    SIZING_ENGINE_VERSION, SIZING_MODES, normalize_sizing_mode,
+)
 
 __all__ = [
     "RiskEngine", "RiskDecision",
@@ -35,4 +41,8 @@ __all__ = [
     "RiskLimits", "CONSERVATIVE", "PIPELINE_PARITY", "STRICT",
     "RuleResult", "BLOCKING_RULES", "QUANTITY_RULES",
     "RiskFactors", "effective_risk", "describe_factors",
+    "PositionSizingService", "PositionSizingRequest", "PositionSizingResult",
+    "InstrumentMetadata", "SIZING_MODES", "SIZING_ENGINE_VERSION",
+    "FIXED_QUANTITY", "FIXED_STARTING_EQUITY_PERCENT",
+    "DYNAMIC_CURRENT_EQUITY_PERCENT", "normalize_sizing_mode",
 ]

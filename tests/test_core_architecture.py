@@ -337,6 +337,15 @@ DELIBERATE_TRADEXA_CONSUMERS = {
     # a differential test asserting bit-identical output against the expression
     # it replaced, and why the import carries a byte-identical fallback.
     "automation-hub/services/signal_pipeline.py",
+    # Stage 3 sizing: one shared deterministic PositionSizingService now owns
+    # paper/live and backtest quantity arithmetic. These adapters provide
+    # instance state; they do not duplicate the sizing formula.
+    "automation-hub/services/trading_instances.py",
+    "automation-hub/risk/position_sizing.py",
+    "bot/risk.py",
+    # Existing core-engine bridge evaluates the standalone risk proposal; its
+    # import is local to the adapter and keeps policy out of the engine shell.
+    "automation-hub/core_engine/risk.py",
     # Phase 4: the adapter for tradexa.portfolio. Read-only and translation-only
     # — it assembles a Portfolio from the paper engine, ledger and broker
     # registry and computes nothing itself, which is what keeps portfolio
