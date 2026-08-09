@@ -51,6 +51,7 @@ export default function TradingInstancesPage({ instanceId }: { instanceId?: stri
   const [range, setRange] = useState<"today" | "7d" | "30d" | "all">("all");
   const [filters, setFilters] = useState({ status: "", pair: "", strategy: "", timeframe: "", version: "", query: "", sort: "newest" });
   const [busy, setBusy] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
   const [form, setForm] = useState({ symbol: "", strategy: "", strategy_version: "", timeframe: "", risk: "0.5", capital: "1000", sizing_mode: "auto", fixed_position_size: "", entry_mode: "limit" });
 
   useEffect(() => {
@@ -91,12 +92,22 @@ export default function TradingInstancesPage({ instanceId }: { instanceId?: stri
   const formStrategy = options.data?.strategies.find((row) => row.key === form.strategy);
 
   const create = async () => {
-    if (!form.symbol || !form.strategy || !form.strategy_version || !form.timeframe) return;
+    if (busy || !form.symbol || !form.strategy || !form.strategy_version || !form.timeframe) return;
+    setCreateError(null);
     setBusy(true);
     try {
-      await apiPostJson("/instances", { symbol: form.symbol, strategy: form.strategy, strategy_version: form.strategy_version, timeframe: form.timeframe, risk_per_trade_pct: Number(form.risk) / 100, capital_allocation: Number(form.capital), mode: "trading", sizing_mode: form.sizing_mode, fixed_position_size: Number(form.fixed_position_size || 0), entry_mode: form.entry_mode, fill_model: "PerfectFill" });
-      app.toast("Trading instance created — start it when ready", "success"); live.refetch();
-    } catch (error) { app.toast(error instanceof Error ? error.message : "Could not create instance", "error"); }
+      const created = await apiPostJson<{ instance: Instance }>("/instances", { symbol: form.symbol, strategy: form.strategy, strategy_version: form.strategy_version, timeframe: form.timeframe, risk_per_trade_pct: Number(form.risk) / 100, capital_allocation: Number(form.capital), mode: "trading", sizing_mode: form.sizing_mode, fixed_position_size: Number(form.fixed_position_size || 0), entry_mode: form.entry_mode, fill_model: "PerfectFill" });
+      // Cards are rendered only from the authoritative GET /instances poll.
+      // Never append the POST payload optimistically: creation may fail while
+      // Supabase validates the durable per-instance market cursor.
+      setSelected(created.instance.id);
+      live.refetch();
+      app.toast("Trading instance created — start it when ready", "success");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not create instance";
+      setCreateError(message);
+      app.toast(message, "error");
+    }
     finally { setBusy(false); }
   };
   const action = async (id: string, name: string) => {
@@ -138,7 +149,8 @@ export default function TradingInstancesPage({ instanceId }: { instanceId?: stri
           <Field label="Market data mode"><input readOnly value="Paper Forward — Live Only" /></Field>
         </div>
         <p className="dim" style={{ margin: "10px 0 0", fontSize: 12 }}>Execution defaults are server-owned and shown read-only. Historical replay cannot be created as a paper-trading instance.</p>
-        <button className="btn btn-primary" disabled={busy || !form.symbol} style={{ marginTop: 10 }} onClick={() => void create()}><Icon name="plus" size={14} /> {busy ? "Creating…" : "Create instance"}</button>
+        {createError && <div className="instance-risk-notice red" role="alert" style={{ marginTop: 10 }}>{createError}</div>}
+        <button className="btn btn-primary" disabled={busy || !form.symbol} aria-busy={busy} style={{ marginTop: 10 }} onClick={() => void create()}><Icon name="plus" size={14} /> {busy ? "Creating…" : "Create instance"}</button>
       </Card>
       <Card className="instance-filter-card" title="Filters & display" subtitle="instance-scoped records only">
         <div className="form-grid-2">

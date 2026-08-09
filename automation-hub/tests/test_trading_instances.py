@@ -2,6 +2,8 @@ from data.ledger import SqliteLedger
 from data.decision_store import DecisionStore
 from execution.paper_engine import PaperExecutionEngine
 from services.trading_instances import InstanceLedger, ResearchExecutionEngine, TradingInstanceManager
+from datetime import datetime, timedelta, timezone
+import time
 import pytest
 
 
@@ -241,3 +243,199 @@ def test_restore_never_exceeds_the_persisted_active_slot_limit(monkeypatch):
     paused = [row for row in rows if row["state"] == "paused"]
     assert len(paused) == 1
     assert "maximum active trading slots" in paused[0]["last_error"]
+
+
+def test_create_first_second_and_third_instances_initializes_distinct_market_cursors():
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
+    created = [
+        manager.create(symbol="BTCUSDT", strategy_key="supertrend", strategy_label="Supertrend",
+                       strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+                       capital_allocation=500),
+        manager.create(symbol="ETHUSDT", strategy_key="brain", strategy_label="Decision Brain",
+                       strategy_version="v2", timeframe="15m", risk_per_trade_pct=0.0075,
+                       capital_allocation=600),
+        manager.create(symbol="SOLUSDT", strategy_key="donchian", strategy_label="Donchian",
+                       strategy_version="v3", timeframe="30m", risk_per_trade_pct=0.004,
+                       capital_allocation=700),
+    ]
+
+    assert len({row.id for row in created}) == 3
+    with ledger._lock:
+        rows = [dict(row) for row in ledger._c.execute(
+            "SELECT * FROM instance_market_state ORDER BY instance_id")]
+    assert {row["instance_id"] for row in rows} == {row.id for row in created}
+    assert all(row["market_data_mode"] == "paper_forward" for row in rows)
+    assert all(row["last_processed_candle_timestamp"] is None for row in rows)
+
+
+def test_schema_failure_happens_before_instance_row_is_inserted(monkeypatch):
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
+    writes = {"create": 0}
+
+    monkeypatch.setattr(manager.store, "assert_runtime_schema",
+                        lambda: (_ for _ in ()).throw(RuntimeError("missing instance_market_state")))
+    original_create = manager.store.create
+    monkeypatch.setattr(manager.store, "create",
+                        lambda instance: (writes.__setitem__("create", writes["create"] + 1),
+                                          original_create(instance))[-1])
+
+    with pytest.raises(RuntimeError, match="instance_market_state"):
+        manager.create(symbol="BTCUSDT", strategy_key="supertrend", strategy_label="Supertrend",
+                       strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+                       capital_allocation=500)
+    assert writes["create"] == 0
+    assert manager.list() == []
+
+
+def test_three_workers_run_simultaneously_with_isolated_runtime_objects(monkeypatch):
+    from services.auto_engine import AutoStrategyEngine
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
+    manager.configure(max_active_slots=3)
+    rows = [
+        manager.create(symbol="BTCUSDT", strategy_key="supertrend", strategy_label="Supertrend",
+                       strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+                       capital_allocation=500),
+        manager.create(symbol="ETHUSDT", strategy_key="brain", strategy_label="Decision Brain",
+                       strategy_version="v2", timeframe="15m", risk_per_trade_pct=0.0075,
+                       capital_allocation=600),
+        manager.create(symbol="SOLUSDT", strategy_key="donchian", strategy_label="Donchian",
+                       strategy_version="v3", timeframe="30m", risk_per_trade_pct=0.004,
+                       capital_allocation=700),
+    ]
+    monkeypatch.setattr(AutoStrategyEngine, "start", lambda self: (
+        setattr(self, "running", True), setattr(self, "lifecycle_state", "running"), True)[-1])
+
+    for row in rows:
+        manager.start(row.id)
+
+    runtimes = [manager._runtime[row.id] for row in rows]
+    assert manager.platform_status()["active_slots"] == 3
+    assert all(runtime[0].running for runtime in runtimes)
+    for component in range(4):
+        assert len({id(runtime[component]) for runtime in runtimes}) == 3
+    assert [(runtime[0].symbols, runtime[0].timeframe) for runtime in runtimes] == [
+        (["BTCUSDT"], "5m"), (["ETHUSDT"], "15m"), (["SOLUSDT"], "30m")]
+    runtimes[0][0]._pending["BTCUSDT"] = {"price": 100}
+    assert runtimes[1][0]._pending == {}
+    assert runtimes[2][0]._pending == {}
+
+
+def test_backend_restart_restores_all_workers_with_their_own_cursor(monkeypatch):
+    from services.auto_engine import AutoStrategyEngine
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
+    manager.configure(max_active_slots=3)
+    rows = [
+        manager.create(symbol="BTCUSDT", strategy_key="supertrend", strategy_label="Supertrend",
+                       strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+                       capital_allocation=500),
+        manager.create(symbol="ETHUSDT", strategy_key="brain", strategy_label="Decision Brain",
+                       strategy_version="v2", timeframe="15m", risk_per_trade_pct=0.0075,
+                       capital_allocation=600),
+        manager.create(symbol="SOLUSDT", strategy_key="donchian", strategy_label="Donchian",
+                       strategy_version="v3", timeframe="30m", risk_per_trade_pct=0.004,
+                       capital_allocation=700),
+    ]
+    cursors = {
+        row.id: (datetime(2026, 8, 9, tzinfo=timezone.utc) + timedelta(minutes=index * 15)).isoformat()
+        for index, row in enumerate(rows)
+    }
+    for row in rows:
+        manager.store.save_market_state(row.id, last_processed_candle_timestamp=cursors[row.id])
+        row.state, row.desired_running = "running", True
+        manager.store.save(row)
+    manager.store.save_pending_orders(rows[0].id, {
+        "BTCUSDT": {"side": "BUY", "price": 100.0, "target": 103.0,
+                    "ttl": 2, "payload": {"symbol": "BTCUSDT", "stop": 99.0},
+                    "decision_id": "decision-one"},
+    })
+    manager.store.save_market_state(rows[0].id, last_processed_candle_timestamp=cursors[rows[0].id])
+
+    monkeypatch.setattr(AutoStrategyEngine, "start", lambda self: (
+        setattr(self, "running", True), setattr(self, "lifecycle_state", "running"), True)[-1])
+    restored_manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
+    restored = restored_manager.restore_desired_instances()
+
+    assert set(restored) == {row.id for row in rows}
+    assert restored_manager.platform_status()["active_slots"] == 3
+    for row in rows:
+        engine = restored_manager._runtime[row.id][0]
+        assert engine.last_processed_candle == cursors[row.id]
+        assert engine.symbols == [row.symbol]
+        assert engine.timeframe == row.timeframe
+    assert set(restored_manager._runtime[rows[0].id][0]._pending) == {"BTCUSDT"}
+    assert restored_manager._runtime[rows[1].id][0]._pending == {}
+    assert restored_manager._runtime[rows[2].id][0]._pending == {}
+
+
+def test_deleting_one_stopped_instance_does_not_affect_another():
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
+    first = manager.create(symbol="BTCUSDT", strategy_key="supertrend", strategy_label="Supertrend",
+                           strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+                           capital_allocation=500)
+    second = manager.create(symbol="ETHUSDT", strategy_key="brain", strategy_label="Decision Brain",
+                            strategy_version="v2", timeframe="15m", risk_per_trade_pct=0.0075,
+                            capital_allocation=600)
+    manager.store.save_market_state(second.id, last_processed_candle_timestamp="2026-08-09T00:15:00+00:00")
+
+    assert manager.delete(first.id) == first.id
+
+    assert [row["id"] for row in manager.list()] == [second.id]
+    assert manager.store.market_state(second.id)["last_processed_candle_timestamp"] == "2026-08-09T00:15:00+00:00"
+    with ledger._lock:
+        assert ledger._c.execute("SELECT COUNT(*) FROM instance_market_state WHERE instance_id=?", (first.id,)).fetchone()[0] == 0
+        assert ledger._c.execute("SELECT COUNT(*) FROM instance_market_state WHERE instance_id=?", (second.id,)).fetchone()[0] == 1
+
+
+def test_two_real_forward_workers_are_alive_at_the_same_time():
+    """Runtime proof: actual worker threads, not merely two database rows."""
+    from bot.types import Bar
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=0.01)
+    manager.configure(max_active_slots=2)
+    btc = manager.create(symbol="BTCUSDT", strategy_key="supertrend", strategy_label="Supertrend",
+                         strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+                         capital_allocation=500)
+    eth = manager.create(symbol="ETHUSDT", strategy_key="brain", strategy_label="Decision Brain",
+                         strategy_version="v2", timeframe="15m", risk_per_trade_pct=0.005,
+                         capital_allocation=500)
+
+    def forward_bars(_symbol, timeframe, limit):
+        minutes = 5 if timeframe == "5m" else 15
+        forming = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        forming -= timedelta(minutes=forming.minute % minutes)
+        start = forming - timedelta(minutes=minutes * (limit - 1))
+        return ([Bar(start + timedelta(minutes=minutes * index), 100, 101, 99, 100, 1)
+                 for index in range(limit)], "live (test)")
+
+    manager.forward_fetcher = forward_bars
+    try:
+        manager.start(btc.id)
+        manager.start(eth.id)
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            states = [manager._runtime[row.id][0].lifecycle_state for row in (btc, eth)]
+            if states == ["running", "running"]:
+                break
+            time.sleep(0.01)
+        first_engine, second_engine = manager._runtime[btc.id][0], manager._runtime[eth.id][0]
+        assert first_engine.running and second_engine.running
+        assert first_engine.lifecycle_state == second_engine.lifecycle_state == "running"
+        assert first_engine._thread is not second_engine._thread
+        assert first_engine._thread is not None and first_engine._thread.is_alive()
+        assert second_engine._thread is not None and second_engine._thread.is_alive()
+        assert manager.platform_status()["active_slots"] == 2
+        assert manager.store.market_state(btc.id)["last_processed_candle_timestamp"] is not None
+        assert manager.store.market_state(eth.id)["last_processed_candle_timestamp"] is not None
+        # Warm-up history establishes each cursor but is never replayed as a
+        # signal/trade. Repeated provider windows remain duplicate-only.
+        assert first_engine.stats["bars"] == second_engine.stats["bars"] == 0
+        assert InstanceLedger(ledger, btc.id).get_paper_trades() == []
+        assert InstanceLedger(ledger, eth.id).get_paper_trades() == []
+    finally:
+        manager.stop(btc.id)
+        manager.stop(eth.id)

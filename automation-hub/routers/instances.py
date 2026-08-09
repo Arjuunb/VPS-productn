@@ -155,15 +155,35 @@ def create_instance(body: InstanceCreate, x_webhook_secret: Optional[str] = Head
         raise HTTPException(400, f"Unsupported pair '{body.symbol.upper()}'")
     if body.timeframe not in TIMEFRAMES:
         raise HTTPException(400, f"Unsupported timeframe '{body.timeframe}'")
-    inst = _manager().create(symbol=body.symbol, strategy_key=strategy["key"], strategy_label=strategy["label"],
-                             strategy_version=body.strategy_version or strategy.get("version", "unversioned"), timeframe=body.timeframe,
-                             risk_per_trade_pct=body.risk_per_trade_pct,
-                             capital_allocation=body.capital_allocation, mode=body.mode,
-                             sizing_mode=body.sizing_mode, fixed_position_size=body.fixed_position_size,
-                             entry_mode=body.entry_mode, fill_model=body.fill_model,
-                             max_open_positions=body.max_open_positions)
+    try:
+        inst = _manager().create(symbol=body.symbol, strategy_key=strategy["key"], strategy_label=strategy["label"],
+                                 strategy_version=body.strategy_version or strategy.get("version", "unversioned"), timeframe=body.timeframe,
+                                 risk_per_trade_pct=body.risk_per_trade_pct,
+                                 capital_allocation=body.capital_allocation, mode=body.mode,
+                                 sizing_mode=body.sizing_mode, fixed_position_size=body.fixed_position_size,
+                                 entry_mode=body.entry_mode, fill_model=body.fill_model,
+                                 max_open_positions=body.max_open_positions)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc))
     _wa.ledger.log(level="info", stage="instance", message=f"Instance created: {inst.symbol} {inst.strategy_label} {inst.strategy_version}", symbol=inst.symbol)
     return {"instance": _manager().status(inst.id)}
+
+
+@router.delete("/instances/{instance_id}")
+def delete_instance(instance_id: str, x_webhook_secret: Optional[str] = Header(default=None)):
+    _wa._check_secret(x_webhook_secret)
+    manager = _manager()
+    try:
+        deleted_id = manager.delete(instance_id)
+    except KeyError:
+        raise HTTPException(404, "Trading instance not found")
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    _wa.ledger.log(level="info", stage="instance",
+                   message=f"Trading Instance deleted: {deleted_id}")
+    return {"deleted_instance_id": deleted_id}
 
 
 @router.get("/instances/leaderboard")

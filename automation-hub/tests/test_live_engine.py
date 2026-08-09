@@ -23,7 +23,10 @@ class _AlwaysLong:
 
 
 def _bars(n, start=100.0):
-    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    # Keep the newest synthetic candle current enough for the strict forward
+    # freshness guard. A fixed historical date makes the recovery-thread test
+    # fail for the wrong reason as wall-clock time advances.
+    t0 = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(hours=4 * n)
     return [Bar(t0 + timedelta(hours=4 * i), start + i, start + i + 1,
                 start + i - 1, start + i, 1.0) for i in range(n)]
 
@@ -48,14 +51,14 @@ def test_ingest_acts_only_on_new_closed_bars():
     last = bars[-3].timestamp             # already-seen up to here
 
     # first poll: bars[-2] is the only NEW closed bar (bars[-1] is in-progress)
-    last = eng._ingest("BTCUSDT", strat, bars, last)
+    last = eng._ingest("BTCUSDT", strat, bars[:-1], last)
     assert eng.stats["bars"] == 1
     assert len(paper.positions()) == 1     # it opened on the new closed bar
     assert last == bars[-2].timestamp
 
     # re-poll with the SAME data -> nothing new, no action
     before = eng.stats["bars"]
-    last = eng._ingest("BTCUSDT", strat, bars, last)
+    last = eng._ingest("BTCUSDT", strat, bars[:-1], last)
     assert eng.stats["bars"] == before
 
 
@@ -67,7 +70,7 @@ def test_ingest_ignores_in_progress_candle():
         strat.bars.append(b)
     last = bars[-2].timestamp              # seen all closed bars
     # only the in-progress bar (bars[-1]) is "new" -> must be ignored
-    eng._ingest("BTCUSDT", strat, bars, last)
+    eng._ingest("BTCUSDT", strat, bars[:-1], last)
     assert eng.stats["bars"] == 0
     assert paper.positions() == []
 
@@ -104,7 +107,11 @@ def test_live_worker_recovers_after_a_transient_warmup_failure():
         calls["n"] += 1
         if calls["n"] == 1:
             raise OSError("temporary network failure")
-        return _bars(4), "live (test)"
+        # This engine uses its default 1h timeframe; return actual 1h-spaced
+        # provider bars so strict freshness is what the test is exercising.
+        newest = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        return [Bar(newest - timedelta(hours=3 - i), 100, 101, 99, 100, 1)
+                for i in range(4)], "live (test)"
 
     eng = AutoStrategyEngine(pipe, paper, led, symbols=["BTCUSDT"], live=True,
                              live_poll_s=0.01, fetcher=fetcher)

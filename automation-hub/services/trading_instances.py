@@ -202,7 +202,8 @@ CREATE TABLE IF NOT EXISTS instance_market_state (
  market_data_mode TEXT NOT NULL, market_data_status TEXT NOT NULL DEFAULT 'stopped',
  last_market_data_timestamp TEXT, data_source TEXT, warmup_bars INTEGER NOT NULL DEFAULT 0,
  duplicate_candles INTEGER NOT NULL DEFAULT 0, missing_candles INTEGER NOT NULL DEFAULT 0,
- out_of_order_candles INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
+ out_of_order_candles INTEGER NOT NULL DEFAULT 0,
+ pending_orders_json TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS trading_instance_platform_settings (
  id TEXT PRIMARY KEY, max_active_slots INTEGER NOT NULL DEFAULT 1,
@@ -216,6 +217,28 @@ CREATE INDEX IF NOT EXISTS idx_instance_symbol_strategy ON trading_instances(sym
 
 class InstanceStore:
     """SQLite in development; Supabase tables in production after the additive migration."""
+    _REMOTE_SCHEMA = {
+        "trading_instances": (
+            "id", "symbol", "strategy_key", "strategy_label", "strategy_version",
+            "timeframe", "risk_per_trade_pct", "capital_allocation", "max_open_positions",
+            "sizing_mode", "fixed_position_size", "entry_mode", "fill_model",
+            "execution_mode", "mode", "market_data_mode", "state", "desired_running",
+            "created_at", "started_at", "stopped_at", "updated_at", "last_error",
+        ),
+        "instance_market_state": (
+            "instance_id", "last_processed_candle_timestamp", "market_data_mode",
+            "market_data_status", "last_market_data_timestamp", "data_source",
+            "warmup_bars", "duplicate_candles", "missing_candles",
+            "out_of_order_candles", "pending_orders_json", "updated_at",
+        ),
+        "instance_metrics": ("instance_id", "data_json", "updated_at"),
+        "instance_engine_logs": ("id", "instance_id", "ts", "level", "message"),
+        "trading_instance_platform_settings": (
+            "id", "max_active_slots", "max_global_risk_pct",
+            "max_global_daily_loss_pct", "paper_account_capital", "updated_at",
+        ),
+    }
+
     def __init__(self, ledger: Ledger):
         self.ledger = ledger
         self.remote = not isinstance(ledger, SqliteLedger)
@@ -241,10 +264,37 @@ class InstanceStore:
                     ensure_column(ledger._c, "trading_instances", name, definition)
                 ensure_column(ledger._c, "trading_instance_platform_settings",
                               "paper_account_capital", "REAL NOT NULL DEFAULT 10000")
+                ensure_column(ledger._c, "instance_market_state",
+                              "pending_orders_json", "TEXT NOT NULL DEFAULT '{}'")
                 ledger._c.commit()
 
     def _table(self, name):
         return self.ledger._db.table(name)
+
+    def assert_runtime_schema(self) -> None:
+        """Fail before mutating a remote database whose migration is incomplete.
+
+        PostgREST validates selected column names even when a table has no rows,
+        so this catches both a missing table and a partially applied additive
+        migration.  Creation must never insert a hidden ``trading_instances``
+        row and only then discover that its durable forward cursor cannot be
+        written.
+        """
+        if not self.remote:
+            return
+        for table, columns in self._REMOTE_SCHEMA.items():
+            try:
+                self._table(table).select(",".join(columns)).limit(1).execute()
+            except Exception as exc:
+                self.available = False
+                self.error = (
+                    f"Trading Instance runtime schema is incomplete at '{table}'; "
+                    "run data/trading_instances_schema.sql in Supabase, reload the "
+                    "PostgREST schema cache, then restart the app"
+                )
+                raise RuntimeError(self.error) from exc
+        self.available = True
+        self.error = ""
 
     def create(self, instance: TradingInstance) -> None:
         if not self.available:
@@ -258,6 +308,17 @@ class InstanceStore:
                 (id,symbol,strategy_key,strategy_label,strategy_version,timeframe,risk_per_trade_pct,capital_allocation,max_open_positions,sizing_mode,fixed_position_size,entry_mode,fill_model,execution_mode,mode,market_data_mode,state,desired_running,created_at,started_at,stopped_at,updated_at,last_error)
                 VALUES (:id,:symbol,:strategy_key,:strategy_label,:strategy_version,:timeframe,:risk_per_trade_pct,:capital_allocation,:max_open_positions,:sizing_mode,:fixed_position_size,:entry_mode,:fill_model,:execution_mode,:mode,:market_data_mode,:state,:desired_running,:created_at,:started_at,:stopped_at,:updated_at,:last_error)""", row)
                 self.ledger._c.commit()
+
+    def delete(self, instance_id: str) -> None:
+        """Delete one configuration and its instance-owned auxiliary state."""
+        if self.remote:
+            self._table("trading_instances").delete().eq("id", instance_id).execute()
+            return
+        with self.ledger._lock:
+            for table in ("instance_market_state", "instance_metrics", "instance_engine_logs"):
+                self.ledger._c.execute(f"DELETE FROM {table} WHERE instance_id=?", (instance_id,))
+            self.ledger._c.execute("DELETE FROM trading_instances WHERE id=?", (instance_id,))
+            self.ledger._c.commit()
 
     def list(self) -> list[TradingInstance]:
         if self.remote:
@@ -298,14 +359,17 @@ class InstanceStore:
                     "market_data_mode": "paper_forward", "market_data_status": "stopped",
                     "last_market_data_timestamp": None, "data_source": None,
                     "warmup_bars": 0, "duplicate_candles": 0, "missing_candles": 0,
-                    "out_of_order_candles": 0}
+                    "out_of_order_candles": 0, "pending_orders_json": {}}
         try:
             if self.remote:
                 rows = self._table("instance_market_state").select("*").eq("instance_id", instance_id).execute().data
                 return {**defaults, **(rows[0] if rows else {})}
             with self.ledger._lock:
                 row = self.ledger._c.execute("SELECT * FROM instance_market_state WHERE instance_id=?", (instance_id,)).fetchone()
-            return {**defaults, **(dict(row) if row else {})}
+            values = {**defaults, **(dict(row) if row else {})}
+            raw_pending = values.get("pending_orders_json")
+            values["pending_orders_json"] = json.loads(raw_pending) if isinstance(raw_pending, str) else (raw_pending or {})
+            return values
         except Exception as exc:
             self.available = False
             self.error = "Trading Instance market-state migration is not installed; run data/trading_instances_schema.sql"
@@ -321,10 +385,33 @@ class InstanceStore:
             self._table("instance_market_state").upsert(row).execute()
         else:
             with self.ledger._lock:
-                self.ledger._c.execute("""INSERT OR REPLACE INTO instance_market_state
+                self.ledger._c.execute("""INSERT INTO instance_market_state
                 (instance_id,last_processed_candle_timestamp,market_data_mode,market_data_status,last_market_data_timestamp,data_source,warmup_bars,duplicate_candles,missing_candles,out_of_order_candles,updated_at)
-                VALUES (:instance_id,:last_processed_candle_timestamp,:market_data_mode,:market_data_status,:last_market_data_timestamp,:data_source,:warmup_bars,:duplicate_candles,:missing_candles,:out_of_order_candles,:updated_at)""", row)
+                VALUES (:instance_id,:last_processed_candle_timestamp,:market_data_mode,:market_data_status,:last_market_data_timestamp,:data_source,:warmup_bars,:duplicate_candles,:missing_candles,:out_of_order_candles,:updated_at)
+                ON CONFLICT(instance_id) DO UPDATE SET
+                  last_processed_candle_timestamp=excluded.last_processed_candle_timestamp,
+                  market_data_mode=excluded.market_data_mode,
+                  market_data_status=excluded.market_data_status,
+                  last_market_data_timestamp=excluded.last_market_data_timestamp,
+                  data_source=excluded.data_source,
+                  warmup_bars=excluded.warmup_bars,
+                  duplicate_candles=excluded.duplicate_candles,
+                  missing_candles=excluded.missing_candles,
+                  out_of_order_candles=excluded.out_of_order_candles,
+                  updated_at=excluded.updated_at""", row)
                 self.ledger._c.commit()
+
+    def save_pending_orders(self, instance_id: str, pending_orders: dict) -> None:
+        row = {"pending_orders_json": pending_orders, "updated_at": _now()}
+        if self.remote:
+            self._table("instance_market_state").update(row).eq("instance_id", instance_id).execute()
+            return
+        with self.ledger._lock:
+            self.ledger._c.execute(
+                "UPDATE instance_market_state SET pending_orders_json=?, updated_at=? WHERE instance_id=?",
+                (json.dumps(pending_orders), row["updated_at"], instance_id),
+            )
+            self.ledger._c.commit()
 
     def save_metrics(self, instance_id: str, metrics: dict) -> None:
         row = {"instance_id": instance_id, "data_json": json.dumps(metrics), "updated_at": _now()}
@@ -398,40 +485,73 @@ class TradingInstanceManager:
                max_open_positions: int = 3,
                sizing_mode: str = "auto", fixed_position_size: float = 0.0,
                entry_mode: str = "limit", fill_model: str = "PerfectFill") -> TradingInstance:
-        if mode not in ("trading", "research"):
-            raise ValueError("mode must be trading or research")
-        if sizing_mode not in ("auto", "fixed"):
-            raise ValueError("sizing_mode must be 'auto' or 'fixed'")
-        if sizing_mode == "fixed" and fixed_position_size <= 0:
-            raise ValueError("fixed_position_size must be greater than zero for fixed sizing")
-        if entry_mode not in ("limit", "market"):
-            raise ValueError("entry_mode must be 'limit' or 'market'")
-        if fill_model != "PerfectFill":
-            raise ValueError("PerfectFill is the only currently supported paper fill model")
-        if not 1 <= int(max_open_positions) <= 50:
-            raise ValueError("max_open_positions must be between 1 and 50")
-        if mode == "trading":
-            duplicate = next((item for item in self._instances.values()
-                              if item.mode == "trading" and item.symbol == symbol.upper()
-                              and item.strategy_key == strategy_key
-                              and item.strategy_version == (strategy_version or "builtin-1")
-                              and item.timeframe == timeframe and item.state in ("running", "paused", "reconnecting", "starting")), None)
-            if duplicate is not None:
-                raise ValueError("This Trading Instance is already active")
-            allocated = sum(item.capital_allocation for item in self._instances.values() if item.mode == "trading")
-            if allocated + capital_allocation > self.paper_account_capital + 1e-9:
-                available = max(0.0, self.paper_account_capital - allocated)
-                raise ValueError(f"Capital allocation exceeds paper account capacity; available {available:.2f}")
-        inst = TradingInstance(id=_id(), symbol=symbol.upper(), strategy_key=strategy_key,
-                               strategy_label=strategy_label, strategy_version=strategy_version or "builtin-1",
-                               timeframe=timeframe, risk_per_trade_pct=risk_per_trade_pct,
-                               capital_allocation=capital_allocation, max_open_positions=int(max_open_positions),
-                               sizing_mode=sizing_mode,
-                               fixed_position_size=fixed_position_size, entry_mode=entry_mode,
-                               fill_model=fill_model, mode=mode,
-                               market_data_mode="paper_forward" if mode == "trading" else "replay")
-        self.store.create(inst); self._instances[inst.id] = inst
-        return inst
+        with self._lock:
+            # This must precede every insert.  A partially installed Supabase
+            # migration previously left a stopped row behind when status() later
+            # discovered the missing instance_market_state table.
+            self.store.assert_runtime_schema()
+            if mode not in ("trading", "research"):
+                raise ValueError("mode must be trading or research")
+            if sizing_mode not in ("auto", "fixed"):
+                raise ValueError("sizing_mode must be 'auto' or 'fixed'")
+            if sizing_mode == "fixed" and fixed_position_size <= 0:
+                raise ValueError("fixed_position_size must be greater than zero for fixed sizing")
+            if entry_mode not in ("limit", "market"):
+                raise ValueError("entry_mode must be 'limit' or 'market'")
+            if fill_model != "PerfectFill":
+                raise ValueError("PerfectFill is the only currently supported paper fill model")
+            if not 1 <= int(max_open_positions) <= 50:
+                raise ValueError("max_open_positions must be between 1 and 50")
+            if mode == "trading":
+                duplicate = next((item for item in self._instances.values()
+                                  if item.mode == "trading" and item.symbol == symbol.upper()
+                                  and item.strategy_key == strategy_key
+                                  and item.strategy_version == (strategy_version or "builtin-1")
+                                  and item.timeframe == timeframe and item.state in ("running", "paused", "reconnecting", "starting")), None)
+                if duplicate is not None:
+                    raise ValueError("This Trading Instance is already active")
+                allocated = sum(item.capital_allocation for item in self._instances.values() if item.mode == "trading")
+                if allocated + capital_allocation > self.paper_account_capital + 1e-9:
+                    available = max(0.0, self.paper_account_capital - allocated)
+                    raise ValueError(f"Capital allocation exceeds paper account capacity; available {available:.2f}")
+            inst = TradingInstance(id=_id(), symbol=symbol.upper(), strategy_key=strategy_key,
+                                   strategy_label=strategy_label, strategy_version=strategy_version or "builtin-1",
+                                   timeframe=timeframe, risk_per_trade_pct=risk_per_trade_pct,
+                                   capital_allocation=capital_allocation, max_open_positions=int(max_open_positions),
+                                   sizing_mode=sizing_mode,
+                                   fixed_position_size=fixed_position_size, entry_mode=entry_mode,
+                                   fill_model=fill_model, mode=mode,
+                                   market_data_mode="paper_forward" if mode == "trading" else "replay")
+            self.store.create(inst)
+            try:
+                if mode == "trading":
+                    self.store.save_market_state(
+                        inst.id, market_data_mode="paper_forward",
+                        market_data_status="stopped",
+                    )
+            except Exception:
+                # Remote writes cannot span a PostgREST transaction here. Make
+                # the operation atomic from the API's perspective by compensating
+                # immediately if the required cursor row cannot be initialized.
+                self.store.delete(inst.id)
+                raise
+            self._instances[inst.id] = inst
+            return inst
+
+    def delete(self, instance_id: str) -> str:
+        """Delete one stopped instance without touching any sibling worker."""
+        with self._lock:
+            inst = self._instances[instance_id]
+            runtime = self._runtime.get(instance_id)
+            if runtime and runtime[0].running:
+                raise ValueError("Stop the Trading Instance before deleting it")
+            if InstanceLedger(self.ledger, instance_id).get_positions("open"):
+                raise ValueError("Close this instance's open positions before deleting it")
+            self.store.delete(instance_id)
+            self._runtime.pop(instance_id, None)
+            self._metric_fingerprints.pop(instance_id, None)
+            del self._instances[instance_id]
+            return inst.id
 
     def _global_guard(self, instance_id: str, symbol: str, entry: float, stop: float, size: float) -> tuple[bool, str]:
         # Query the scoped records rather than only in-memory workers. An
@@ -498,6 +618,8 @@ class TradingInstanceManager:
                                         fetcher=self.forward_fetcher if forward else self.fetcher,
                                         initial_last_processed_candle=market.get("last_processed_candle_timestamp"),
                                         candle_checkpoint=checkpoint if forward else None,
+                                        initial_pending_orders=market.get("pending_orders_json") if forward else None,
+                                        pending_orders_checkpoint=(lambda pending: self.store.save_pending_orders(instance_id, pending)) if forward else None,
                                         entry_mode=inst.entry_mode)
             engine.strategy_label = f"{inst.strategy_label} {inst.strategy_version}"
             engine.decisions = self.decision_store

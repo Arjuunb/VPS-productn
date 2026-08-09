@@ -43,7 +43,7 @@ def test_simulator_limit_entry_fills_and_misses():
 
 
 # ─────────────────────────── live engine pending limits ───────────────────────────
-def _engine(entry_mode="limit"):
+def _engine(entry_mode="limit", pending_checkpoint=None):
     from services.auto_engine import AutoStrategyEngine
     led = SqliteLedger(":memory:")
     paper = PaperExecutionEngine(led)
@@ -51,7 +51,8 @@ def _engine(entry_mode="limit"):
                           risk_per_trade_pct=0.01, exposure_limit_pct=0.5,
                           max_total_exposure_pct=1.0)
     eng = AutoStrategyEngine(pipe, paper, led, symbols=["BTCUSDT"],
-                             entry_mode=entry_mode)
+                             entry_mode=entry_mode,
+                             pending_orders_checkpoint=pending_checkpoint)
     return eng, paper
 
 
@@ -77,6 +78,15 @@ def test_engine_parks_limit_then_fills_when_touched():
     pos = paper.open_position("BTCUSDT")
     assert pos is not None and pos["entry"] == 100.0
     assert eng.status()["pending_orders"] == 0
+
+
+def test_engine_checkpoints_pending_order_on_create_and_fill():
+    saved = []
+    eng, _paper = _engine(pending_checkpoint=lambda rows: saved.append(rows))
+    eng._process_bar("BTCUSDT", _bar(100), _Stub([_sig()]))
+    assert saved[-1]["BTCUSDT"]["ttl"] == 3
+    eng._process_bar("BTCUSDT", _bar(101, high=102, low=99.8), _Stub([]))
+    assert saved[-1] == {}
 
 
 def test_engine_limit_expires_unfilled():

@@ -65,6 +65,8 @@ class AutoStrategyEngine:
         fetcher: Optional[Callable[[str, str, int], tuple]] = None,
         initial_last_processed_candle: Optional[str] = None,
         candle_checkpoint: Optional[Callable[[str], None]] = None,
+        initial_pending_orders: Optional[dict] = None,
+        pending_orders_checkpoint: Optional[Callable[[dict], None]] = None,
         trade_manager=None,
         entry_mode: Optional[str] = None,
         limit_ttl_bars: int = 3,
@@ -98,6 +100,7 @@ class AutoStrategyEngine:
         # a worker/container restart.  The legacy engine leaves them unset.
         self.last_processed_candle = initial_last_processed_candle
         self._candle_checkpoint = candle_checkpoint
+        self._pending_orders_checkpoint = pending_orders_checkpoint
         self.last_closed_candle: Optional[str] = None
         self.warmup_bars = 0
         self.market_data_status = "replay" if not live else "warming_up"
@@ -161,7 +164,7 @@ class AutoStrategyEngine:
         from services.context_brain import ContextModifiers
         self.context = ContextModifiers(
             leader_bars_fn=lambda: self._fetcher("BTCUSDT", self.timeframe, 80)[0])
-        self._pending: dict[str, dict] = {}     # symbol -> resting limit order
+        self._pending: dict[str, dict] = dict(initial_pending_orders or {})
         self.stats_missed_entries = 0
         # Shadow A/B: an optional services.shadow.ShadowRun fed the SAME bars
         # the live strategy trades — a candidate audition with zero capital.
@@ -274,6 +277,7 @@ class AutoStrategyEngine:
         self._targets.clear()
         self._managed.clear()
         self._pending.clear()
+        self._checkpoint_pending_orders()
         self.stats = {"bars": 0, "signals": 0, "trades": 0, "rejections": 0}
         self.start()
         return self.status()
@@ -580,6 +584,15 @@ class AutoStrategyEngine:
         except Exception as exc:  # persistence is critical for exactly-once
             raise EngineFeedError(f"candle cursor persistence failed: {exc}") from exc
 
+    def _checkpoint_pending_orders(self) -> None:
+        if self._pending_orders_checkpoint is None:
+            return
+        try:
+            snapshot = {symbol: dict(order) for symbol, order in self._pending.items()}
+            self._pending_orders_checkpoint(snapshot)
+        except Exception as exc:  # order persistence is part of instance recovery
+            raise EngineFeedError(f"pending order persistence failed: {exc}") from exc
+
     def _record_market_snapshot(self, symbol, closed) -> None:
         newest = closed[-1]
         self.last_closed_candle = newest.timestamp.isoformat()
@@ -718,6 +731,7 @@ class AutoStrategyEngine:
             return
         if self.paper.open_position(sym) is not None:
             self._pending.pop(sym, None)
+            self._checkpoint_pending_orders()
             return
         long = po["side"] == "BUY"
         fill = None
@@ -747,8 +761,10 @@ class AutoStrategyEngine:
                             time=bar.timestamp.isoformat())
                     except Exception:  # noqa: BLE001
                         pass
+            self._checkpoint_pending_orders()
             return
         self._pending.pop(sym, None)
+        self._checkpoint_pending_orders()
         res = self._route({**po["payload"], "entry": fill, "maker": True,
                            "timestamp": bar.timestamp.isoformat()})
         if res is None:
@@ -1068,6 +1084,7 @@ class AutoStrategyEngine:
                                   "target": signal.take_profit,
                                   "ttl": self.limit_ttl_bars, "payload": payload,
                                   "decision_id": decision_id}
+            self._checkpoint_pending_orders()
             return {"kind": "pending", "decision": decision, "verdict": v}
         res = self._route(payload)
         if res is None:

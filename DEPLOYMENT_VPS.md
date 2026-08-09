@@ -227,3 +227,78 @@ never deletes local SQLite data, but a backup is still mandatory.
    Startup must say `ledger backend = SupabaseLedger (Supabase active: True)`.
    The health JSON must report both `settings_supabase.connected` and
    `ledger_supabase.connected` as `true`.
+
+## Enable multiple paper-forward Trading Instances
+
+Trading Instances use Supabase for their configuration and a separate durable
+closed-candle cursor per instance. A one-column patch is not sufficient. Run
+the **full** `automation-hub/data/trading_instances_schema.sql` file in the
+Supabase SQL Editor before creating an instance.
+
+### Supabase SQL Editor
+
+1. Paste and run the complete contents of:
+   `automation-hub/data/trading_instances_schema.sql`.
+2. Paste and run the complete contents of:
+   `automation-hub/data/verify_trading_instances_schema.sql`.
+3. The verifier's first query must return `0 rows`. Its second query must return
+   `is_primary_key = true` and `has_owner_foreign_key = true`.
+
+The migration is additive and safe to rerun. It ends with a PostgREST schema
+cache reload. Never paste a filesystem path by itself into the SQL Editor; paste
+the SQL contained in the file.
+
+### VPS terminal
+
+Deploy the application after the Supabase migration, raise the active slot cap
+to three without printing the API key, and validate the runtime:
+
+```sh
+cd /opt/VPS-productn
+git pull --ff-only origin main
+docker compose build app
+docker compose up -d --force-recreate --wait --wait-timeout 180 app
+
+docker compose exec -T app python - <<'PY'
+import json, os, urllib.request
+request = urllib.request.Request(
+    "http://127.0.0.1:8000/instances/platform",
+    data=json.dumps({"max_active_slots": 3}).encode(),
+    headers={"x-webhook-secret": os.environ["HUB_API_KEY"], "content-type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(request, timeout=30) as response:
+    status = json.load(response)
+print("Active slot cap:", status["max_active_slots"])
+PY
+
+curl -fsS https://trade-logx.com/health
+docker compose ps
+docker compose logs --tail=150 app
+```
+
+Create and start `BTCUSDT / Supertrend / 5m` and
+`ETHUSDT / Decision Brain / 15m` from Trading Instances. Then verify that both
+server-owned workers and cursor rows exist without printing credentials:
+
+```sh
+cd /opt/VPS-productn
+docker compose exec -T app python - <<'PY'
+import json, os, urllib.request
+request = urllib.request.Request(
+    "http://127.0.0.1:8000/instances",
+    headers={"x-webhook-secret": os.environ["HUB_API_KEY"]},
+)
+with urllib.request.urlopen(request, timeout=30) as response:
+    payload = json.load(response)
+print("Active slots:", payload["active_slots"], "/", payload["max_active_slots"])
+for row in payload["instances"]:
+    market = row.get("market_data") or {}
+    print(row["id"], row["symbol"], row["strategy_label"], row["timeframe"],
+          row["state"], market.get("last_processed_candle_timestamp"))
+PY
+```
+
+Expected: `Active slots: 2 / 3` (or higher if another intentional instance is
+running), two different instance IDs, and independent cursor timestamps that
+only move after each instance processes its own newly closed candle.
