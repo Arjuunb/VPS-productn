@@ -19,5 +19,11 @@ class DuplicateGuard:
     def is_duplicate(self, alert_id: str) -> bool:
         if not alert_id:
             return False
-        since = (datetime.now(timezone.utc) - timedelta(seconds=self.window_seconds)).isoformat()
+        # Autonomous IDs encode instance + candle + action and are immutable.
+        # Their protection must outlive the normal webhook retry window: a
+        # cursor checkpoint can fail, then the same candle can be recovered
+        # hours later after a restart.
+        since = ("1970-01-01T00:00:00+00:00" if alert_id.startswith("auto:")
+                 else (datetime.now(timezone.utc)
+                       - timedelta(seconds=self.window_seconds)).isoformat())
         return self.ledger.webhook_seen(alert_id, since)

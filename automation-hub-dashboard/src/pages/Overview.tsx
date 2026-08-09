@@ -17,7 +17,7 @@ import ActiveTradingInstances from "../components/instances/ActiveTradingInstanc
 export default function Overview() {
   return (
     <>
-      <PageHeader title="Dashboard" subtitle="Live paper trading · realized P&L, engine health, risk and activity at a glance" />
+      <PageHeader title="Dashboard" subtitle="Forward paper simulation · live market data, simulated fills, realized paper P&L" />
       <WhyNoTrades />
       <DashboardHero />
       <MetricCards />

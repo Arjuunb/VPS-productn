@@ -10,8 +10,15 @@ tests) unchanged.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import random
+
+
+PERFECT_FILL = "PerfectFill"
+REALISTIC_FILL = "RealisticFill"
+UNIFIED_FEES = "UnifiedFees"
+SUPPORTED_FILL_MODELS = (REALISTIC_FILL, UNIFIED_FEES, PERFECT_FILL)
 
 
 class PerfectFill:
@@ -46,7 +53,17 @@ class RealisticFill:
         # Binance-like spot rates; makers (resting limits) pay the lower fee.
         self.taker_fee_pct = float(taker_fee_pct)
         self.maker_fee_pct = float(maker_fee_pct)
-        self._rnd = random.Random(int(seed))
+        self.seed = int(seed)
+        self._rnd = random.Random(self.seed)
+
+    def _draw(self, execution_id: str, purpose: str) -> float:
+        """Stable autonomous outcome, sequential seeded outcome in research."""
+        if not execution_id:
+            return self._rnd.random()
+        digest = hashlib.sha256(
+            f"{self.seed}:{execution_id}:{purpose}".encode("utf-8")
+        ).digest()
+        return int.from_bytes(digest[:8], "big") / float(1 << 64)
 
     @property
     def cost_pct(self) -> float:
@@ -58,17 +75,19 @@ class RealisticFill:
 
     def apply(self, action: str, price: float, size: float, *,
               allow_reject: bool = True, allow_partial: bool = True,
-              maker: bool = False) -> dict:
+              maker: bool = False, execution_id: str = "") -> dict:
         """``action`` ∈ {buy, sell}. Buys fill higher, sells fill lower.
         ``maker`` fills (resting limit orders) execute AT the limit price —
         no spread crossing, no slippage; that is the point of maker entries."""
         cost = 0.0 if maker else self.cost_pct
-        if allow_reject and self.reject_prob and self._rnd.random() < self.reject_prob:
+        if (allow_reject and self.reject_prob
+                and self._draw(execution_id, "reject") < self.reject_prob):
             return {"price": price, "size": 0.0, "rejected": True,
                     "filled_fraction": 0.0, "cost_pct": cost}
         fill_price = price * (1 + cost) if action == "buy" else price * (1 - cost)
         frac = 1.0
-        if allow_partial and self.partial_fill_prob and self._rnd.random() < self.partial_fill_prob:
+        if (allow_partial and self.partial_fill_prob
+                and self._draw(execution_id, "partial") < self.partial_fill_prob):
             frac = self.partial_fraction
         return {"price": round(fill_price, 8), "size": round(size * frac, 10),
                 "rejected": False, "filled_fraction": frac, "cost_pct": cost}
@@ -111,6 +130,60 @@ def unified_fees():
     )
 
 
+def normalize_fill_model(value: str | None) -> str:
+    """Return the persisted canonical name for a supported paper fill model.
+
+    Existing instance rows use class-style names while older settings APIs use
+    lower-case aliases. Accept both at the boundary, but persist one stable
+    representation so a worker restores with exactly the model it was created
+    with.
+    """
+    raw = str(value or "").strip().lower().replace("-", "_")
+    aliases = {
+        "perfect": PERFECT_FILL,
+        "perfect_fill": PERFECT_FILL,
+        "perfectfill": PERFECT_FILL,
+        "ideal": PERFECT_FILL,
+        "realistic": REALISTIC_FILL,
+        "realistic_fill": REALISTIC_FILL,
+        "realisticfill": REALISTIC_FILL,
+        "unified": UNIFIED_FEES,
+        "unified_fees": UNIFIED_FEES,
+        "unifiedfees": UNIFIED_FEES,
+    }
+    try:
+        return aliases[raw]
+    except KeyError as exc:
+        raise ValueError(
+            f"fill_model must be one of {', '.join(SUPPORTED_FILL_MODELS)}"
+        ) from exc
+
+
+def _realistic_from_env() -> RealisticFill:
+    """Build the production paper model from documented environment values."""
+    return RealisticFill(
+        spread_pct=float(os.environ.get("HUB_FILL_SPREAD_PCT", 0.0004)),
+        slippage_pct=float(os.environ.get("HUB_FILL_SLIPPAGE_PCT", 0.0003)),
+        latency_pct=float(os.environ.get("HUB_FILL_LATENCY_PCT", 0.0001)),
+        partial_fill_prob=float(os.environ.get("HUB_FILL_PARTIAL_PROB", 0.0)),
+        partial_fraction=float(os.environ.get("HUB_FILL_PARTIAL_FRACTION", 0.6)),
+        reject_prob=float(os.environ.get("HUB_FILL_REJECT_PROB", 0.0)),
+        taker_fee_pct=float(os.environ.get("HUB_FILL_TAKER_FEE_PCT", 0.0004)),
+        maker_fee_pct=float(os.environ.get("HUB_FILL_MAKER_FEE_PCT", 0.0002)),
+        seed=int(os.environ.get("HUB_FILL_RANDOM_SEED", 1)),
+    )
+
+
+def from_name(value: str | None):
+    """Construct one explicitly selected, paper-only execution model."""
+    name = normalize_fill_model(value)
+    if name == REALISTIC_FILL:
+        return _realistic_from_env()
+    if name == UNIFIED_FEES:
+        return unified_fees()
+    return PerfectFill()
+
+
 def _flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -126,13 +199,7 @@ def from_env():
     CHANGES live paper P&L, so it is an opt-in decision, never a silent one.
     """
     if os.environ.get("HUB_FILL_MODEL", "").lower() in ("realistic", "real", "1", "true"):
-        return RealisticFill(
-            spread_pct=float(os.environ.get("HUB_FILL_SPREAD_PCT", 0.0004)),
-            slippage_pct=float(os.environ.get("HUB_FILL_SLIPPAGE_PCT", 0.0003)),
-            partial_fill_prob=float(os.environ.get("HUB_FILL_PARTIAL_PROB", 0.0)),
-            reject_prob=float(os.environ.get("HUB_FILL_REJECT_PROB", 0.0)),
-            taker_fee_pct=float(os.environ.get("HUB_FILL_TAKER_FEE_PCT", 0.0004)),
-            maker_fee_pct=float(os.environ.get("HUB_FILL_MAKER_FEE_PCT", 0.0002)))
+        return _realistic_from_env()
     if _flag("HUB_UNIFIED_FEES"):
         return unified_fees()
     return PerfectFill()

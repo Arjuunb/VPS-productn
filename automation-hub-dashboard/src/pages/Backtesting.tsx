@@ -63,7 +63,7 @@ export default function BacktestingPage() {
     <>
       <PageHeader
         title="Strategy Performance"
-        subtitle={data ? `${data.strategy} · ${data.mode} · live paper-trading track record` : "live paper-trading track record"}
+        subtitle={data ? `${data.strategy} · ${data.mode} · forward-paper record on live data` : "forward-paper record on live data"}
         actions={
           <>
             {data && <Badge text={`${data.trades} trades`} tone="blue" />}

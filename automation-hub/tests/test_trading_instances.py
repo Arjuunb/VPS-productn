@@ -23,6 +23,20 @@ def test_instance_scoped_ledger_keeps_positions_and_trades_isolated():
     assert second.ledger.get_paper_trades() == []
 
 
+def test_autonomous_idempotency_is_permanent_and_instance_scoped():
+    from services.dedup import DuplicateGuard
+
+    ledger = SqliteLedger(":memory:")
+    one, two = InstanceLedger(ledger, "one"), InstanceLedger(ledger, "two")
+    alert_id = "auto:one:BTCUSDT:5m:2026-08-09T00:00:00+00:00:buy"
+    one.insert_webhook_event(alert_id=alert_id, symbol="BTCUSDT", side="BUY",
+                             entry=100, stop=95, payload={}, status="accepted")
+    # A zero normal retry window would already have elapsed, but autonomous
+    # candle IDs remain protected for the lifetime of the ledger.
+    assert DuplicateGuard(one, window_seconds=0).is_duplicate(alert_id)
+    assert not DuplicateGuard(two, window_seconds=0).is_duplicate(alert_id)
+
+
 def test_instances_keep_pair_strategy_version_and_metrics_separate():
     ledger = SqliteLedger(":memory:")
     manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
@@ -153,6 +167,69 @@ def test_worker_start_uses_persisted_instance_execution_not_legacy_runtime(monke
     assert pipeline.position_sizing_mode == "fixed_quantity"
     assert pipeline.fixed_position_size == 3.0
     assert pipeline.max_open_positions == 1
+
+
+def test_instance_fill_model_is_persisted_and_constructed_per_worker(monkeypatch):
+    from services.auto_engine import AutoStrategyEngine
+    from services.fill_model import PerfectFill, RealisticFill
+
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60,
+                                     max_slots=2, paper_account_capital=2_000)
+    realistic = manager.create(
+        symbol="BTCUSDT", strategy_key="brain", strategy_label="Decision Brain",
+        strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+        capital_allocation=1_000,
+    )
+    ideal = manager.create(
+        symbol="ETHUSDT", strategy_key="ema", strategy_label="EMA Crossover",
+        strategy_version="v1", timeframe="15m", risk_per_trade_pct=0.005,
+        capital_allocation=1_000, fill_model="perfect",
+    )
+    assert realistic.fill_model == "RealisticFill"
+    assert ideal.fill_model == "PerfectFill"
+
+    monkeypatch.setattr(AutoStrategyEngine, "start", lambda self: True)
+    manager.start(realistic.id)
+    manager.start(ideal.id)
+    assert isinstance(manager._runtime[realistic.id][1].fill_model, RealisticFill)
+    assert isinstance(manager._runtime[ideal.id][1].fill_model, PerfectFill)
+
+    restored = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
+    assert restored.status(realistic.id)["configuration"]["fill_model"] == "RealisticFill"
+    assert restored.status(ideal.id)["configuration"]["fill_model"] == "PerfectFill"
+
+
+def test_instance_fill_model_can_change_only_through_safe_worker_rebuild(monkeypatch):
+    from services.auto_engine import AutoStrategyEngine
+    from services.fill_model import PerfectFill
+
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
+    instance = manager.create(
+        symbol="BTCUSDT", strategy_key="brain", strategy_label="Decision Brain",
+        strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+        capital_allocation=1_000,
+    )
+    monkeypatch.setattr(
+        AutoStrategyEngine, "start",
+        lambda self: (setattr(self, "running", True), setattr(self, "lifecycle_state", "running"), True)[-1],
+    )
+    manager.start(instance.id)
+
+    updated = manager.update_configuration(instance.id, fill_model="PerfectFill")
+
+    assert updated.state == "running"
+    assert updated.fill_model == "PerfectFill"
+    assert isinstance(manager._runtime[instance.id][1].fill_model, PerfectFill)
+    with pytest.raises(ValueError, match="fill_model must be one of"):
+        manager.update_configuration(instance.id, fill_model="UnknownFill")
+
+    paper = manager._runtime[instance.id][1]
+    paper.open(symbol="BTCUSDT", side="BUY", size=0.01, entry=100, stop=95)
+    paper.close(symbol="BTCUSDT", exit_price=101)
+    with pytest.raises(ValueError, match="immutable after the first trade"):
+        manager.update_configuration(instance.id, fill_model="RealisticFill")
 
 
 def test_instance_quick_configuration_persists_and_rebuilds_running_worker(monkeypatch):

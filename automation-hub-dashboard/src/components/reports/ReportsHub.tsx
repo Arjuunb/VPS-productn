@@ -117,7 +117,7 @@ export default function ReportsHub() {
       </Card>
 
       <div className="grid-2-eq">
-        <Card title="Track Record" subtitle="live paper record vs the backtest promise"
+        <Card title="Track Record" subtitle="forward-paper record vs the backtest promise"
           right={track.data?.verdict ? <Badge text={track.data.verdict} tone={verdictTone(track.data.verdict) as any} /> : undefined}>
           {track.data ? (
             <>

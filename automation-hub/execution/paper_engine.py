@@ -7,6 +7,7 @@ unrealized P&L is computed against supplied mark prices.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Optional
 
@@ -88,6 +89,12 @@ class PaperExecutionEngine:
         adjust) through this engine's own ledger. Returns rows updated."""
         return self.ledger.update_position_stop(symbol=symbol, stop=stop)
 
+    def update_management(self, symbol: str, *, stop=None, target=None,
+                          management=None) -> int:
+        """Persist the complete live trade plan through the scoped ledger."""
+        return self.ledger.update_position_management(
+            symbol=symbol, stop=stop, target=target, management=management)
+
     def realized_pnl(self) -> float:
         return sum((t.get("pnl") or 0.0) for t in self.history())
 
@@ -142,13 +149,15 @@ class PaperExecutionEngine:
 
     # --------------------------------------------------------------- actions
     def open(self, *, symbol: str, side: str, size: float, entry: float,
-             stop: Optional[float], alert_id: str = "", maker: bool = False,
+             stop: Optional[float], target: Optional[float] = None,
+             alert_id: str = "", maker: bool = False,
              sizing_context: Optional[dict] = None) -> FillResult:
         direction = _dir(side)
         # route the entry through the fill model (price/size/rejection);
         # maker fills (resting limits) execute at the limit price exactly
         action = "buy" if direction == "long" else "sell"
-        f = self.fill_model.apply(action, entry, size, maker=maker)
+        f = self.fill_model.apply(action, entry, size, maker=maker,
+                                  execution_id=alert_id)
         if f["rejected"] or f["size"] <= 0:
             return FillResult("rejected", symbol, direction, 0.0, entry)
         if self.quality is not None:
@@ -158,11 +167,20 @@ class PaperExecutionEngine:
         entry_sizing = dict(sizing_context or {})
         if stop is not None:
             entry_sizing["risk_amount_at_entry"] = abs(entry - float(stop)) * size
-        pid = self.ledger.open_position(symbol=symbol, side=direction, size=size,
-                                        entry=entry, stop=stop)
+        initial_management = {}
+        if stop is not None and target is not None and stop != entry:
+            initial_management = {
+                "side": direction, "entry": entry, "stop": float(stop),
+                "target": float(target), "risk": abs(entry - float(stop)),
+                "be": False, "scaled": False, "best": entry, "age": 0,
+                "mfe": entry, "mae": entry,
+            }
+        pid = self.ledger.open_position(
+            symbol=symbol, side=direction, size=size, entry=entry, stop=stop,
+            target=target, management=initial_management)
         tid = self.ledger.record_paper_trade({
             "alert_id": alert_id, "symbol": symbol, "side": direction,
-            "size": size, "entry": entry, "stop": stop,
+            "size": size, "entry": entry, "stop": stop, "target": target,
             "strategy_id": self.strategy_id,
             **entry_sizing,
         })
@@ -187,9 +205,17 @@ class PaperExecutionEngine:
         equity_before_close = self.balance()
         rr = self._rr(pos, exit_price)
         remainder = pos["size"] - closed_size
+        management = pos.get("management_json") or {}
+        if isinstance(management, str):
+            try:
+                management = json.loads(management)
+            except (TypeError, ValueError):
+                management = {}
         self.ledger.close_position(pos["id"], exit_price=exit_price, pnl=pnl)
         self.ledger.open_position(symbol=symbol, side=pos["side"], size=remainder,
-                                  entry=pos["entry"], stop=pos.get("stop"))
+                                  entry=pos["entry"], stop=pos.get("stop"),
+                                  target=pos.get("target"),
+                                  management=management)
         open_trade = next((t for t in self.ledger.get_paper_trades()
                            if t["symbol"] == symbol and t["status"] == "open"), None)
         if open_trade:
@@ -200,6 +226,7 @@ class PaperExecutionEngine:
         self.ledger.record_paper_trade({
             "alert_id": "", "symbol": symbol, "side": pos["side"],
             "size": remainder, "entry": pos["entry"], "stop": pos.get("stop"),
+            "target": pos.get("target"),
             "strategy_id": self.strategy_id,
             **({key: open_trade.get(key) for key in (
                 "sizing_mode", "sizing_engine_version", "risk_basis_at_entry",

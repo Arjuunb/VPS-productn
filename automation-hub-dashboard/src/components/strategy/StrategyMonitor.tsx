@@ -47,7 +47,7 @@ export default function StrategyMonitor({ spec, range, toast }: {
 
   return (
     <Card title="AI Monitoring Agent"
-          subtitle="Compares your live paper trades against a backtest of this same strategy"
+          subtitle="Compares simulated fills on live data against a backtest of this strategy"
           right={st ? <Badge text={st.text} tone={st.tone} /> : null}>
       <div className="toolbar" style={{ gap: 8 }}>
         <button className="btn btn-primary btn-sm" disabled={busy} onClick={run}>

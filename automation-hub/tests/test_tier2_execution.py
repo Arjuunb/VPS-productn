@@ -80,6 +80,37 @@ def test_engine_parks_limit_then_fills_when_touched():
     assert eng.status()["pending_orders"] == 0
 
 
+def test_limit_entry_cannot_claim_ambiguous_same_candle_target():
+    eng, paper = _engine()
+    eng._process_bar("BTCUSDT", _bar(101), _Stub([_sig(entry=100, stop=95, tp=105)]))
+    # The next candle touches entry and target, but OHLC cannot prove the target
+    # happened after entry. Conservative forward paper keeps the trade open.
+    eng._process_bar("BTCUSDT", _bar(102, high=106, low=99), _Stub([]))
+    assert paper.open_position("BTCUSDT") is not None
+    assert paper.history() == []
+
+
+def test_limit_entry_same_candle_stop_is_enforced_pessimistically():
+    eng, paper = _engine()
+    eng._process_bar("BTCUSDT", _bar(101), _Stub([_sig(entry=100, stop=95, tp=115)]))
+    # Price must cross the long entry before reaching the lower stop, so this
+    # adverse path is valid even though the candle's full path is unknown.
+    eng._process_bar("BTCUSDT", _bar(101, high=116, low=94), _Stub([]))
+    assert paper.open_position("BTCUSDT") is None
+    assert paper.history()[0]["exit"] == 95
+
+
+def test_existing_position_gap_through_stop_uses_adverse_open():
+    eng, paper = _engine(entry_mode="market")
+    paper.open(symbol="BTCUSDT", side="BUY", size=1, entry=100, stop=95,
+               target=115)
+    # This is an already-open trade, so a gap below the stop cannot fill at the
+    # stale stop price. It exits at the opening price (before fill costs).
+    eng._process_bar("BTCUSDT", _bar(91, open_=90, high=92, low=89), _Stub([]))
+    assert paper.open_position("BTCUSDT") is None
+    assert paper.history()[0]["exit"] == 90
+
+
 def test_engine_checkpoints_pending_order_on_create_and_fill():
     saved = []
     eng, _paper = _engine(pending_checkpoint=lambda rows: saved.append(rows))
@@ -103,6 +134,20 @@ def test_engine_market_mode_unchanged():
     eng, paper = _engine(entry_mode="market")
     eng._process_bar("BTCUSDT", _bar(100), _Stub([_sig()]))
     assert paper.open_position("BTCUSDT") is not None   # immediate taker entry
+
+
+def test_forward_ids_are_stable_but_research_replay_ids_are_repeatable():
+    forward, _ = _engine()
+    forward.live = True
+    first = forward._auto_execution_id("BTCUSDT", TS, "buy")
+    assert first == forward._auto_execution_id("BTCUSDT", TS, "buy")
+    assert first.startswith("auto:")
+
+    replay, _ = _engine()
+    first_replay = replay._auto_execution_id("BTCUSDT", TS, "buy")
+    second_replay = replay._auto_execution_id("BTCUSDT", TS, "buy")
+    assert first_replay != second_replay
+    assert not first_replay.startswith("auto:")
 
 
 # ─────────────────────────── execution quality ───────────────────────────
@@ -134,3 +179,43 @@ def test_paper_engine_records_fills_into_quality():
     kinds = {r["kind"] for r in rep["recent"]}
     assert rep["overall"]["fills"] == 2 and kinds == {"entry", "exit"}
     assert rep["overall"]["avg_bps"] > 0                # friction is measured
+
+
+def test_pipeline_floors_quantity_to_selected_venue_step():
+    from bot.brokers.symbol_rules import SymbolRules
+
+    led = SqliteLedger(":memory:")
+    paper = PaperExecutionEngine(led)
+    pipe = SignalPipeline(
+        led, paper, TradingControl(), equity=10_000,
+        position_sizing_mode="fixed", fixed_position_size=0.03712941,
+        exposure_limit_pct=1.0, max_total_exposure_pct=1.0,
+    )
+    pipe.symbol_rules_provider = lambda _symbol: SymbolRules(
+        "BTC/USDT", step_size=0.001, min_qty=0.001, min_notional=1.0)
+    result = pipe.process({"alert_id": "venue-1", "symbol": "BTCUSDT",
+                           "side": "BUY", "entry": 100.0, "stop": 95.0,
+                           "target": 115.0})
+    assert result.accepted
+    assert result.fill["size"] == 0.037
+    assert any(step.rule == "venue_rules" for step in result.steps)
+
+
+def test_pipeline_rejects_below_venue_minimum_notional():
+    from bot.brokers.symbol_rules import SymbolRules
+
+    led = SqliteLedger(":memory:")
+    paper = PaperExecutionEngine(led)
+    pipe = SignalPipeline(
+        led, paper, TradingControl(), equity=10_000,
+        position_sizing_mode="fixed", fixed_position_size=0.01,
+        exposure_limit_pct=1.0, max_total_exposure_pct=1.0,
+    )
+    pipe.symbol_rules_provider = lambda _symbol: SymbolRules(
+        "BTC/USDT", step_size=0.001, min_qty=0.001, min_notional=10.0)
+    result = pipe.process({"alert_id": "venue-2", "symbol": "BTCUSDT",
+                           "side": "BUY", "entry": 100.0, "stop": 95.0,
+                           "target": 115.0})
+    assert not result.accepted
+    assert result.stage == "venue_rules"
+    assert "minimum" in result.reason

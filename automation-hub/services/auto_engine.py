@@ -304,6 +304,7 @@ class AutoStrategyEngine:
 
     def status(self) -> dict:
         feed, feed_err = self.feed_status()
+        ws_feed = getattr(self, "ws_feed", None)
         return {
             "running": self.running,
             "symbols": self.symbols,
@@ -332,6 +333,7 @@ class AutoStrategyEngine:
             "data_source": self.last_source,
             "feed_status": feed,             # connected | waiting-for-candle | fallback | failed | replay
             "feed_error": feed_err,          # last real fetch error, if any
+            "websocket": ws_feed.status() if ws_feed is not None else None,
             "market_data_status": self.market_data_status,
             "last_closed_candle": self.last_closed_candle,
             "last_processed_candle_timestamp": self.last_processed_candle,
@@ -680,10 +682,13 @@ class AutoStrategyEngine:
                             detail="approval window expired unactioned")
             except Exception:  # noqa: BLE001 — never let approvals break the loop
                 pass
-        # 1. resting limit entry: fill if this bar traded through it.
-        self._check_pending(sym, bar)
+        # 1. resting limit entry: fill if this bar traded through it. A candle
+        # does not reveal whether its high happened before or after that fill,
+        # so a newly filled entry may be stopped on this candle but can never be
+        # credited with a same-candle target/scale-out (conservative ordering).
+        filled_this_bar = self._check_pending(sym, bar)
         # 2. stop-loss / take-profit exits against this bar's range.
-        self._check_exit(sym, bar, strategy)
+        self._check_exit(sym, bar, strategy, entry_bar=filled_this_bar)
         # 3. strategy decision on the new bar.
         signal: Optional[Signal] = strategy.on_bar(bar)
         outcome: Optional[dict] = None
@@ -725,14 +730,14 @@ class AutoStrategyEngine:
             except Exception as e:  # noqa: BLE001 — never block the engine
                 print(f"[explain] cycle report failed for {sym}: {type(e).__name__}: {e}")
 
-    def _check_pending(self, sym: str, bar) -> None:
+    def _check_pending(self, sym: str, bar) -> bool:
         po = self._pending.get(sym)
         if po is None:
-            return
+            return False
         if self.paper.open_position(sym) is not None:
             self._pending.pop(sym, None)
             self._checkpoint_pending_orders()
-            return
+            return False
         long = po["side"] == "BUY"
         fill = None
         if long and bar.open <= po["price"]:
@@ -762,13 +767,13 @@ class AutoStrategyEngine:
                     except Exception:  # noqa: BLE001
                         pass
             self._checkpoint_pending_orders()
-            return
+            return False
         self._pending.pop(sym, None)
         self._checkpoint_pending_orders()
         res = self._route({**po["payload"], "entry": fill, "maker": True,
                            "timestamp": bar.timestamp.isoformat()})
         if res is None:
-            return
+            return False
         f = res.fill or {}
         if res.accepted and f.get("action") == "opened":
             if po.get("decision_id") is not None and self.decisions is not None:
@@ -784,8 +789,11 @@ class AutoStrategyEngine:
                 self._managed[sym] = ManagedTrade(
                     side="long" if long else "short", entry=entry, stop=stop,
                     target=po["target"], risk=abs(entry - stop))
+                self._checkpoint_managed(sym, self._managed[sym])
+            return True
         elif not res.accepted:
             self.stats["rejections"] += 1
+        return False
 
     @staticmethod
     def _mfe_mae_r(mt) -> tuple:
@@ -797,7 +805,37 @@ class AutoStrategyEngine:
         mae_r = round((mt.entry - mt.mae) * sign / mt.risk, 3)
         return mfe_r, mae_r
 
-    def _check_exit(self, sym: str, bar, strategy=None) -> None:
+    @staticmethod
+    def _managed_dict(mt) -> dict:
+        """Stable JSON-safe representation of every stateful management field."""
+        return {key: getattr(mt, key) for key in (
+            "side", "entry", "stop", "target", "risk", "be", "scaled",
+            "best", "age", "mfe", "mae",
+        )}
+
+    def _checkpoint_managed(self, sym: str, mt) -> None:
+        """Persist protection + lifecycle after each mutation, scoped per instance."""
+        if not hasattr(self, "paper"):  # permits pure-state unit construction
+            return
+        self.paper.update_management(
+            sym, stop=mt.stop, target=mt.target,
+            management=self._managed_dict(mt))
+
+    def _auto_execution_id(self, sym: str, timestamp, action: str) -> str:
+        """Return a permanent key in forward mode and a run key in research.
+
+        Research replay is intentionally repeatable, so replaying the same
+        candle in a new experiment must not be rejected by the durable ledger.
+        Forward paper execution, however, must never execute a recovered candle
+        twice, including after the normal webhook retry window has elapsed.
+        """
+        if not self.live:
+            return f"auto-{sym}-{action}-{next(self._seq)}"
+        stamp = timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp)
+        scope = getattr(self.ledger, "instance_id", "") or "legacy"
+        return f"auto:{scope}:{sym}:{self.timeframe}:{stamp}:{action}"
+
+    def _check_exit(self, sym: str, bar, strategy=None, *, entry_bar: bool = False) -> None:
         pos = self.paper.open_position(sym)
         if pos is None:
             self._managed.pop(sym, None)
@@ -812,9 +850,31 @@ class AutoStrategyEngine:
             if mt is None:
                 mt = self._adopt(sym, pos)
             if mt is not None:
-                # shared TradeManager: stop/target exits + break-even / scale-out
-                # / trailing when enabled (identical to plain checks when not).
-                act = self.trade_manager.on_bar(mt, bar.high, bar.low, bar.close)
+                if entry_bar:
+                    # OHLC has no path information. After an intrabar limit fill,
+                    # an adverse stop is provably reachable (price crossed entry
+                    # on its way there), but a favorable high/low may have happened
+                    # before the fill. Never manufacture a same-candle winner.
+                    from services.trade_manager import Action
+                    adverse = bar.low if mt.side == "long" else bar.high
+                    stop_hit = (adverse <= mt.stop if mt.side == "long"
+                                else adverse >= mt.stop)
+                    act = Action()
+                    if stop_hit:
+                        gap_through = (bar.open <= mt.stop if mt.side == "long"
+                                       else bar.open >= mt.stop)
+                        act.exit_price = bar.open if gap_through else mt.stop
+                        act.exit_reason = "stop"
+                        mt.mae = min(mt.mae, adverse) if mt.side == "long" else max(mt.mae, adverse)
+                else:
+                    # shared TradeManager: stop/target exits + break-even /
+                    # scale-out / trailing when enabled.
+                    act = self.trade_manager.on_bar(mt, bar.high, bar.low, bar.close)
+                    if act.exit_reason == "stop":
+                        gap_through = (bar.open <= mt.stop if mt.side == "long"
+                                       else bar.open >= mt.stop)
+                        if gap_through:
+                            act.exit_price = bar.open
             else:  # no stop on record (e.g. external webhook trade) — legacy
                 legacy_stop, legacy_target = pos.get("stop"), self._targets.get(sym)
         if mt is not None and act is not None:
@@ -825,11 +885,15 @@ class AutoStrategyEngine:
                     self.ledger.log(level="info", stage="execution", symbol=sym,
                                     message=f"{sym} scale-out {fill.size:.6f} @ {fill.price}"
                                             f" (PnL {fill.pnl:+.2f})")
+            if act.exit_price is None:
+                self._checkpoint_managed(sym, mt)
             if act.exit_price is not None:
                 exit_price = act.exit_price
-                why = "stop-loss" if act.exit_reason == "stop" else "take-profit"
+                why = ({"stop": "stop-loss", "target": "take-profit",
+                        "time": "time-stop"}.get(act.exit_reason, act.exit_reason))
         elif mt is None:  # no stop on record (e.g. external webhook trade) — legacy
-            stop, target = legacy_stop, legacy_target
+            stop = legacy_stop
+            target = None if entry_bar else legacy_target
             if pos["side"] == "long":
                 if stop and bar.low <= stop:
                     exit_price, why = stop, "stop-loss"
@@ -854,7 +918,7 @@ class AutoStrategyEngine:
         if exit_price is not None:
             mfe_r, mae_r = self._mfe_mae_r(mt)
             res = self._route({
-                "alert_id": f"auto-{sym}-x{next(self._seq)}", "symbol": sym,
+                "alert_id": self._auto_execution_id(sym, bar.timestamp, "close"), "symbol": sym,
                 "side": "CLOSE", "entry": exit_price, "stop": None,
                 "exit_reason": why,          # real exit cause for the journal
                 "mfe_r": mfe_r, "mae_r": mae_r,   # lifecycle telemetry
@@ -870,15 +934,38 @@ class AutoStrategyEngine:
         """Rebuild management state for a position opened before a restart (or
         by a webhook). Needs a stop to define R; returns None without one."""
         from services.trade_manager import ManagedTrade
+        raw = pos.get("management_json") or {}
+        if isinstance(raw, str):
+            try:
+                import json
+                raw = json.loads(raw)
+            except (TypeError, ValueError):
+                raw = {}
         stop = pos.get("stop")
         entry = pos.get("entry")
-        if not stop or not entry or stop == entry:
+        if stop is None or entry is None:
             return None
-        risk = abs(entry - stop)
+        # A break-even stop legitimately equals entry after management has
+        # progressed. Its persisted original risk is what makes reconstruction
+        # possible; only legacy rows with neither distance nor saved risk remain
+        # unmanaged.
+        risk = float(raw.get("risk") or abs(entry - stop))
+        if risk <= 0:
+            return None
         sign = 1.0 if pos["side"] == "long" else -1.0
-        target = self._targets.get(sym) or entry + sign * 3.0 * risk
-        mt = ManagedTrade(side=pos["side"], entry=entry, stop=stop,
-                          target=target, risk=risk)
+        target = pos.get("target") or self._targets.get(sym)
+        if not target:
+            # Compatibility only for positions opened before target persistence
+            # existed. Every new position records its exact strategy target.
+            target = entry + sign * 3.0 * risk
+        allowed = {key: raw[key] for key in (
+            "side", "entry", "stop", "target", "risk", "be", "scaled",
+            "best", "age", "mfe", "mae",
+        ) if key in raw}
+        allowed.update({"side": pos["side"], "entry": entry, "stop": stop,
+                        "target": target, "risk": risk})
+        mt = ManagedTrade(**allowed)
+        self._targets[sym] = target
         self._managed[sym] = mt
         return mt
 
@@ -892,9 +979,8 @@ class AutoStrategyEngine:
 
         A manually moved stop redefines the trade's risk (the new stop is now the
         real distance being risked) and clears the auto break-even flag so future
-        management, if enabled, references the operator's stop. The caller is
-        responsible for persisting the stop to the ledger; the target is held in
-        memory only (identical to how the engine's own targets are held today).
+        management, if enabled, references the operator's stop. Both levels and
+        the mutable lifecycle state are persisted before this method returns.
         Returns the levels now in force (``{stop, target, side, entry}``)."""
         with self._adjust_lock:
             mt = self._managed.get(symbol)
@@ -908,6 +994,7 @@ class AutoStrategyEngine:
                 if target is not None:
                     mt.target = float(target)
                     self._targets[symbol] = float(target)
+                self._checkpoint_managed(symbol, mt)
                 return {"stop": mt.stop, "target": mt.target,
                         "side": mt.side, "entry": mt.entry}
             # No managed state (adopt needs a stop to define R). Still honour the
@@ -915,6 +1002,8 @@ class AutoStrategyEngine:
             # the caller persists to the ledger for the legacy exit path.
             if target is not None:
                 self._targets[symbol] = float(target)
+            if hasattr(self, "paper"):
+                self.paper.update_management(symbol, stop=stop, target=target)
             return {"stop": (float(stop) if stop is not None else None),
                     "target": self._targets.get(symbol),
                     "side": None, "entry": None}
@@ -1025,7 +1114,8 @@ class AutoStrategyEngine:
             return {"kind": "rejected", "stage": "context", "reason": ctx_why,
                     "decision": decision, "verdict": v}
         payload = {
-            "alert_id": f"auto-{sym}-{next(self._seq)}", "symbol": sym, "side": side,
+            "alert_id": self._auto_execution_id(sym, signal.timestamp, side.lower()),
+            "symbol": sym, "side": side,
             "entry": signal.entry, "stop": signal.stop_loss,
             "target": signal.take_profit,
             "confidence": getattr(signal, "confidence", 1.0),
@@ -1105,6 +1195,7 @@ class AutoStrategyEngine:
                     side="long" if signal.type == SignalType.LONG else "short",
                     entry=entry, stop=stop, target=signal.take_profit,
                     risk=abs(entry - stop))
+                self._checkpoint_managed(sym, self._managed[sym])
             return {"kind": "opened", "decision": decision, "verdict": v, "fill": fill}
         elif res.accepted and fill.get("action") == "closed":
             self.stats["trades"] += 1
@@ -1191,6 +1282,7 @@ class AutoStrategyEngine:
                     side="long" if payload.get("side") == "BUY" else "short",
                     entry=entry, stop=stop, target=payload.get("target"),
                     risk=abs(float(entry) - float(stop)))
+                self._checkpoint_managed(sym, self._managed[sym])
             self.ledger.log(level="info", stage="approval", symbol=sym,
                             message=f"Approved {sym} {payload.get('side')} entry executed")
             return {"ok": True, "action": "opened", "fill": fill}

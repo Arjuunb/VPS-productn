@@ -1,6 +1,7 @@
 """Phase 1 upgrades: shared trade management (break-even / scale-out /
 trailing — OFF by default, by measurement), paper-engine partial closes, and
 Kelly-capped adaptive risk sizing."""
+import json
 from datetime import datetime, timezone
 
 from bot.types import Bar
@@ -89,6 +90,60 @@ def test_paper_reduce_noop_on_bad_input():
     assert paper.reduce(symbol="BTCUSDT", exit_price=100, fraction=0.5).action == "noop"
     paper.open(symbol="BTCUSDT", side="BUY", size=1.0, entry=100, stop=95)
     assert paper.reduce(symbol="BTCUSDT", exit_price=100, fraction=1.5).action == "noop"
+
+
+def test_exact_target_and_management_survive_engine_reconstruction():
+    """A restart restores the actual strategy target and lifecycle, never a
+    guessed 3R replacement or a fresh zero-age management object."""
+    from services.auto_engine import AutoStrategyEngine
+
+    led = SqliteLedger(":memory:")
+    paper = PaperExecutionEngine(led)
+    paper.open(symbol="BTCUSDT", side="BUY", size=1.0, entry=100, stop=95,
+               target=112.5)
+    state = {
+        "side": "long", "entry": 100.0, "stop": 100.0, "target": 112.5,
+        "risk": 5.0, "be": True, "scaled": True, "best": 109.0,
+        "age": 37, "mfe": 110.0, "mae": 97.0,
+    }
+    paper.update_management("BTCUSDT", stop=100.0, target=112.5,
+                            management=state)
+
+    restored = AutoStrategyEngine.__new__(AutoStrategyEngine)
+    restored.paper = paper
+    restored._managed = {}
+    restored._targets = {}
+    pos = paper.open_position("BTCUSDT")
+    assert pos["target"] == 112.5
+    assert json.loads(pos["management_json"])["age"] == 37
+
+    mt = restored._adopt("BTCUSDT", pos)
+    assert mt.target == 112.5
+    assert mt.stop == 100.0
+    assert mt.risk == 5.0
+    assert mt.age == 37 and mt.be is True and mt.scaled is True
+    assert mt.best == 109.0 and mt.mfe == 110.0 and mt.mae == 97.0
+
+
+def test_partial_close_preserves_target_and_management_checkpoint():
+    led = SqliteLedger(":memory:")
+    paper = PaperExecutionEngine(led)
+    management = {
+        "side": "long", "entry": 100.0, "stop": 98.0, "target": 112.5,
+        "risk": 5.0, "be": True, "scaled": True, "best": 108.0,
+        "age": 12, "mfe": 109.0, "mae": 97.0,
+    }
+    paper.open(symbol="BTCUSDT", side="BUY", size=2.0, entry=100, stop=98,
+               target=112.5)
+    paper.update_management("BTCUSDT", stop=98, target=112.5,
+                            management=management)
+    assert paper.reduce(symbol="BTCUSDT", exit_price=107.5, fraction=0.5).action == "reduced"
+    pos = paper.open_position("BTCUSDT")
+    assert pos["target"] == 112.5
+    assert json.loads(pos["management_json"])["age"] == 12
+    open_trade = next(t for t in paper.ledger.get_paper_trades()
+                      if t["status"] == "open")
+    assert open_trade["target"] == 112.5
 
 
 # ─────────────────────────── Kelly-capped adaptive sizing ───────────────────────────

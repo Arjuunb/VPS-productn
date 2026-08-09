@@ -1,6 +1,9 @@
 -- Trading Instance migration for Supabase/Postgres (additive; safe to rerun).
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS target DOUBLE PRECISION;
+ALTER TABLE positions ADD COLUMN IF NOT EXISTS management_json JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS target DOUBLE PRECISION;
 ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS strategy_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS sizing_mode TEXT;
 ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS sizing_engine_version TEXT;
@@ -32,6 +35,8 @@ ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS strategy_version TEXT NOT
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS timeframe TEXT NOT NULL DEFAULT '5m';
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS risk_per_trade_pct DOUBLE PRECISION NOT NULL DEFAULT 0.005;
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS capital_allocation DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS exchange TEXT NOT NULL DEFAULT 'inherit';
+ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS instrument_type TEXT NOT NULL DEFAULT 'spot';
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'trading';
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'stopped';
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS desired_running BOOLEAN NOT NULL DEFAULT FALSE;
@@ -52,7 +57,10 @@ ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS current_realized_equity D
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS risk_basis DOUBLE PRECISION;
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS sizing_engine_version TEXT NOT NULL DEFAULT 'v2';
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS entry_mode TEXT NOT NULL DEFAULT 'limit';
-ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS fill_model TEXT NOT NULL DEFAULT 'PerfectFill';
+ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS fill_model TEXT NOT NULL DEFAULT 'RealisticFill';
+-- Existing rows deliberately retain their recorded model. Only future inserts
+-- that omit the explicit application value inherit realistic paper execution.
+ALTER TABLE trading_instances ALTER COLUMN fill_model SET DEFAULT 'RealisticFill';
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS execution_mode TEXT NOT NULL DEFAULT 'paper';
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS stopped_at TIMESTAMPTZ;

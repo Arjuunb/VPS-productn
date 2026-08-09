@@ -22,7 +22,7 @@ export default function PerformanceOverview() {
   ];
 
   return (
-    <Card title="Performance Overview" subtitle="live paper" className="perf-card">
+    <Card title="Performance Overview" subtitle="paper fills · live market data" className="perf-card">
       <div className="perf-grid">
         {items.map((p) => (
           <div className="perf-item" key={p.label}>

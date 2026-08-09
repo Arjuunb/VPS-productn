@@ -26,7 +26,9 @@ class InstanceCreate(BaseModel):
     maximum_risk_amount: Optional[float] = Field(default=None, gt=0)
     minimum_equity: Optional[float] = Field(default=None, gt=0)
     entry_mode: str = Field("limit")
-    fill_model: str = Field("PerfectFill")
+    fill_model: str = Field("RealisticFill")
+    exchange: str = Field("inherit", min_length=2, max_length=30)
+    instrument_type: str = Field("spot", min_length=2, max_length=30)
     max_open_positions: int = Field(3, ge=1, le=50)
 
 
@@ -40,6 +42,9 @@ class InstanceUpdate(BaseModel):
     maximum_risk_amount: Optional[float] = Field(default=None, gt=0)
     minimum_equity: Optional[float] = Field(default=None, gt=0)
     entry_mode: Optional[str] = None
+    fill_model: Optional[str] = None
+    exchange: Optional[str] = Field(default=None, min_length=2, max_length=30)
+    instrument_type: Optional[str] = Field(default=None, min_length=2, max_length=30)
     max_open_positions: Optional[int] = Field(default=None, ge=1, le=50)
     strategy: Optional[str] = Field(default=None, min_length=1)
     strategy_version: Optional[str] = Field(default=None, min_length=1, max_length=80)
@@ -93,12 +98,26 @@ def instance_options():
     return {
         "symbols": list(SYMBOLS), "timeframes": list(TIMEFRAMES),
         "strategies": strategies,
-        # These are the presently implemented per-instance execution defaults,
-        # not editable UI choices.  The API exposes them so they remain honest
-        # and can become persisted options in a later additive migration.
+        # Execution choices are server-owned and persisted per instance. New
+        # instances default to realistic costs; existing PerfectFill rows remain
+        # valid so historical results and restore behaviour do not change.
         "execution_defaults": {"position_sizing_mode": "fixed_starting_equity_percent", "entry_mode": "limit",
-                               "fill_model": "PerfectFill", "leverage": None,
+                               "fill_model": "RealisticFill", "leverage": None,
+                               "exchange": str(getattr(_wa.settings, "default_exchange", "binance") or "binance").lower(),
+                               "instrument_type": "spot",
                                "max_open_positions": 3, "max_quick_risk_pct": 0.01},
+        "exchanges": [
+            {"key": "inherit", "label": "Server default (HUB_EXCHANGE)"},
+            {"key": "binance", "label": "Binance Spot"},
+            {"key": "kraken", "label": "Kraken Spot"},
+            {"key": "coinbase", "label": "Coinbase Spot"},
+            {"key": "bybit", "label": "Bybit Spot"},
+        ],
+        "fill_models": [
+            {"key": "RealisticFill", "label": "Realistic — spread, slippage and fees", "recommended": True},
+            {"key": "UnifiedFees", "label": "Backtest parity — shared fees and slippage", "recommended": False},
+            {"key": "PerfectFill", "label": "Ideal — research comparison only", "recommended": False},
+        ],
         "sizing_modes": [
             {"key": "fixed_starting_equity_percent", "label": "Fixed Starting Equity %", "implemented": True},
             {"key": "dynamic_current_equity_percent", "label": "Dynamic Current Equity %", "implemented": True},
@@ -175,6 +194,7 @@ def create_instance(body: InstanceCreate, x_webhook_secret: Optional[str] = Head
                                  maximum_risk_amount=body.maximum_risk_amount,
                                  minimum_equity=body.minimum_equity,
                                  entry_mode=body.entry_mode, fill_model=body.fill_model,
+                                 exchange=body.exchange, instrument_type=body.instrument_type,
                                  max_open_positions=body.max_open_positions)
     except ValueError as exc:
         raise HTTPException(409, str(exc))
@@ -233,6 +253,9 @@ def update_instance(instance_id: str, body: InstanceUpdate,
             maximum_risk_amount=body.maximum_risk_amount,
             minimum_equity=body.minimum_equity,
             entry_mode=body.entry_mode,
+            fill_model=body.fill_model,
+            exchange=body.exchange,
+            instrument_type=body.instrument_type,
             max_open_positions=body.max_open_positions,
             strategy_key=strategy["key"] if strategy else None,
             strategy_label=strategy["label"] if strategy else None,

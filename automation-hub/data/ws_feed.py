@@ -45,6 +45,9 @@ class WebSocketFeed:
         self.last_error: str = ""
         self.updates = 0                # candles ingested (all symbols)
         self.last_update: Optional[str] = None
+        self.reconnect_attempt = 0
+        self.websocket_reads = 0
+        self.rest_fallback_reads = 0
 
     # ------------------------------------------------------------- ingestion
     def ingest_rows(self, symbol: str, rows: list) -> None:
@@ -53,6 +56,7 @@ class WebSocketFeed:
         bars = [Bar(datetime.fromtimestamp(r[0] / 1000, tz=timezone.utc),
                     float(r[1]), float(r[2]), float(r[3]), float(r[4]),
                     float(r[5] or 0.0)) for r in rows]
+        self.available = True
         with self._lock:
             dq = self._bars.setdefault(symbol, deque(maxlen=self.max_bars))
             for b in bars:
@@ -85,6 +89,9 @@ class WebSocketFeed:
                 "available": self.available, "exchange": self.exchange,
                 "timeframe": self.timeframe, "symbols": self.symbols,
                 "bars_cached": depth, "updates": self.updates,
+                "reconnect_attempt": self.reconnect_attempt,
+                "websocket_reads": self.websocket_reads,
+                "rest_fallback_reads": self.rest_fallback_reads,
                 "last_update": self.last_update, "last_error": self.last_error}
 
     # ------------------------------------------------------------- lifecycle
@@ -105,6 +112,10 @@ class WebSocketFeed:
 
     def stop(self) -> None:
         self._stop.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            # Keep shutdown bounded so a slow venue cannot hang an API action.
+            thread.join(timeout=2.0)
 
     def _run(self) -> None:
         import asyncio
@@ -121,10 +132,14 @@ class WebSocketFeed:
                     try:
                         rows = await ex.watch_ohlcv(pair, self.timeframe)
                         self.available = True
+                        self.reconnect_attempt = 0
+                        self.last_error = ""
                         self.ingest_rows(sym, rows)
                     except Exception as e:  # noqa: BLE001 — reconnect, don't die
                         self.last_error = str(e)
-                        await asyncio.sleep(5)
+                        self.available = False
+                        self.reconnect_attempt += 1
+                        await asyncio.sleep(min(2 ** self.reconnect_attempt, 30))
             await asyncio.gather(*(watch(s) for s in self.symbols))
         finally:
             try:
@@ -137,11 +152,13 @@ class WebSocketFeed:
         """A drop-in engine fetcher: WS cache when fresh, REST fallback when not.
         Seeds the cache from the fallback so streams start with warm history."""
         def fetcher(symbol: str, timeframe: str, limit: int):
-            if timeframe == self.timeframe and self.fresh(symbol):
+            if self.available and timeframe == self.timeframe and self.fresh(symbol):
                 bars = self.get_bars(symbol, limit)
                 if len(bars) >= min(limit, 30):
+                    self.websocket_reads += 1
                     return bars, "live (websocket)"
             bars, src = fallback(symbol, timeframe, limit)
+            self.rest_fallback_reads += 1
             # keep the cache warm so the stream picks up with full history
             if bars and timeframe == self.timeframe and not self.get_bars(symbol, 1):
                 with self._lock:

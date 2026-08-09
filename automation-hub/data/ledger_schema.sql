@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS positions (
     size       REAL NOT NULL,
     entry      REAL NOT NULL,
     stop       REAL,
+    target     REAL,
+    management_json TEXT NOT NULL DEFAULT '{}',
     status     TEXT NOT NULL,          -- open | closed
     pnl        REAL DEFAULT 0,
     opened_at  TEXT NOT NULL,
@@ -38,6 +40,7 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     size       REAL NOT NULL,
     entry      REAL NOT NULL,
     stop       REAL,
+    target     REAL,
     exit       REAL,
     pnl        REAL,
     rr         REAL,

@@ -7,6 +7,8 @@ instances never share its mutable strategy or trade history.
 from __future__ import annotations
 
 import json
+import os
+import inspect
 import threading
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -96,6 +98,8 @@ class TradingInstance:
     timeframe: str
     risk_per_trade_pct: float
     capital_allocation: float
+    exchange: str = "inherit"
+    instrument_type: str = "spot"
     max_open_positions: int = 3
     # These execution values are persisted with the worker; legacy autonomous
     # engine settings are never consulted when an instance starts or restores.
@@ -110,7 +114,7 @@ class TradingInstance:
     risk_basis: float = 0.0
     sizing_engine_version: str = SIZING_ENGINE_VERSION
     entry_mode: str = "limit"
-    fill_model: str = "PerfectFill"
+    fill_model: str = "RealisticFill"
     execution_mode: str = "paper"
     mode: str = "trading"              # trading | research (paper only)
     # Trading instances are always forward paper. Research remains the only
@@ -140,9 +144,8 @@ class InstanceLedger:
         return self._ledger.insert_webhook_event(**kw, instance_id=self.instance_id)
 
     def webhook_seen(self, alert_id: str, since_iso: str) -> bool:
-        return any(e.get("alert_id") == alert_id and e.get("instance_id") == self.instance_id
-                   and e.get("received_at", "") >= since_iso and e.get("status") != "rejected"
-                   for e in self._ledger.get_webhook_events(1000))
+        return self._ledger.webhook_seen(alert_id, since_iso,
+                                        instance_id=self.instance_id)
 
     def get_webhook_events(self, limit=500):
         return [e for e in self._ledger.get_webhook_events(max(limit * 5, 500))
@@ -156,6 +159,11 @@ class InstanceLedger:
 
     def update_position_stop(self, *, symbol, stop):
         return self._ledger.update_position_stop(symbol=symbol, stop=stop, instance_id=self.instance_id)
+
+    def update_position_management(self, *, symbol, stop=None, target=None, management=None):
+        return self._ledger.update_position_management(
+            symbol=symbol, stop=stop, target=target, management=management,
+            instance_id=self.instance_id)
 
     def record_paper_trade(self, trade):
         row = dict(trade); row["instance_id"] = self.instance_id
@@ -185,7 +193,8 @@ class ResearchExecutionEngine(PaperExecutionEngine):
     without pretending that a simulated order was placed.
     """
     def open(self, *, symbol: str, side: str, size: float, entry: float,
-             stop: Optional[float], alert_id: str = "", maker: bool = False,
+             stop: Optional[float], target: Optional[float] = None,
+             alert_id: str = "", maker: bool = False,
              sizing_context: Optional[dict] = None) -> FillResult:
         return FillResult("rejected", symbol, side.lower(), 0.0, entry)
 
@@ -195,12 +204,13 @@ CREATE TABLE IF NOT EXISTS trading_instances (
  id TEXT PRIMARY KEY, symbol TEXT NOT NULL, strategy_key TEXT NOT NULL,
  strategy_label TEXT NOT NULL, strategy_version TEXT NOT NULL, timeframe TEXT NOT NULL,
  risk_per_trade_pct REAL NOT NULL, capital_allocation REAL NOT NULL,
+ exchange TEXT NOT NULL DEFAULT 'inherit', instrument_type TEXT NOT NULL DEFAULT 'spot',
  max_open_positions INTEGER NOT NULL DEFAULT 3,
  sizing_mode TEXT NOT NULL DEFAULT 'fixed_starting_equity_percent', fixed_position_size REAL NOT NULL DEFAULT 0,
  fixed_quantity REAL NOT NULL DEFAULT 0, profit_reinvestment INTEGER NOT NULL DEFAULT 0,
  maximum_risk_amount REAL, minimum_equity REAL, starting_equity REAL,
  current_realized_equity REAL, risk_basis REAL, sizing_engine_version TEXT NOT NULL DEFAULT 'v2',
- entry_mode TEXT NOT NULL DEFAULT 'limit', fill_model TEXT NOT NULL DEFAULT 'PerfectFill',
+ entry_mode TEXT NOT NULL DEFAULT 'limit', fill_model TEXT NOT NULL DEFAULT 'RealisticFill',
  execution_mode TEXT NOT NULL DEFAULT 'paper',
  mode TEXT NOT NULL, market_data_mode TEXT NOT NULL DEFAULT 'paper_forward', state TEXT NOT NULL, desired_running INTEGER NOT NULL DEFAULT 0,
  created_at TEXT NOT NULL, started_at TEXT, stopped_at TEXT, updated_at TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT ''
@@ -233,13 +243,15 @@ class InstanceStore:
     """SQLite in development; Supabase tables in production after the additive migration."""
     _REMOTE_SCHEMA = {
         "paper_trades": (
-            "id", "instance_id", "sizing_mode", "sizing_engine_version",
+            "id", "instance_id", "target", "sizing_mode", "sizing_engine_version",
             "risk_basis_at_entry", "risk_pct_at_entry", "risk_amount_at_entry",
             "equity_before_trade", "equity_after_close", "fees", "realized_pnl",
         ),
+        "positions": ("id", "instance_id", "target", "management_json"),
         "trading_instances": (
             "id", "symbol", "strategy_key", "strategy_label", "strategy_version",
-            "timeframe", "risk_per_trade_pct", "capital_allocation", "max_open_positions",
+            "timeframe", "risk_per_trade_pct", "capital_allocation", "exchange",
+            "instrument_type", "max_open_positions",
             "sizing_mode", "fixed_position_size", "fixed_quantity", "profit_reinvestment",
             "maximum_risk_amount", "minimum_equity", "starting_equity",
             "current_realized_equity", "risk_basis", "sizing_engine_version", "entry_mode", "fill_model",
@@ -273,6 +285,8 @@ class InstanceStore:
                 ensure_column(ledger._c, "trading_instances", "market_data_mode",
                               "TEXT NOT NULL DEFAULT 'paper_forward'")
                 for name, definition in (
+                    ("exchange", "TEXT NOT NULL DEFAULT 'inherit'"),
+                    ("instrument_type", "TEXT NOT NULL DEFAULT 'spot'"),
                     ("sizing_mode", "TEXT NOT NULL DEFAULT 'fixed_starting_equity_percent'"),
                     ("fixed_position_size", "REAL NOT NULL DEFAULT 0"),
                     ("fixed_quantity", "REAL NOT NULL DEFAULT 0"),
@@ -284,7 +298,7 @@ class InstanceStore:
                     ("risk_basis", "REAL"),
                     ("sizing_engine_version", "TEXT NOT NULL DEFAULT 'v2'"),
                     ("entry_mode", "TEXT NOT NULL DEFAULT 'limit'"),
-                    ("fill_model", "TEXT NOT NULL DEFAULT 'PerfectFill'"),
+                    ("fill_model", "TEXT NOT NULL DEFAULT 'RealisticFill'"),
                     ("execution_mode", "TEXT NOT NULL DEFAULT 'paper'"),
                     ("max_open_positions", "INTEGER NOT NULL DEFAULT 3"),
                     ("started_at", "TEXT"),
@@ -343,8 +357,8 @@ class InstanceStore:
         else:
             with self.ledger._lock:
                 self.ledger._c.execute("""INSERT INTO trading_instances
-                (id,symbol,strategy_key,strategy_label,strategy_version,timeframe,risk_per_trade_pct,capital_allocation,max_open_positions,sizing_mode,fixed_position_size,fixed_quantity,profit_reinvestment,maximum_risk_amount,minimum_equity,starting_equity,current_realized_equity,risk_basis,sizing_engine_version,entry_mode,fill_model,execution_mode,mode,market_data_mode,state,desired_running,created_at,started_at,stopped_at,updated_at,last_error)
-                VALUES (:id,:symbol,:strategy_key,:strategy_label,:strategy_version,:timeframe,:risk_per_trade_pct,:capital_allocation,:max_open_positions,:sizing_mode,:fixed_position_size,:fixed_quantity,:profit_reinvestment,:maximum_risk_amount,:minimum_equity,:starting_equity,:current_realized_equity,:risk_basis,:sizing_engine_version,:entry_mode,:fill_model,:execution_mode,:mode,:market_data_mode,:state,:desired_running,:created_at,:started_at,:stopped_at,:updated_at,:last_error)""", row)
+                (id,symbol,strategy_key,strategy_label,strategy_version,timeframe,risk_per_trade_pct,capital_allocation,exchange,instrument_type,max_open_positions,sizing_mode,fixed_position_size,fixed_quantity,profit_reinvestment,maximum_risk_amount,minimum_equity,starting_equity,current_realized_equity,risk_basis,sizing_engine_version,entry_mode,fill_model,execution_mode,mode,market_data_mode,state,desired_running,created_at,started_at,stopped_at,updated_at,last_error)
+                VALUES (:id,:symbol,:strategy_key,:strategy_label,:strategy_version,:timeframe,:risk_per_trade_pct,:capital_allocation,:exchange,:instrument_type,:max_open_positions,:sizing_mode,:fixed_position_size,:fixed_quantity,:profit_reinvestment,:maximum_risk_amount,:minimum_equity,:starting_equity,:current_realized_equity,:risk_basis,:sizing_engine_version,:entry_mode,:fill_model,:execution_mode,:mode,:market_data_mode,:state,:desired_running,:created_at,:started_at,:stopped_at,:updated_at,:last_error)""", row)
                 self.ledger._c.commit()
 
     def delete(self, instance_id: str) -> None:
@@ -550,7 +564,8 @@ class TradingInstanceManager:
                profit_reinvestment: bool = False,
                maximum_risk_amount: float | None = None,
                minimum_equity: float | None = None,
-               entry_mode: str = "limit", fill_model: str = "PerfectFill") -> TradingInstance:
+               entry_mode: str = "limit", fill_model: str = "RealisticFill",
+               exchange: str = "inherit", instrument_type: str = "spot") -> TradingInstance:
         with self._lock:
             # This must precede every insert.  A partially installed Supabase
             # migration previously left a stopped row behind when status() later
@@ -570,8 +585,14 @@ class TradingInstanceManager:
                 raise ValueError("minimum_equity must be greater than zero and no more than the allocation")
             if entry_mode not in ("limit", "market"):
                 raise ValueError("entry_mode must be 'limit' or 'market'")
-            if fill_model != "PerfectFill":
-                raise ValueError("PerfectFill is the only currently supported paper fill model")
+            from services.fill_model import normalize_fill_model
+            fill_model = normalize_fill_model(fill_model)
+            exchange = str(exchange or "inherit").strip().lower()
+            if exchange not in ("inherit", "binance", "kraken", "coinbase", "bybit"):
+                raise ValueError("exchange must be one of inherit, binance, kraken, coinbase, bybit")
+            instrument_type = str(instrument_type or "spot").strip().lower()
+            if instrument_type != "spot":
+                raise ValueError("Only spot instrument parity is currently supported for paper-forward instances")
             if not 1 <= int(max_open_positions) <= 50:
                 raise ValueError("max_open_positions must be between 1 and 50")
             if mode == "trading":
@@ -579,7 +600,8 @@ class TradingInstanceManager:
                                   if item.mode == "trading" and item.symbol == symbol.upper()
                                   and item.strategy_key == strategy_key
                                   and item.strategy_version == (strategy_version or "builtin-1")
-                                  and item.timeframe == timeframe and item.state in ("running", "paused", "reconnecting", "starting")), None)
+                                  and item.timeframe == timeframe and item.exchange == exchange
+                                  and item.state in ("running", "paused", "reconnecting", "starting")), None)
                 if duplicate is not None:
                     raise ValueError("This Trading Instance is already active")
                 allocated = sum(item.capital_allocation for item in self._instances.values() if item.mode == "trading")
@@ -589,7 +611,9 @@ class TradingInstanceManager:
             inst = TradingInstance(id=_id(), symbol=symbol.upper(), strategy_key=strategy_key,
                                    strategy_label=strategy_label, strategy_version=strategy_version or "builtin-1",
                                    timeframe=timeframe, risk_per_trade_pct=risk_per_trade_pct,
-                                   capital_allocation=capital_allocation, max_open_positions=int(max_open_positions),
+                                   capital_allocation=capital_allocation,
+                                   exchange=exchange, instrument_type=instrument_type,
+                                   max_open_positions=int(max_open_positions),
                                    sizing_mode=sizing_mode,
                                    fixed_position_size=quantity, fixed_quantity=quantity,
                                    profit_reinvestment=bool(profit_reinvestment),
@@ -665,7 +689,9 @@ class TradingInstanceManager:
             scoped = InstanceLedger(self.ledger, instance_id)
             controls = TradingControl()
             engine_type = ResearchExecutionEngine if inst.mode == "research" else PaperExecutionEngine
-            paper = engine_type(scoped, inst.starting_equity)
+            from services.fill_model import from_name as fill_model_from_name
+            paper = engine_type(scoped, inst.starting_equity,
+                                fill_model=fill_model_from_name(inst.fill_model))
             inst.current_realized_equity = paper.current_realized_equity()
             def persist_realized_equity(value: float) -> None:
                 inst.current_realized_equity = float(value)
@@ -689,6 +715,29 @@ class TradingInstanceManager:
                                       minimum_equity=inst.minimum_equity)
             pipeline.global_entry_guard = lambda **kw: self._global_guard(instance_id, **kw)
             forward = inst.mode == "trading"
+            exchange = (inst.exchange if inst.exchange != "inherit"
+                        else (os.environ.get("HUB_EXCHANGE", "binance").strip() or "binance"))
+            if forward:
+                from data.forward_market_data import fetch_forward_symbol_rules
+                pipeline.symbol_rules_provider = lambda symbol: fetch_forward_symbol_rules(symbol, exchange)
+            fetch_parameters = inspect.signature(self.forward_fetcher).parameters if forward else {}
+            supports_exchange = "exchange" in fetch_parameters
+            supports_since = "since_ms" in fetch_parameters
+            def instance_forward_fetcher(symbol, timeframe, limit, since_ms=None):
+                kwargs = {}
+                if supports_since:
+                    kwargs["since_ms"] = since_ms
+                if supports_exchange:
+                    kwargs["exchange"] = exchange
+                return self.forward_fetcher(symbol, timeframe, limit, **kwargs)
+            ws_feed = None
+            runtime_fetcher = instance_forward_fetcher
+            if forward:
+                from data.ws_feed import WebSocketFeed
+                ws_feed = WebSocketFeed([inst.symbol], timeframe=inst.timeframe,
+                                        exchange=exchange, max_bars=1000)
+                ws_feed.start()  # false is honest: REST remains authoritative
+                runtime_fetcher = ws_feed.make_fetcher(instance_forward_fetcher)
             market = self.store.market_state(instance_id) if forward else {}
             if forward:
                 self.store.save_market_state(instance_id,
@@ -708,12 +757,13 @@ class TradingInstanceManager:
             engine = AutoStrategyEngine(pipeline, paper, scoped, symbols=[inst.symbol], timeframe=inst.timeframe,
                                         strategy_factory=lambda symbol: self.strategy_factory(inst.strategy_key, symbol),
                                         live=forward, live_poll_s=self.live_poll_s,
-                                        fetcher=self.forward_fetcher if forward else self.fetcher,
+                                        fetcher=runtime_fetcher if forward else self.fetcher,
                                         initial_last_processed_candle=market.get("last_processed_candle_timestamp"),
                                         candle_checkpoint=checkpoint if forward else None,
                                         initial_pending_orders=market.get("pending_orders_json") if forward else None,
                                         pending_orders_checkpoint=(lambda pending: self.store.save_pending_orders(instance_id, pending)) if forward else None,
                                         entry_mode=inst.entry_mode)
+            engine.ws_feed = ws_feed
             engine.strategy_label = f"{inst.strategy_label} {inst.strategy_version}"
             engine.decisions = self.decision_store
             engine.start(); self._runtime[instance_id] = (engine, paper, pipeline, controls)
@@ -724,7 +774,11 @@ class TradingInstanceManager:
     def stop(self, instance_id: str) -> TradingInstance:
         inst = self._instances[instance_id]
         runtime = self._runtime.get(instance_id)
-        if runtime: runtime[0].stop("Stopped by instance operator")
+        if runtime:
+            runtime[0].stop("Stopped by instance operator")
+            ws_feed = getattr(runtime[0], "ws_feed", None)
+            if ws_feed is not None:
+                ws_feed.stop()
         inst.state, inst.desired_running, inst.stopped_at = "stopped", False, _now(); self.store.save(inst); return inst
 
     def restart(self, instance_id: str) -> TradingInstance:
@@ -753,6 +807,9 @@ class TradingInstanceManager:
                              maximum_risk_amount: float | None = None,
                              minimum_equity: float | None = None,
                              entry_mode: str | None = None,
+                             fill_model: str | None = None,
+                             exchange: str | None = None,
+                             instrument_type: str | None = None,
                              max_open_positions: int | None = None,
                              strategy_key: str | None = None, strategy_label: str | None = None,
                              strategy_version: str | None = None, timeframe: str | None = None) -> TradingInstance:
@@ -794,6 +851,21 @@ class TradingInstanceManager:
             candidate_entry = entry_mode if entry_mode is not None else inst.entry_mode
             if candidate_entry not in ("limit", "market"):
                 raise ValueError("entry_mode must be 'limit' or 'market'")
+            from services.fill_model import normalize_fill_model
+            candidate_fill = normalize_fill_model(fill_model if fill_model is not None else inst.fill_model)
+            if (fill_model is not None and trade_history
+                    and candidate_fill != inst.fill_model):
+                raise ValueError("Fill model is immutable after the first trade; create a new instance")
+            candidate_exchange = str(exchange if exchange is not None else inst.exchange).strip().lower()
+            if candidate_exchange not in ("inherit", "binance", "kraken", "coinbase", "bybit"):
+                raise ValueError("exchange must be one of inherit, binance, kraken, coinbase, bybit")
+            candidate_instrument = str(instrument_type if instrument_type is not None
+                                       else inst.instrument_type).strip().lower()
+            if candidate_instrument != "spot":
+                raise ValueError("Only spot instrument parity is currently supported")
+            if trade_history and (candidate_exchange != inst.exchange
+                                  or candidate_instrument != inst.instrument_type):
+                raise ValueError("Venue and instrument type are immutable after the first trade; create a new instance")
             candidate_max = int(max_open_positions if max_open_positions is not None else inst.max_open_positions)
             if not 1 <= candidate_max <= 50:
                 raise ValueError("max_open_positions must be between 1 and 50")
@@ -803,7 +875,8 @@ class TradingInstanceManager:
                 raise ValueError("Capital allocation exceeds paper account capacity")
             rebuild_required = any(value is not None for value in (
                 capital_allocation, sizing_mode, fixed_position_size, fixed_quantity,
-                profit_reinvestment, maximum_risk_amount, minimum_equity, entry_mode,
+                profit_reinvestment, maximum_risk_amount, minimum_equity, entry_mode, fill_model,
+                exchange, instrument_type,
                 strategy_key, strategy_label, strategy_version, timeframe,
             ))
             if rebuild_required and open_positions:
@@ -822,6 +895,9 @@ class TradingInstanceManager:
             inst.maximum_risk_amount = candidate_max_risk
             inst.minimum_equity = candidate_floor
             inst.entry_mode = candidate_entry
+            inst.fill_model = candidate_fill
+            inst.exchange = candidate_exchange
+            inst.instrument_type = candidate_instrument
             if capital_allocation is not None and not trade_history:
                 inst.starting_equity = candidate_capital
                 inst.current_realized_equity = candidate_capital
@@ -1226,7 +1302,10 @@ class TradingInstanceManager:
             "entry_mode": inst.entry_mode, "fill_model": inst.fill_model,
             "execution_mode": inst.execution_mode, "market_data_mode": inst.market_data_mode,
         }
-        return {**inst.to_dict(), "state": state, "engine": engine,
+        effective_exchange = (inst.exchange if inst.exchange != "inherit"
+                              else (os.environ.get("HUB_EXCHANGE", "binance").strip() or "binance"))
+        return {**inst.to_dict(), "effective_exchange": effective_exchange,
+                "state": state, "engine": engine,
                 "configuration": configuration, "execution": execution,
                 "risk": risk, "market_data": market, "current_position": current_position,
                 "performance": {**metrics, "net_pnl": execution.get("realized_pnl"),

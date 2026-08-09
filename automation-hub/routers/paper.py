@@ -135,7 +135,7 @@ def paper_stop_target(body: AdjustLevels,
     """Adjust the stop-loss and/or take-profit on an OPEN paper position — the
     backing endpoint for on-chart drag-to-move. The stop is persisted to the
     ledger and pushed into the engine's live managed state (enforced next bar);
-    the target updates the engine's in-memory target. Paper only — never live."""
+    the target and management state are persisted too. Paper only — never live."""
     _wa._check_secret(x_webhook_secret)
     symbol = (body.symbol or "").upper().strip()
     if not symbol:
@@ -158,7 +158,7 @@ def paper_stop_target(body: AdjustLevels,
     except Exception:  # noqa: BLE001
         managed = {}
     eff_stop = stop if stop is not None else pos.get("stop")
-    eff_target = target if target is not None else managed.get("target")
+    eff_target = target if target is not None else (managed.get("target") or pos.get("target"))
     if eff_stop is not None and eff_target is not None:
         if side == "long" and not (eff_stop < eff_target):
             raise HTTPException(400, "For a long, the stop must sit below the target.")

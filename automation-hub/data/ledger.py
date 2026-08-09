@@ -70,11 +70,18 @@ class Ledger(Protocol):
     def insert_webhook_event(self, *, alert_id: str, symbol: str, side: str,
                              entry: Optional[float], stop: Optional[float],
                              payload: dict, status: str, reason: str = "", instance_id: str = "") -> str: ...
-    def webhook_seen(self, alert_id: str, since_iso: str) -> bool: ...
+    def webhook_seen(self, alert_id: str, since_iso: str, instance_id: str = "") -> bool: ...
     def get_webhook_events(self, limit: int = 500) -> list[dict]: ...
     # positions / trades
     def open_position(self, *, symbol: str, side: str, size: float, entry: float,
-                      stop: Optional[float], instance_id: str = "") -> str: ...
+                      stop: Optional[float], target: Optional[float] = None,
+                      management: Optional[dict] = None,
+                      instance_id: str = "") -> str: ...
+    def update_position_management(self, *, symbol: str,
+                                   stop: Optional[float] = None,
+                                   target: Optional[float] = None,
+                                   management: Optional[dict] = None,
+                                   instance_id: str = "") -> int: ...
     def close_position(self, position_id: str, *, exit_price: float, pnl: float) -> None: ...
     def get_positions(self, status: Optional[str] = None, instance_id: str = "") -> list[dict]: ...
     def record_paper_trade(self, trade: dict) -> str: ...
@@ -128,6 +135,9 @@ class SqliteLedger:
                 ensure_column(self._c, "paper_trades", _name, _definition)
             for _t in ("webhook_events", "positions", "paper_trades", "bot_logs", "alerts"):
                 ensure_column(self._c, _t, "instance_id")
+            ensure_column(self._c, "positions", "target", "REAL")
+            ensure_column(self._c, "positions", "management_json", "TEXT NOT NULL DEFAULT '{}'")
+            ensure_column(self._c, "paper_trades", "target", "REAL")
             self._c.execute("CREATE INDEX IF NOT EXISTS idx_paper_strategy "
                             "ON paper_trades(strategy_id, closed_at)")
             self._c.commit()
@@ -143,11 +153,15 @@ class SqliteLedger:
             self._c.commit()
         return wid
 
-    def webhook_seen(self, alert_id: str, since_iso: str) -> bool:
+    def webhook_seen(self, alert_id: str, since_iso: str, instance_id: str = "") -> bool:
         with self._lock:
-            r = self._c.execute(
-                "SELECT 1 FROM webhook_events WHERE alert_id=? AND received_at>=? AND status!='rejected' LIMIT 1",
-                (alert_id, since_iso)).fetchone()
+            query = ("SELECT 1 FROM webhook_events WHERE alert_id=? AND received_at>=? "
+                     "AND status!='rejected'")
+            args = [alert_id, since_iso]
+            if instance_id:
+                query += " AND instance_id=?"
+                args.append(instance_id)
+            r = self._c.execute(query + " LIMIT 1", args).fetchone()
         return r is not None
 
     def get_webhook_events(self, limit: int = 500) -> list[dict]:
@@ -166,13 +180,15 @@ class SqliteLedger:
         return out
 
     # ----------------------------------------------------------- positions
-    def open_position(self, *, symbol, side, size, entry, stop, instance_id=""):
+    def open_position(self, *, symbol, side, size, entry, stop, target=None,
+                      management=None, instance_id=""):
         pid = _id()
         with self._lock:
             self._c.execute(
-                "INSERT INTO positions(id,symbol,side,size,entry,stop,status,pnl,opened_at,instance_id)"
-                " VALUES (?,?,?,?,?,?, 'open', 0, ?,?)",
-                (pid, symbol, side, size, entry, stop, _now(), instance_id))
+                "INSERT INTO positions(id,symbol,side,size,entry,stop,target,management_json,status,pnl,opened_at,instance_id)"
+                " VALUES (?,?,?,?,?,?,?,?, 'open', 0, ?,?)",
+                (pid, symbol, side, size, entry, stop, target,
+                 json.dumps(management or {}, separators=(",", ":")), _now(), instance_id))
             self._c.commit()
         return pid
 
@@ -198,13 +214,28 @@ class SqliteLedger:
             return [dict(r) for r in self._c.execute(q, args)]
 
     def update_position_stop(self, *, symbol, stop, instance_id="") -> int:
-        """Move the stop-loss on the OPEN position for a symbol (manual on-chart
-        adjust). Only the stop is persisted here — the take-profit lives in the
-        engine's in-memory managed state, matching how targets are held today.
-        Returns the number of rows updated (0 if no open position)."""
+        """Backward-compatible stop-only position update."""
+        return self.update_position_management(symbol=symbol, stop=stop,
+                                               instance_id=instance_id)
+
+    def update_position_management(self, *, symbol, stop=None, target=None,
+                                   management=None, instance_id="") -> int:
+        """Atomically checkpoint the protection and mutable management state."""
         with self._lock:
-            query = "UPDATE positions SET stop=? WHERE symbol=? AND status='open'"
-            args = [stop, symbol]
+            sets, args = [], []
+            if stop is not None:
+                sets.append("stop=?")
+                args.append(stop)
+            if target is not None:
+                sets.append("target=?")
+                args.append(target)
+            if management is not None:
+                sets.append("management_json=?")
+                args.append(json.dumps(management, separators=(",", ":")))
+            if not sets:
+                return 0
+            query = f"UPDATE positions SET {','.join(sets)} WHERE symbol=? AND status='open'"
+            args.append(symbol)
             if instance_id:
                 query += " AND instance_id=?"
                 args.append(instance_id)
@@ -217,12 +248,12 @@ class SqliteLedger:
         tid = trade.get("id") or _id()
         with self._lock:
             self._c.execute(
-                "INSERT INTO paper_trades(id,alert_id,symbol,side,size,entry,stop,status,"
+                "INSERT INTO paper_trades(id,alert_id,symbol,side,size,entry,stop,target,status,"
                 "opened_at,strategy_id,instance_id,sizing_mode,sizing_engine_version,"
                 "risk_basis_at_entry,risk_pct_at_entry,risk_amount_at_entry,equity_before_trade,fees) "
-                "VALUES (?,?,?,?,?,?,?, 'open', ?,?,?,?,?,?,?,?,?,0)",
+                "VALUES (?,?,?,?,?,?,?,?, 'open', ?,?,?,?,?,?,?,?,?,0)",
                 (tid, trade.get("alert_id"), trade["symbol"], trade["side"], trade["size"],
-                 trade["entry"], trade.get("stop"), _now(),
+                 trade["entry"], trade.get("stop"), trade.get("target"), _now(),
                  trade.get("strategy_id") or "", trade.get("instance_id") or "",
                  trade.get("sizing_mode"), trade.get("sizing_engine_version"),
                  trade.get("risk_basis_at_entry"), trade.get("risk_pct_at_entry"),
@@ -349,10 +380,15 @@ class SupabaseLedger:
         self._t("webhook_events").insert(row).execute()
         return wid
 
-    def webhook_seen(self, alert_id, since_iso):  # pragma: no cover
-        res = remote_call_with_retry(lambda: self._t("webhook_events").select("id")
-                                     .eq("alert_id", alert_id).gte("received_at", since_iso)
-                                     .neq("status", "rejected").limit(1).execute())
+    def webhook_seen(self, alert_id, since_iso, instance_id=""):  # pragma: no cover
+        def query():
+            q = (self._t("webhook_events").select("id")
+                 .eq("alert_id", alert_id).gte("received_at", since_iso)
+                 .neq("status", "rejected"))
+            if instance_id:
+                q = q.eq("instance_id", instance_id)
+            return q.limit(1).execute()
+        res = remote_call_with_retry(query)
         return bool(res.data)
 
     def get_webhook_events(self, limit=500):  # pragma: no cover
@@ -365,11 +401,13 @@ class SupabaseLedger:
                 d["payload"] = {}
         return rows
 
-    def open_position(self, *, symbol, side, size, entry, stop, instance_id=""):  # pragma: no cover
+    def open_position(self, *, symbol, side, size, entry, stop, target=None,
+                      management=None, instance_id=""):  # pragma: no cover
         pid = _id()
         row = {
             "id": pid, "symbol": symbol, "side": side, "size": size, "entry": entry,
-            "stop": stop, "status": "open", "pnl": 0, "opened_at": _now()}
+            "stop": stop, "target": target, "management_json": management or {},
+            "status": "open", "pnl": 0, "opened_at": _now()}
         if instance_id:
             row["instance_id"] = instance_id
         self._t("positions").insert(row).execute()
@@ -390,7 +428,21 @@ class SupabaseLedger:
         return remote_call_with_retry(query).data
 
     def update_position_stop(self, *, symbol, stop, instance_id="") -> int:  # pragma: no cover
-        q = self._t("positions").update({"stop": stop}).eq("symbol", symbol).eq("status", "open")
+        return self.update_position_management(symbol=symbol, stop=stop,
+                                               instance_id=instance_id)
+
+    def update_position_management(self, *, symbol, stop=None, target=None,
+                                   management=None, instance_id="") -> int:  # pragma: no cover
+        patch = {}
+        if stop is not None:
+            patch["stop"] = stop
+        if target is not None:
+            patch["target"] = target
+        if management is not None:
+            patch["management_json"] = management
+        if not patch:
+            return 0
+        q = self._t("positions").update(patch).eq("symbol", symbol).eq("status", "open")
         if instance_id:
             q = q.eq("instance_id", instance_id)
         q.execute()
@@ -401,7 +453,8 @@ class SupabaseLedger:
         row = {
             "id": tid, "alert_id": trade.get("alert_id"), "symbol": trade["symbol"],
             "side": trade["side"], "size": trade["size"], "entry": trade["entry"],
-            "stop": trade.get("stop"), "status": "open", "opened_at": _now()}
+            "stop": trade.get("stop"), "target": trade.get("target"),
+            "status": "open", "opened_at": _now()}
         if trade.get("strategy_id"):
             row["strategy_id"] = trade["strategy_id"]
         if trade.get("instance_id"):

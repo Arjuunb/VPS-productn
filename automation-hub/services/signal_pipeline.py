@@ -196,6 +196,10 @@ class SignalPipeline:
         # Optional account-wide gate supplied by TradingInstanceManager. It is
         # evaluated after instance sizing/caps but before paper execution.
         self.global_entry_guard = None
+        # Optional venue rule resolver supplied by TradingInstanceManager.
+        # It returns bot.brokers.symbol_rules.SymbolRules and is evaluated only
+        # for a real entry candidate, after account caps but before execution.
+        self.symbol_rules_provider = None
         raw_sizing_mode = str(position_sizing_mode or "auto")
         # Keep the legacy global settings API's public auto/fixed values stable.
         # Trading Instances pass and persist canonical Stage 3 values.
@@ -744,6 +748,28 @@ class SignalPipeline:
             else:
                 steps.append(Step("portfolio_exposure", True,
                                   f"total within {self.max_total_exposure_pct*100:.0f}%"))
+        if self.symbol_rules_provider is not None:
+            try:
+                rules = self.symbol_rules_provider(symbol)
+                executable_size, rule_error = rules.clamp(size, entry)
+            except Exception as exc:
+                return reject("venue_rules",
+                              f"Venue order rules unavailable: {type(exc).__name__}: {exc}")
+            if executable_size <= 0:
+                return reject("venue_rules", rule_error or "Quantity rejected by venue rules")
+            if executable_size != size:
+                steps.append(Step(
+                    "venue_rules", True,
+                    f"quantity floored {size:.10g} → {executable_size:.10g} "
+                    f"(step {rules.step_size:g})"))
+                size = executable_size
+            else:
+                steps.append(Step("venue_rules", True, "quantity satisfies venue filters"))
+            payload["venue_rules"] = {
+                "symbol": rules.symbol, "step_size": rules.step_size,
+                "tick_size": rules.tick_size, "min_qty": rules.min_qty,
+                "min_notional": rules.min_notional,
+            }
         payload["journal_sizing"]["accepted_size"] = round(size, 10)
         payload["journal_sizing"]["accepted_notional"] = round(size * entry, 2)
 
@@ -797,7 +823,8 @@ class SignalPipeline:
             steps.append(Step("global_risk", True, reason))
 
         # 6. paper execution (routed through the fill model)
-        fill = self.paper.open(symbol=symbol, side=side, size=size, entry=entry, stop=stop,
+        fill = self.paper.open(symbol=symbol, side=side, size=size, entry=entry,
+                               stop=stop, target=payload.get("target"),
                                alert_id=alert_id, maker=bool(payload.get("maker")),
                                sizing_context={
                                    "sizing_mode": sizing.mode,

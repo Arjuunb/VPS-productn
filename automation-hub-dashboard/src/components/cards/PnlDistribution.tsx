@@ -15,7 +15,7 @@ export default function PnlDistribution() {
   const total = Math.max(1, wins + losses);
 
   return (
-    <Card title="P&L Distribution" subtitle="live paper" className="pnl-dist-card">
+    <Card title="P&L Distribution" subtitle="paper fills · live market data" className="pnl-dist-card">
       <div className="pnl-dist">
         <PnlDoughnut />
         <div className="pnl-legend">
