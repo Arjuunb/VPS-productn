@@ -21,8 +21,8 @@ export default function TopHeader({ onToggleSidebar, title = "Dashboard" }: TopH
         <h1 className="page-title">{title}</h1>
       </div>
 
-      {/* Interactive control strip: mode · engine · strategy · timeframe · ⚙ —
-          each segment opens an anchored popover that drives the real engine. */}
+      {/* Read-only summary of active Trading Instances. Instance configuration
+          and lifecycle actions live on the Trading Instances page. */}
       <HeaderControls />
 
       <div className="topbar-right">

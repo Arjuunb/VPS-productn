@@ -1,6 +1,6 @@
 import Card from "../common/Card";
 import { Badge, StatCard } from "../common/ui";
-import { apiPost, type PaperAccount, useLive } from "../../lib/api";
+import { apiPost, useLive } from "../../lib/api";
 import { useApp } from "../../app-context";
 
 type Metrics = {
@@ -21,7 +21,8 @@ type InstanceSnapshot = {
   instances: Instance[]; active_slots: number; max_active_slots: number;
   current_global_risk_amount: number; max_global_risk_amount: number;
   total_open_positions: number; today_pnl: number; global_risk_status: string;
-  global_risk_message: string;
+  global_risk_message: string; paper_account_capital: number;
+  total_allocated_capital: number; available_paper_capital: number; total_current_equity: number;
 };
 
 const money = (value?: number | null) => `${(value ?? 0) >= 0 ? "+" : "-"}$${Math.abs(value ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
@@ -87,7 +88,6 @@ function InstanceCard({ instance, onPause }: { instance: Instance; onPause: (id:
 export default function ActiveTradingInstances() {
   const app = useApp();
   const instances = useLive<InstanceSnapshot>("/instances", 2000);
-  const account = useLive<PaperAccount>("/paper/account", 4000);
   const snapshot = instances.data;
   // Running, paused, starting, reconnecting and error states all deserve
   // visibility. Stopped historical instances live on the dedicated page.
@@ -104,7 +104,7 @@ export default function ActiveTradingInstances() {
   return <section className="active-instances-section" aria-label="Active Trading Instances">
     <div className="active-instances-title"><div><h2>Active Trading Instances</h2><p>Authoritative paper engine state · monitor here, manage in the instance detail</p></div><Badge text={`${snapshot?.active_slots ?? 0} / ${snapshot?.max_active_slots ?? 1} active`} tone="blue" /></div>
     <div className="instance-summary-row">
-      <StatCard label="Paper balance" value={`$${(account.data?.balance ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`} sub="paper account" />
+      <StatCard label="Paper capacity" value={`$${(snapshot?.paper_account_capital ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`} sub={`allocated $${(snapshot?.total_allocated_capital ?? 0).toLocaleString()} · available $${(snapshot?.available_paper_capital ?? 0).toLocaleString()}`} />
       <StatCard label="Today's P&L" value={money(snapshot?.today_pnl)} tone={(snapshot?.today_pnl ?? 0) >= 0 ? "green" : "red"} sub="instances only" />
       <StatCard label="Open positions" value={String(snapshot?.total_open_positions ?? 0)} sub={`${snapshot?.active_slots ?? 0} / ${snapshot?.max_active_slots ?? 1} trading slots`} />
       <StatCard label="Open risk" value={`${riskPct.toFixed(1)}%`} tone={riskTone} sub={`${money(snapshot?.current_global_risk_amount)} of ${money(snapshot?.max_global_risk_amount)}`} />

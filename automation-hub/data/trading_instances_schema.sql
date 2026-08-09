@@ -14,6 +14,15 @@ CREATE TABLE IF NOT EXISTS trading_instances (
  created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL, last_error TEXT NOT NULL DEFAULT ''
 );
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS market_data_mode TEXT NOT NULL DEFAULT 'paper_forward';
+-- Instance-owned execution configuration.  Existing rows retain the prior
+-- paper defaults; no legacy global setting is copied or guessed.
+ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS sizing_mode TEXT NOT NULL DEFAULT 'auto';
+ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS fixed_position_size DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS entry_mode TEXT NOT NULL DEFAULT 'limit';
+ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS fill_model TEXT NOT NULL DEFAULT 'PerfectFill';
+ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS execution_mode TEXT NOT NULL DEFAULT 'paper';
+ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
+ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS stopped_at TIMESTAMPTZ;
 CREATE TABLE IF NOT EXISTS instance_metrics (
  instance_id TEXT PRIMARY KEY REFERENCES trading_instances(id) ON DELETE CASCADE,
  data_json JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL
@@ -46,6 +55,8 @@ CREATE TABLE IF NOT EXISTS trading_instance_platform_settings (
 );
 ALTER TABLE trading_instance_platform_settings
  ADD COLUMN IF NOT EXISTS max_global_daily_loss_pct DOUBLE PRECISION NOT NULL DEFAULT 0.05;
+ALTER TABLE trading_instance_platform_settings
+ ADD COLUMN IF NOT EXISTS paper_account_capital DOUBLE PRECISION NOT NULL DEFAULT 10000;
 CREATE INDEX IF NOT EXISTS idx_instance_pair_strategy ON trading_instances(symbol, strategy_key, strategy_version);
 CREATE INDEX IF NOT EXISTS idx_instance_trade ON paper_trades(instance_id, closed_at);
 CREATE INDEX IF NOT EXISTS idx_instance_position ON positions(instance_id, status);

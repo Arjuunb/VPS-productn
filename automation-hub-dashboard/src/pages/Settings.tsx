@@ -127,9 +127,8 @@ export default function SettingsPage() {
   return (
     <>
       <PageHeader
-        title="Settings"
-        subtitle="real configuration · risk values persist across restarts"
-        actions={<button className="btn btn-primary" disabled={saving || !data} onClick={save}><Icon name="check" size={14} /> {saving ? "Saving…" : "Save Settings"}</button>}
+        title="Global Account Settings"
+        subtitle="account-level limits and provider settings · active trading configuration lives in Trading Instances"
       />
 
       {error && !data && (
@@ -140,11 +139,18 @@ export default function SettingsPage() {
 
       <AccountCard />
 
-      <PaperCapitalCard />
       <WorkspaceCard />
 
+      <InstancePlatformCard />
+
+      <details className="card" style={{ marginTop: 14 }}>
+        <summary style={{ cursor: "pointer", fontWeight: 700 }}>Legacy Autonomous Engine <span className="dim">— stopped by default; not used by Trading Instances</span></summary>
+        <p className="dim" style={{ marginTop: 10 }}>These retained controls exist for backward-compatible diagnostics only. They do not override an active Trading Instance’s pair, strategy, timeframe, risk, sizing, entry mode, or market-data mode.</p>
+        <button className="btn btn-soft" disabled={saving || !data} onClick={save}><Icon name="check" size={14} /> {saving ? "Saving…" : "Save legacy settings"}</button>
+        <PaperCapitalCard />
+
       <div className="grid-2-eq">
-        <Card title="Risk Management" subtitle="editable · applied live + persisted">
+        <Card title="Legacy Risk Management" subtitle="legacy worker only · persisted">
           <div className="form-grid-2">
             <Field label="Risk per trade (%)"><input value={f.risk ?? ""} onChange={set("risk")} inputMode="decimal" /></Field>
             <Field label="Max exposure (% equity)"><input value={f.exposure ?? ""} onChange={set("exposure")} inputMode="decimal" /></Field>
@@ -155,7 +161,7 @@ export default function SettingsPage() {
           </p>
         </Card>
 
-        <Card title="Position & Execution" subtitle="editable · applied live + persisted">
+        <Card title="Legacy Position & Execution" subtitle="legacy worker only · persisted">
           <div className="form-grid-2">
             <Field label="Max open positions"><input value={f.maxpos ?? ""} onChange={set("maxpos")} inputMode="numeric" /></Field>
             <Field label="Duplicate window (s)" hint="reject repeat alert_id within this window"><input value={f.dedup ?? ""} onChange={set("dedup")} inputMode="numeric" /></Field>
@@ -184,14 +190,14 @@ export default function SettingsPage() {
       </div>
 
       <div className="grid-2-eq">
-        <Card title="Daily Loss Limit" subtitle="editable · auto-resets each UTC day">
+        <Card title="Legacy Daily Loss Limit" subtitle="legacy worker only · auto-resets each UTC day">
           <div className="form-grid-2">
             <Field label="Max daily loss (%)" hint="0 = disabled; halts new entries for the day"><input value={f.daily ?? ""} onChange={set("daily")} inputMode="decimal" /></Field>
           </div>
           <p className="dim" style={{ marginTop: 8 }}>When today's realized loss exceeds this, new entries are blocked until the next UTC day. Open positions still exit.</p>
         </Card>
 
-        <Card title="Trading Session (UTC)" subtitle="editable · entries only inside the window">
+        <Card title="Legacy Trading Session (UTC)" subtitle="legacy worker only · entries only inside the window">
           <div className="row-actions" style={{ justifyContent: "flex-start", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
             {Object.keys(SESSIONS).map((s) => <button key={s} className="chip-btn" onClick={() => preset(s)}>{s}</button>)}
           </div>
@@ -204,7 +210,7 @@ export default function SettingsPage() {
       </div>
 
       <div className="grid-2-eq">
-        <Card title="Pair Selection" subtitle="manual = exactly one pair · auto = configured watchlist">
+        <Card title="Legacy Pair Selection" subtitle="not used by Trading Instances">
           <div className="form-grid-2">
             <Field label="Trading pair mode">
               <select value={pairMode} onChange={(e) => setPairMode(e.target.value === "manual" ? "manual" : "auto")}>
@@ -221,13 +227,13 @@ export default function SettingsPage() {
           <p className="dim" style={{ marginTop: 8 }}>Changing pair mode safely restarts the paper engine. Open paper positions remain managed; no live orders are possible.</p>
         </Card>
 
-        <Card title="Automatic Watchlist" subtitle="used only when pair mode is automatic">
+        <Card title="Legacy Automatic Watchlist" subtitle="not used by Trading Instances">
           <Field label="Traded symbols (comma-separated)"><input value={symbols} onChange={(e) => setSymbols(e.target.value.toUpperCase())} /></Field>
           <button className="btn btn-soft" style={{ marginTop: 8 }} onClick={applySymbols}><Icon name="check" size={14} /> Apply watchlist</button>
           <p className="dim" style={{ marginTop: 8 }}>Sets the auto-mode watchlist. In manual mode it is saved but not traded until you switch back to automatic.</p>
         </Card>
 
-        <Card title="Engine Timeframe" subtitle="editable · restarts the engine · persists across redeploys">
+        <Card title="Legacy Engine Timeframe" subtitle="not used by Trading Instances">
           <div className="row-actions" style={{ justifyContent: "flex-start", gap: 6, flexWrap: "wrap" }}>
             {(["1m", "5m", "15m", "1h", "4h", "1d"] as const).map((tf) => (
               <button key={tf} className={`chip-btn ${engine.data?.timeframe === tf ? "active" : ""}`}
@@ -247,7 +253,7 @@ export default function SettingsPage() {
           </p>
         </Card>
 
-        <Card title="Allowed Trading Days (UTC)" subtitle="editable · entries only on enabled days">
+        <Card title="Legacy Allowed Trading Days (UTC)" subtitle="legacy worker only">
           <div className="row-actions" style={{ justifyContent: "flex-start", gap: 6, flexWrap: "wrap" }}>
             {DAY_NAMES.map((d, i) => (
               <button key={d} className={`chip-btn ${days[i] ? "active" : ""}`} onClick={() => setDays((p) => p.map((v, j) => (j === i ? !v : v)))}>{d}</button>
@@ -258,7 +264,7 @@ export default function SettingsPage() {
       </div>
 
       <div className="grid-2-eq">
-        <Card title="Loss Limits & Circuit Breakers" subtitle="editable · 0 = disabled">
+        <Card title="Legacy Loss Limits & Circuit Breakers" subtitle="legacy worker only · 0 = disabled">
           <div className="form-grid-2">
             <Field label="Weekly loss limit (%)" hint="resets each ISO week"><input value={f.weekly ?? ""} onChange={set("weekly")} inputMode="decimal" /></Field>
             <Field label="Max trades / day"><input value={f.maxday ?? ""} onChange={set("maxday")} inputMode="numeric" /></Field>
@@ -268,7 +274,7 @@ export default function SettingsPage() {
           <p className="dim" style={{ marginTop: 8 }}>These block NEW entries only; open positions always exit. Consecutive-loss halt requires a manual Resume.</p>
         </Card>
 
-        <Card title="Account Protection — Progression" subtitle="enforced order">
+        <Card title="Account Protection — Progression" subtitle="paper instances remain simulation-only">
           <div className="risk-list">
             <Ro k="1. Backtest" v="any strategy (historical, isolated)" />
             <Ro k="2. Simulation" v="real historical data · labelled SIMULATION" />
@@ -278,6 +284,8 @@ export default function SettingsPage() {
           <p className="dim" style={{ marginTop: 8 }}>A new strategy can never trade live directly. Live execution is disabled until a broker is wired.</p>
         </Card>
       </div>
+
+      </details>
 
       <div className="grid-2-eq">
         <Card title="Notifications" subtitle="Telegram · editable" right={<ActionButton className="btn btn-soft" icon="external" busyLabel="Sending…" onAction={testNotif}>Send test</ActionButton>}>
@@ -303,7 +311,7 @@ export default function SettingsPage() {
       </div>
 
       <div className="grid-2-eq">
-        <Card title="Engine Configuration" subtitle="env-configured · read-only">
+        <Card title="Legacy Autonomous Engine" subtitle="read-only · stopped by default · not used by Trading Instances">
           {ro ? (
             <div className="risk-list">
               <Ro k="Mode" v={`${ro.mode} (simulation)`} badge={<Badge text="PAPER" tone="blue" />} />
@@ -337,6 +345,50 @@ export default function SettingsPage() {
   );
 }
 
+type InstancePlatform = {
+  max_active_slots: number; max_global_risk_pct: number; max_global_daily_loss_pct: number;
+  paper_account_capital: number; total_allocated_capital: number; available_paper_capital: number;
+};
+
+function InstancePlatformCard() {
+  const app = useApp();
+  const platform = useLive<InstancePlatform>("/instances", 5000);
+  const [form, setForm] = useState<Record<string, string>>({});
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    if (platform.data && Object.keys(form).length === 0) setForm({
+      slots: String(platform.data.max_active_slots),
+      risk: String(platform.data.max_global_risk_pct * 100),
+      daily: String(platform.data.max_global_daily_loss_pct * 100),
+      capital: String(platform.data.paper_account_capital),
+    });
+  }, [platform.data, form]);
+  const save = async () => {
+    setSaving(true);
+    try {
+      await apiPostJson("/instances/platform", {
+        max_active_slots: Number(form.slots), max_global_risk_pct: Number(form.risk) / 100,
+        max_global_daily_loss_pct: Number(form.daily) / 100, paper_account_capital: Number(form.capital),
+      });
+      platform.refetch(); app.toast("Global Paper Trading limits saved", "success");
+    } catch (error) { app.toast(error instanceof Error ? error.message : "Could not save global limits", "error"); }
+    finally { setSaving(false); }
+  };
+  return <Card title="Trading Instance Global Risk Boundary" subtitle="applies above all Paper Trading instances; individual pair and strategy controls are in each instance">
+    <div className="form-grid-2">
+      <Field label="Paper account capital ($)"><input value={form.capital ?? ""} onChange={(e) => setForm({ ...form, capital: e.target.value })} inputMode="decimal" /></Field>
+      <Field label="Maximum active instances"><select value={form.slots ?? "1"} onChange={(e) => setForm({ ...form, slots: e.target.value })}><option value="1">1</option><option value="2">2 (recommended)</option><option value="3">3</option></select></Field>
+      <Field label="Global open-risk limit (%)"><input value={form.risk ?? ""} onChange={(e) => setForm({ ...form, risk: e.target.value })} inputMode="decimal" /></Field>
+      <Field label="Global daily-loss limit (%)"><input value={form.daily ?? ""} onChange={(e) => setForm({ ...form, daily: e.target.value })} inputMode="decimal" /></Field>
+    </div>
+    <div className="risk-list" style={{ marginTop: 10 }}>
+      <Ro k="Allocated / available" v={`$${(platform.data?.total_allocated_capital ?? 0).toLocaleString()} / $${(platform.data?.available_paper_capital ?? 0).toLocaleString()}`} />
+      <Ro k="Active configuration" v="Trading Instances are authoritative" badge={<Badge text="INSTANCE-OWNED" tone="green" />} />
+    </div>
+    <button className="btn btn-primary" style={{ marginTop: 10 }} disabled={saving || !platform.data} onClick={() => void save()}><Icon name="check" size={14} /> {saving ? "Saving…" : "Save global limits"}</button>
+  </Card>;
+}
+
 function PaperCapitalCard() {
   const app = useApp();
   const acct = useLive<import("../lib/api").PaperAccount>("/paper/account", 4000);
@@ -359,7 +411,7 @@ function PaperCapitalCard() {
   };
 
   return (
-    <Card title="Paper Capital" subtitle="initial capital vs current equity · persists across logout / restart">
+    <Card title="Legacy Paper Account" subtitle="backward-compatible account state · Trading Instance allocation is configured above">
       {a?.persistent === false && a?.warning && (
         <div className="card" style={{ marginBottom: 10, borderColor: "var(--gold)", background: "rgba(234,181,79,0.08)" }}>
           <Icon name="warning" size={13} className="amber" /> <span className="dim">{a.warning}</span>

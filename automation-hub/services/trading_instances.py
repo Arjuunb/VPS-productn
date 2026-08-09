@@ -92,6 +92,13 @@ class TradingInstance:
     timeframe: str
     risk_per_trade_pct: float
     capital_allocation: float
+    # These execution values are persisted with the worker; legacy autonomous
+    # engine settings are never consulted when an instance starts or restores.
+    sizing_mode: str = "auto"
+    fixed_position_size: float = 0.0
+    entry_mode: str = "limit"
+    fill_model: str = "PerfectFill"
+    execution_mode: str = "paper"
     mode: str = "trading"              # trading | research (paper only)
     # Trading instances are always forward paper. Research remains the only
     # instance mode allowed to consume a historical replay.
@@ -99,6 +106,8 @@ class TradingInstance:
     state: str = "stopped"             # running | paused | stopped | error
     desired_running: bool = False
     created_at: str = field(default_factory=_now)
+    started_at: Optional[str] = None
+    stopped_at: Optional[str] = None
     updated_at: str = field(default_factory=_now)
     last_error: str = ""
 
@@ -174,8 +183,11 @@ CREATE TABLE IF NOT EXISTS trading_instances (
  id TEXT PRIMARY KEY, symbol TEXT NOT NULL, strategy_key TEXT NOT NULL,
  strategy_label TEXT NOT NULL, strategy_version TEXT NOT NULL, timeframe TEXT NOT NULL,
  risk_per_trade_pct REAL NOT NULL, capital_allocation REAL NOT NULL,
+ sizing_mode TEXT NOT NULL DEFAULT 'auto', fixed_position_size REAL NOT NULL DEFAULT 0,
+ entry_mode TEXT NOT NULL DEFAULT 'limit', fill_model TEXT NOT NULL DEFAULT 'PerfectFill',
+ execution_mode TEXT NOT NULL DEFAULT 'paper',
  mode TEXT NOT NULL, market_data_mode TEXT NOT NULL DEFAULT 'paper_forward', state TEXT NOT NULL, desired_running INTEGER NOT NULL DEFAULT 0,
- created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT ''
+ created_at TEXT NOT NULL, started_at TEXT, stopped_at TEXT, updated_at TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS instance_metrics (
  instance_id TEXT PRIMARY KEY, data_json TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -193,7 +205,8 @@ CREATE TABLE IF NOT EXISTS instance_market_state (
 CREATE TABLE IF NOT EXISTS trading_instance_platform_settings (
  id TEXT PRIMARY KEY, max_active_slots INTEGER NOT NULL DEFAULT 1,
  max_global_risk_pct REAL NOT NULL DEFAULT 0.02,
- max_global_daily_loss_pct REAL NOT NULL DEFAULT 0.05, updated_at TEXT NOT NULL
+ max_global_daily_loss_pct REAL NOT NULL DEFAULT 0.05,
+ paper_account_capital REAL NOT NULL DEFAULT 10000, updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_instance_symbol_strategy ON trading_instances(symbol, strategy_key, strategy_version);
 """
@@ -213,6 +226,18 @@ class InstanceStore:
                               "max_global_daily_loss_pct", "REAL NOT NULL DEFAULT 0.05")
                 ensure_column(ledger._c, "trading_instances", "market_data_mode",
                               "TEXT NOT NULL DEFAULT 'paper_forward'")
+                for name, definition in (
+                    ("sizing_mode", "TEXT NOT NULL DEFAULT 'auto'"),
+                    ("fixed_position_size", "REAL NOT NULL DEFAULT 0"),
+                    ("entry_mode", "TEXT NOT NULL DEFAULT 'limit'"),
+                    ("fill_model", "TEXT NOT NULL DEFAULT 'PerfectFill'"),
+                    ("execution_mode", "TEXT NOT NULL DEFAULT 'paper'"),
+                    ("started_at", "TEXT"),
+                    ("stopped_at", "TEXT"),
+                ):
+                    ensure_column(ledger._c, "trading_instances", name, definition)
+                ensure_column(ledger._c, "trading_instance_platform_settings",
+                              "paper_account_capital", "REAL NOT NULL DEFAULT 10000")
                 ledger._c.commit()
 
     def _table(self, name):
@@ -227,8 +252,8 @@ class InstanceStore:
         else:
             with self.ledger._lock:
                 self.ledger._c.execute("""INSERT INTO trading_instances
-                (id,symbol,strategy_key,strategy_label,strategy_version,timeframe,risk_per_trade_pct,capital_allocation,mode,market_data_mode,state,desired_running,created_at,updated_at,last_error)
-                VALUES (:id,:symbol,:strategy_key,:strategy_label,:strategy_version,:timeframe,:risk_per_trade_pct,:capital_allocation,:mode,:market_data_mode,:state,:desired_running,:created_at,:updated_at,:last_error)""", row)
+                (id,symbol,strategy_key,strategy_label,strategy_version,timeframe,risk_per_trade_pct,capital_allocation,sizing_mode,fixed_position_size,entry_mode,fill_model,execution_mode,mode,market_data_mode,state,desired_running,created_at,started_at,stopped_at,updated_at,last_error)
+                VALUES (:id,:symbol,:strategy_key,:strategy_label,:strategy_version,:timeframe,:risk_per_trade_pct,:capital_allocation,:sizing_mode,:fixed_position_size,:entry_mode,:fill_model,:execution_mode,:mode,:market_data_mode,:state,:desired_running,:created_at,:started_at,:stopped_at,:updated_at,:last_error)""", row)
                 self.ledger._c.commit()
 
     def list(self) -> list[TradingInstance]:
@@ -251,7 +276,14 @@ class InstanceStore:
             self._table("trading_instances").update(row).eq("id", instance.id).execute()
         else:
             with self.ledger._lock:
-                self.ledger._c.execute("""UPDATE trading_instances SET market_data_mode=:market_data_mode,state=:state,desired_running=:desired_running,updated_at=:updated_at,last_error=:last_error WHERE id=:id""", row)
+                self.ledger._c.execute(
+                    """UPDATE trading_instances
+                    SET sizing_mode=:sizing_mode, fixed_position_size=:fixed_position_size,
+                        entry_mode=:entry_mode, fill_model=:fill_model, execution_mode=:execution_mode,
+                        market_data_mode=:market_data_mode, state=:state, desired_running=:desired_running,
+                        started_at=:started_at, stopped_at=:stopped_at,
+                        updated_at=:updated_at, last_error=:last_error
+                    WHERE id=:id""", row)
                 self.ledger._c.commit()
 
     def market_state(self, instance_id: str) -> dict:
@@ -301,7 +333,7 @@ class InstanceStore:
 
     def platform_settings(self) -> dict:
         defaults = {"max_active_slots": 1, "max_global_risk_pct": 0.02,
-                    "max_global_daily_loss_pct": 0.05}
+                    "max_global_daily_loss_pct": 0.05, "paper_account_capital": None}
         if self.remote:
             try:
                 rows = self._table("trading_instance_platform_settings").select("*").eq("id", "default").execute().data
@@ -315,17 +347,18 @@ class InstanceStore:
         return {**defaults, **(dict(row) if row else {})}
 
     def save_platform_settings(self, *, max_active_slots: int, max_global_risk_pct: float,
-                               max_global_daily_loss_pct: float) -> None:
+                               max_global_daily_loss_pct: float, paper_account_capital: float) -> None:
         row = {"id": "default", "max_active_slots": max_active_slots,
                "max_global_risk_pct": max_global_risk_pct,
-               "max_global_daily_loss_pct": max_global_daily_loss_pct, "updated_at": _now()}
+               "max_global_daily_loss_pct": max_global_daily_loss_pct,
+               "paper_account_capital": paper_account_capital, "updated_at": _now()}
         if self.remote:
             self._table("trading_instance_platform_settings").upsert(row).execute()
         else:
             with self.ledger._lock:
                 self.ledger._c.execute("""INSERT OR REPLACE INTO trading_instance_platform_settings
-                    (id,max_active_slots,max_global_risk_pct,max_global_daily_loss_pct,updated_at)
-                    VALUES (:id,:max_active_slots,:max_global_risk_pct,:max_global_daily_loss_pct,:updated_at)""", row)
+                    (id,max_active_slots,max_global_risk_pct,max_global_daily_loss_pct,paper_account_capital,updated_at)
+                    VALUES (:id,:max_active_slots,:max_global_risk_pct,:max_global_daily_loss_pct,:paper_account_capital,:updated_at)""", row)
                 self.ledger._c.commit()
 
 
@@ -333,7 +366,7 @@ class TradingInstanceManager:
     def __init__(self, ledger: Ledger, *, strategy_factory: Callable[[str, str], object],
                  live: bool, live_poll_s: float, fetcher=None, max_slots: int = 1,
                  max_global_risk_pct: float = 0.02, max_global_daily_loss_pct: float = 0.05,
-                 decision_store=None):
+                 paper_account_capital: float = 10_000.0, decision_store=None):
         self.ledger, self.store = ledger, InstanceStore(ledger)
         self.strategy_factory, self.live, self.live_poll_s, self.fetcher = strategy_factory, live, live_poll_s, fetcher
         self.decision_store = decision_store
@@ -346,19 +379,45 @@ class TradingInstanceManager:
         self.max_slots = min(3, max(1, int(configured.get("max_active_slots", max_slots))))
         self.max_global_risk_pct = min(1.0, max(0.001, float(configured.get("max_global_risk_pct", max_global_risk_pct))))
         self.max_global_daily_loss_pct = min(1.0, max(0.001, float(configured.get("max_global_daily_loss_pct", max_global_daily_loss_pct))))
+        configured_capital = configured.get("paper_account_capital")
+        self.paper_account_capital = max(1.0, float(configured_capital if configured_capital is not None else paper_account_capital))
         self._instances: dict[str, TradingInstance] = {i.id: i for i in self.store.list()}
         self._runtime: dict[str, tuple[AutoStrategyEngine, PaperExecutionEngine, SignalPipeline, TradingControl]] = {}
         self._metric_fingerprints: dict[str, tuple] = {}
         self._lock = threading.RLock()
 
     def create(self, *, symbol: str, strategy_key: str, strategy_label: str, strategy_version: str,
-               timeframe: str, risk_per_trade_pct: float, capital_allocation: float, mode: str = "trading") -> TradingInstance:
+               timeframe: str, risk_per_trade_pct: float, capital_allocation: float, mode: str = "trading",
+               sizing_mode: str = "auto", fixed_position_size: float = 0.0,
+               entry_mode: str = "limit", fill_model: str = "PerfectFill") -> TradingInstance:
         if mode not in ("trading", "research"):
             raise ValueError("mode must be trading or research")
+        if sizing_mode not in ("auto", "fixed"):
+            raise ValueError("sizing_mode must be 'auto' or 'fixed'")
+        if sizing_mode == "fixed" and fixed_position_size <= 0:
+            raise ValueError("fixed_position_size must be greater than zero for fixed sizing")
+        if entry_mode not in ("limit", "market"):
+            raise ValueError("entry_mode must be 'limit' or 'market'")
+        if fill_model != "PerfectFill":
+            raise ValueError("PerfectFill is the only currently supported paper fill model")
+        if mode == "trading":
+            duplicate = next((item for item in self._instances.values()
+                              if item.mode == "trading" and item.symbol == symbol.upper()
+                              and item.strategy_key == strategy_key
+                              and item.strategy_version == (strategy_version or "builtin-1")
+                              and item.timeframe == timeframe and item.state in ("running", "paused", "reconnecting", "starting")), None)
+            if duplicate is not None:
+                raise ValueError("This Trading Instance is already active")
+            allocated = sum(item.capital_allocation for item in self._instances.values() if item.mode == "trading")
+            if allocated + capital_allocation > self.paper_account_capital + 1e-9:
+                available = max(0.0, self.paper_account_capital - allocated)
+                raise ValueError(f"Capital allocation exceeds paper account capacity; available {available:.2f}")
         inst = TradingInstance(id=_id(), symbol=symbol.upper(), strategy_key=strategy_key,
                                strategy_label=strategy_label, strategy_version=strategy_version or "builtin-1",
                                timeframe=timeframe, risk_per_trade_pct=risk_per_trade_pct,
-                               capital_allocation=capital_allocation, mode=mode,
+                               capital_allocation=capital_allocation, sizing_mode=sizing_mode,
+                               fixed_position_size=fixed_position_size, entry_mode=entry_mode,
+                               fill_model=fill_model, mode=mode,
                                market_data_mode="paper_forward" if mode == "trading" else "replay")
         self.store.create(inst); self._instances[inst.id] = inst
         return inst
@@ -396,8 +455,13 @@ class TradingInstanceManager:
             controls = TradingControl()
             engine_type = ResearchExecutionEngine if inst.mode == "research" else PaperExecutionEngine
             paper = engine_type(scoped, inst.capital_allocation)
+            # Ledger rows retain the immutable instance identity and a stable
+            # strategy/version attribution without borrowing legacy state.
+            paper.strategy_id = f"{inst.strategy_key}:{inst.strategy_version}"
             pipeline = SignalPipeline(scoped, paper, controls, equity=inst.capital_allocation,
-                                      risk_per_trade_pct=inst.risk_per_trade_pct, exposure_limit_pct=0.05)
+                                      risk_per_trade_pct=inst.risk_per_trade_pct, exposure_limit_pct=0.05,
+                                      position_sizing_mode=inst.sizing_mode,
+                                      fixed_position_size=inst.fixed_position_size)
             pipeline.global_entry_guard = lambda **kw: self._global_guard(instance_id, **kw)
             forward = inst.mode == "trading"
             market = self.store.market_state(instance_id) if forward else {}
@@ -421,18 +485,20 @@ class TradingInstanceManager:
                                         live=forward, live_poll_s=self.live_poll_s,
                                         fetcher=self.forward_fetcher if forward else self.fetcher,
                                         initial_last_processed_candle=market.get("last_processed_candle_timestamp"),
-                                        candle_checkpoint=checkpoint if forward else None)
+                                        candle_checkpoint=checkpoint if forward else None,
+                                        entry_mode=inst.entry_mode)
             engine.strategy_label = f"{inst.strategy_label} {inst.strategy_version}"
             engine.decisions = self.decision_store
             engine.start(); self._runtime[instance_id] = (engine, paper, pipeline, controls)
             inst.state, inst.desired_running, inst.last_error = "running", True, ""
+            inst.started_at, inst.stopped_at = _now(), None
             self.store.save(inst); return inst
 
     def stop(self, instance_id: str) -> TradingInstance:
         inst = self._instances[instance_id]
         runtime = self._runtime.get(instance_id)
         if runtime: runtime[0].stop("Stopped by instance operator")
-        inst.state, inst.desired_running = "stopped", False; self.store.save(inst); return inst
+        inst.state, inst.desired_running, inst.stopped_at = "stopped", False, _now(); self.store.save(inst); return inst
 
     def restart(self, instance_id: str) -> TradingInstance:
         self.stop(instance_id)
@@ -452,9 +518,46 @@ class TradingInstanceManager:
             return inst
         return self.start(instance_id)
 
+    def update_configuration(self, instance_id: str, *, capital_allocation: float | None = None,
+                             risk_per_trade_pct: float | None = None, sizing_mode: str | None = None,
+                             fixed_position_size: float | None = None, entry_mode: str | None = None) -> TradingInstance:
+        """Explicit edits for an inactive worker; identity remains immutable.
+
+        Changing a live worker's execution inputs mid-position makes its audit
+        trail ambiguous, so the operator must pause or stop it first.
+        """
+        with self._lock:
+            inst = self._instances[instance_id]
+            if inst.state in ("running", "reconnecting", "starting"):
+                raise ValueError("Pause or stop the instance before editing its configuration")
+            candidate_capital = float(capital_allocation if capital_allocation is not None else inst.capital_allocation)
+            if candidate_capital <= 0:
+                raise ValueError("capital_allocation must be greater than zero")
+            if risk_per_trade_pct is not None and not 0 < float(risk_per_trade_pct) <= 0.05:
+                raise ValueError("risk_per_trade_pct must be in (0, 0.05]")
+            candidate_mode = sizing_mode if sizing_mode is not None else inst.sizing_mode
+            if candidate_mode not in ("auto", "fixed"):
+                raise ValueError("sizing_mode must be 'auto' or 'fixed'")
+            candidate_fixed = float(fixed_position_size if fixed_position_size is not None else inst.fixed_position_size)
+            if candidate_fixed < 0 or (candidate_mode == "fixed" and candidate_fixed <= 0):
+                raise ValueError("fixed_position_size must be greater than zero for fixed sizing")
+            candidate_entry = entry_mode if entry_mode is not None else inst.entry_mode
+            if candidate_entry not in ("limit", "market"):
+                raise ValueError("entry_mode must be 'limit' or 'market'")
+            allocated_elsewhere = sum(item.capital_allocation for key, item in self._instances.items()
+                                      if key != instance_id and item.mode == "trading")
+            if inst.mode == "trading" and allocated_elsewhere + candidate_capital > self.paper_account_capital + 1e-9:
+                raise ValueError("Capital allocation exceeds paper account capacity")
+            inst.capital_allocation = candidate_capital
+            inst.risk_per_trade_pct = float(risk_per_trade_pct if risk_per_trade_pct is not None else inst.risk_per_trade_pct)
+            inst.sizing_mode, inst.fixed_position_size, inst.entry_mode = candidate_mode, candidate_fixed, candidate_entry
+            self.store.save(inst)
+            return inst
+
     def configure(self, *, max_active_slots: int | None = None,
                   max_global_risk_pct: float | None = None,
-                  max_global_daily_loss_pct: float | None = None) -> dict:
+                  max_global_daily_loss_pct: float | None = None,
+                  paper_account_capital: float | None = None) -> dict:
         if max_active_slots is not None:
             if not 1 <= int(max_active_slots) <= 3:
                 raise ValueError("max_active_slots must be between 1 and 3")
@@ -471,9 +574,17 @@ class TradingInstanceManager:
             if not 0.001 <= float(max_global_daily_loss_pct) <= 1:
                 raise ValueError("max_global_daily_loss_pct must be between 0.001 and 1")
             self.max_global_daily_loss_pct = float(max_global_daily_loss_pct)
+        if paper_account_capital is not None:
+            if float(paper_account_capital) <= 0:
+                raise ValueError("paper_account_capital must be greater than zero")
+            allocated = sum(item.capital_allocation for item in self._instances.values() if item.mode == "trading")
+            if float(paper_account_capital) < allocated:
+                raise ValueError("paper_account_capital cannot be below existing allocated capital")
+            self.paper_account_capital = float(paper_account_capital)
         self.store.save_platform_settings(max_active_slots=self.max_slots,
                                           max_global_risk_pct=self.max_global_risk_pct,
-                                          max_global_daily_loss_pct=self.max_global_daily_loss_pct)
+                                          max_global_daily_loss_pct=self.max_global_daily_loss_pct,
+                                          paper_account_capital=self.paper_account_capital)
         return self.platform_status()
 
     def platform_status(self) -> dict:
@@ -497,6 +608,7 @@ class TradingInstanceManager:
                            for row in runtime_states)
         available_capital = sum(float((row.get("execution") or {}).get("available_capital") or 0)
                                 for row in runtime_states)
+        account_available = max(0.0, self.paper_account_capital - allocated_capital)
         opened_or_closed_today = {str(t.get("id")) for t in instance_trades
                                   if str(t.get("opened_at") or "").startswith(today)
                                   or str(t.get("closed_at") or "").startswith(today)}
@@ -527,8 +639,12 @@ class TradingInstanceManager:
                 "instance_counts": {state: sum(1 for row in runtime_states if row.get("state") == state)
                                     for state in ("running", "paused", "stopped", "error")},
                 "total_allocated_capital": round(allocated_capital, 2),
+                "paper_account_capital": round(self.paper_account_capital, 2),
                 "total_current_equity": round(total_equity, 2),
-                "available_paper_capital": round(available_capital, 2),
+                # Allocation capacity is account-level.  Per-worker free cash
+                # remains separately visible for execution diagnostics.
+                "available_paper_capital": round(account_available, 2),
+                "worker_available_capital": round(available_capital, 2),
                 "today_pnl": round(today_pnl + unrealized, 2),
                 "today_realized_pnl": round(today_pnl, 2),
                 "today_unrealized_pnl": round(unrealized, 2),
@@ -729,7 +845,9 @@ class TradingInstanceManager:
             "strategy_key": inst.strategy_key, "strategy_version": inst.strategy_version,
             "timeframe": inst.timeframe, "capital_allocation": inst.capital_allocation,
             "risk_per_trade_pct": inst.risk_per_trade_pct,
-            "market_data_mode": inst.market_data_mode,
+            "sizing_mode": inst.sizing_mode, "fixed_position_size": inst.fixed_position_size,
+            "entry_mode": inst.entry_mode, "fill_model": inst.fill_model,
+            "execution_mode": inst.execution_mode, "market_data_mode": inst.market_data_mode,
         }
         return {**inst.to_dict(), "state": state, "engine": engine,
                 "configuration": configuration, "execution": execution,

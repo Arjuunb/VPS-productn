@@ -19,12 +19,25 @@ class InstanceCreate(BaseModel):
     risk_per_trade_pct: float = Field(0.005, gt=0, le=0.05)
     capital_allocation: float = Field(..., gt=0)
     mode: str = Field("trading")
+    sizing_mode: str = Field("auto")
+    fixed_position_size: float = Field(0.0, ge=0)
+    entry_mode: str = Field("limit")
+    fill_model: str = Field("PerfectFill")
+
+
+class InstanceUpdate(BaseModel):
+    capital_allocation: Optional[float] = Field(default=None, gt=0)
+    risk_per_trade_pct: Optional[float] = Field(default=None, gt=0, le=0.05)
+    sizing_mode: Optional[str] = None
+    fixed_position_size: Optional[float] = Field(default=None, ge=0)
+    entry_mode: Optional[str] = None
 
 
 class PlatformConfig(BaseModel):
     max_active_slots: Optional[int] = Field(default=None, ge=1, le=3)
     max_global_risk_pct: Optional[float] = Field(default=None, ge=0.001, le=1)
     max_global_daily_loss_pct: Optional[float] = Field(default=None, ge=0.001, le=1)
+    paper_account_capital: Optional[float] = Field(default=None, gt=0)
 
 
 def _catalog(key: str) -> dict:
@@ -73,6 +86,11 @@ def instance_options():
         "execution_defaults": {"position_sizing_mode": "auto", "entry_mode": "limit",
                                "fill_model": "PerfectFill", "leverage": None,
                                "max_open_positions": 3},
+        "sizing_modes": [
+            {"key": "auto", "label": "Dynamic Current Equity %", "implemented": True},
+            {"key": "fixed", "label": "Fixed Quantity", "implemented": True},
+            {"key": "fixed_starting_equity_pct", "label": "Fixed Starting Equity %", "implemented": False},
+        ],
         "market_data_mode": "paper_forward_live_only",
     }
 
@@ -98,7 +116,8 @@ def configure_platform(body: PlatformConfig, x_webhook_secret: Optional[str] = H
     try:
         return _manager().configure(max_active_slots=body.max_active_slots,
                                     max_global_risk_pct=body.max_global_risk_pct,
-                                    max_global_daily_loss_pct=body.max_global_daily_loss_pct)
+                                    max_global_daily_loss_pct=body.max_global_daily_loss_pct,
+                                    paper_account_capital=body.paper_account_capital)
     except ValueError as exc:
         raise HTTPException(409, str(exc))
 
@@ -134,7 +153,9 @@ def create_instance(body: InstanceCreate, x_webhook_secret: Optional[str] = Head
     inst = _manager().create(symbol=body.symbol, strategy_key=strategy["key"], strategy_label=strategy["label"],
                              strategy_version=body.strategy_version or strategy.get("version", "unversioned"), timeframe=body.timeframe,
                              risk_per_trade_pct=body.risk_per_trade_pct,
-                             capital_allocation=body.capital_allocation, mode=body.mode)
+                             capital_allocation=body.capital_allocation, mode=body.mode,
+                             sizing_mode=body.sizing_mode, fixed_position_size=body.fixed_position_size,
+                             entry_mode=body.entry_mode, fill_model=body.fill_model)
     _wa.ledger.log(level="info", stage="instance", message=f"Instance created: {inst.symbol} {inst.strategy_label} {inst.strategy_version}", symbol=inst.symbol)
     return {"instance": _manager().status(inst.id)}
 
@@ -148,6 +169,20 @@ def instance_leaderboard(sort: str = "realized_pnl"):
 def instance_detail(instance_id: str):
     try: return _manager().status(instance_id)
     except KeyError: raise HTTPException(404, "Trading instance not found")
+
+
+@router.patch("/instances/{instance_id}")
+def update_instance(instance_id: str, body: InstanceUpdate,
+                    x_webhook_secret: Optional[str] = Header(default=None)):
+    _wa._check_secret(x_webhook_secret)
+    try:
+        inst = _manager().update_configuration(
+            instance_id, capital_allocation=body.capital_allocation,
+            risk_per_trade_pct=body.risk_per_trade_pct, sizing_mode=body.sizing_mode,
+            fixed_position_size=body.fixed_position_size, entry_mode=body.entry_mode)
+        return {"instance": _manager().status(inst.id)}
+    except KeyError: raise HTTPException(404, "Trading instance not found")
+    except ValueError as exc: raise HTTPException(409, str(exc))
 
 
 @router.post("/instances/{instance_id}/{action}")

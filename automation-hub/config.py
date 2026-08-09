@@ -80,7 +80,10 @@ class Settings:
     dedup_window_s: int = field(default_factory=lambda: int(os.environ.get("HUB_DEDUP_WINDOW", "300")))
 
     # --- autonomous strategy engine (real signals -> paper execution) ---
-    auto_engine: bool = field(default_factory=lambda: os.environ.get("HUB_AUTO_ENGINE", "1") not in ("0", "false", ""))
+    # The legacy autonomous worker remains available for backward-compatible
+    # diagnostics, but Trading Instances are the production paper authority.
+    # It is therefore opt-in rather than unexpectedly starting beside them.
+    auto_engine: bool = field(default_factory=lambda: os.environ.get("HUB_AUTO_ENGINE", "0") not in ("0", "false", ""))
     auto_symbols: tuple = field(default_factory=lambda: tuple(
         s.strip() for s in os.environ.get("HUB_AUTO_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",") if s.strip()))
     auto_interval: float = field(default_factory=lambda: float(os.environ.get("HUB_AUTO_INTERVAL", "2.0")))
