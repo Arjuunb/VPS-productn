@@ -32,7 +32,7 @@ def _id() -> str:
 
 
 _TIMEFRAME_SECONDS = {
-    "1m": 60, "5m": 300, "15m": 900, "30m": 1800,
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
     "1h": 3600, "2h": 7200, "4h": 14400, "1d": 86400, "1w": 604800,
 }
 
@@ -92,6 +92,7 @@ class TradingInstance:
     timeframe: str
     risk_per_trade_pct: float
     capital_allocation: float
+    max_open_positions: int = 3
     # These execution values are persisted with the worker; legacy autonomous
     # engine settings are never consulted when an instance starts or restores.
     sizing_mode: str = "auto"
@@ -183,6 +184,7 @@ CREATE TABLE IF NOT EXISTS trading_instances (
  id TEXT PRIMARY KEY, symbol TEXT NOT NULL, strategy_key TEXT NOT NULL,
  strategy_label TEXT NOT NULL, strategy_version TEXT NOT NULL, timeframe TEXT NOT NULL,
  risk_per_trade_pct REAL NOT NULL, capital_allocation REAL NOT NULL,
+ max_open_positions INTEGER NOT NULL DEFAULT 3,
  sizing_mode TEXT NOT NULL DEFAULT 'auto', fixed_position_size REAL NOT NULL DEFAULT 0,
  entry_mode TEXT NOT NULL DEFAULT 'limit', fill_model TEXT NOT NULL DEFAULT 'PerfectFill',
  execution_mode TEXT NOT NULL DEFAULT 'paper',
@@ -232,6 +234,7 @@ class InstanceStore:
                     ("entry_mode", "TEXT NOT NULL DEFAULT 'limit'"),
                     ("fill_model", "TEXT NOT NULL DEFAULT 'PerfectFill'"),
                     ("execution_mode", "TEXT NOT NULL DEFAULT 'paper'"),
+                    ("max_open_positions", "INTEGER NOT NULL DEFAULT 3"),
                     ("started_at", "TEXT"),
                     ("stopped_at", "TEXT"),
                 ):
@@ -252,8 +255,8 @@ class InstanceStore:
         else:
             with self.ledger._lock:
                 self.ledger._c.execute("""INSERT INTO trading_instances
-                (id,symbol,strategy_key,strategy_label,strategy_version,timeframe,risk_per_trade_pct,capital_allocation,sizing_mode,fixed_position_size,entry_mode,fill_model,execution_mode,mode,market_data_mode,state,desired_running,created_at,started_at,stopped_at,updated_at,last_error)
-                VALUES (:id,:symbol,:strategy_key,:strategy_label,:strategy_version,:timeframe,:risk_per_trade_pct,:capital_allocation,:sizing_mode,:fixed_position_size,:entry_mode,:fill_model,:execution_mode,:mode,:market_data_mode,:state,:desired_running,:created_at,:started_at,:stopped_at,:updated_at,:last_error)""", row)
+                (id,symbol,strategy_key,strategy_label,strategy_version,timeframe,risk_per_trade_pct,capital_allocation,max_open_positions,sizing_mode,fixed_position_size,entry_mode,fill_model,execution_mode,mode,market_data_mode,state,desired_running,created_at,started_at,stopped_at,updated_at,last_error)
+                VALUES (:id,:symbol,:strategy_key,:strategy_label,:strategy_version,:timeframe,:risk_per_trade_pct,:capital_allocation,:max_open_positions,:sizing_mode,:fixed_position_size,:entry_mode,:fill_model,:execution_mode,:mode,:market_data_mode,:state,:desired_running,:created_at,:started_at,:stopped_at,:updated_at,:last_error)""", row)
                 self.ledger._c.commit()
 
     def list(self) -> list[TradingInstance]:
@@ -278,7 +281,11 @@ class InstanceStore:
             with self.ledger._lock:
                 self.ledger._c.execute(
                     """UPDATE trading_instances
-                    SET sizing_mode=:sizing_mode, fixed_position_size=:fixed_position_size,
+                    SET symbol=:symbol, strategy_key=:strategy_key, strategy_label=:strategy_label,
+                        strategy_version=:strategy_version, timeframe=:timeframe,
+                        risk_per_trade_pct=:risk_per_trade_pct, capital_allocation=:capital_allocation,
+                        max_open_positions=:max_open_positions,
+                        sizing_mode=:sizing_mode, fixed_position_size=:fixed_position_size,
                         entry_mode=:entry_mode, fill_model=:fill_model, execution_mode=:execution_mode,
                         market_data_mode=:market_data_mode, state=:state, desired_running=:desired_running,
                         started_at=:started_at, stopped_at=:stopped_at,
@@ -388,6 +395,7 @@ class TradingInstanceManager:
 
     def create(self, *, symbol: str, strategy_key: str, strategy_label: str, strategy_version: str,
                timeframe: str, risk_per_trade_pct: float, capital_allocation: float, mode: str = "trading",
+               max_open_positions: int = 3,
                sizing_mode: str = "auto", fixed_position_size: float = 0.0,
                entry_mode: str = "limit", fill_model: str = "PerfectFill") -> TradingInstance:
         if mode not in ("trading", "research"):
@@ -400,6 +408,8 @@ class TradingInstanceManager:
             raise ValueError("entry_mode must be 'limit' or 'market'")
         if fill_model != "PerfectFill":
             raise ValueError("PerfectFill is the only currently supported paper fill model")
+        if not 1 <= int(max_open_positions) <= 50:
+            raise ValueError("max_open_positions must be between 1 and 50")
         if mode == "trading":
             duplicate = next((item for item in self._instances.values()
                               if item.mode == "trading" and item.symbol == symbol.upper()
@@ -415,7 +425,8 @@ class TradingInstanceManager:
         inst = TradingInstance(id=_id(), symbol=symbol.upper(), strategy_key=strategy_key,
                                strategy_label=strategy_label, strategy_version=strategy_version or "builtin-1",
                                timeframe=timeframe, risk_per_trade_pct=risk_per_trade_pct,
-                               capital_allocation=capital_allocation, sizing_mode=sizing_mode,
+                               capital_allocation=capital_allocation, max_open_positions=int(max_open_positions),
+                               sizing_mode=sizing_mode,
                                fixed_position_size=fixed_position_size, entry_mode=entry_mode,
                                fill_model=fill_model, mode=mode,
                                market_data_mode="paper_forward" if mode == "trading" else "replay")
@@ -460,6 +471,7 @@ class TradingInstanceManager:
             paper.strategy_id = f"{inst.strategy_key}:{inst.strategy_version}"
             pipeline = SignalPipeline(scoped, paper, controls, equity=inst.capital_allocation,
                                       risk_per_trade_pct=inst.risk_per_trade_pct, exposure_limit_pct=0.05,
+                                      max_open_positions=inst.max_open_positions,
                                       position_sizing_mode=inst.sizing_mode,
                                       fixed_position_size=inst.fixed_position_size)
             pipeline.global_entry_guard = lambda **kw: self._global_guard(instance_id, **kw)
@@ -520,16 +532,22 @@ class TradingInstanceManager:
 
     def update_configuration(self, instance_id: str, *, capital_allocation: float | None = None,
                              risk_per_trade_pct: float | None = None, sizing_mode: str | None = None,
-                             fixed_position_size: float | None = None, entry_mode: str | None = None) -> TradingInstance:
-        """Explicit edits for an inactive worker; identity remains immutable.
+                             fixed_position_size: float | None = None, entry_mode: str | None = None,
+                             max_open_positions: int | None = None,
+                             strategy_key: str | None = None, strategy_label: str | None = None,
+                             strategy_version: str | None = None, timeframe: str | None = None) -> TradingInstance:
+        """Persist execution configuration and safely rebuild an active worker.
 
-        Changing a live worker's execution inputs mid-position makes its audit
-        trail ambiguous, so the operator must pause or stop it first.
+        Strategy/timeframe changes cannot mutate a running strategy object in
+        place. The manager therefore refuses edits while a position is open,
+        stops the worker, persists one authoritative configuration, and
+        restores its prior running/paused lifecycle state.
         """
         with self._lock:
             inst = self._instances[instance_id]
-            if inst.state in ("running", "reconnecting", "starting"):
-                raise ValueError("Pause or stop the instance before editing its configuration")
+            open_positions = InstanceLedger(self.ledger, instance_id).get_positions("open")
+            prior_state = inst.state
+            had_runtime = instance_id in self._runtime
             candidate_capital = float(capital_allocation if capital_allocation is not None else inst.capital_allocation)
             if candidate_capital <= 0:
                 raise ValueError("capital_allocation must be greater than zero")
@@ -544,14 +562,48 @@ class TradingInstanceManager:
             candidate_entry = entry_mode if entry_mode is not None else inst.entry_mode
             if candidate_entry not in ("limit", "market"):
                 raise ValueError("entry_mode must be 'limit' or 'market'")
+            candidate_max = int(max_open_positions if max_open_positions is not None else inst.max_open_positions)
+            if not 1 <= candidate_max <= 50:
+                raise ValueError("max_open_positions must be between 1 and 50")
             allocated_elsewhere = sum(item.capital_allocation for key, item in self._instances.items()
                                       if key != instance_id and item.mode == "trading")
             if inst.mode == "trading" and allocated_elsewhere + candidate_capital > self.paper_account_capital + 1e-9:
                 raise ValueError("Capital allocation exceeds paper account capacity")
+            rebuild_required = any(value is not None for value in (
+                capital_allocation, sizing_mode, fixed_position_size, entry_mode,
+                strategy_key, strategy_label, strategy_version, timeframe,
+            ))
+            if rebuild_required and open_positions:
+                raise ValueError("Close the instance's open position before changing execution configuration")
+            if len(open_positions) > candidate_max:
+                raise ValueError("max_open_positions cannot be below the instance's current open-position count")
+            if had_runtime and rebuild_required:
+                self.stop(instance_id)
             inst.capital_allocation = candidate_capital
             inst.risk_per_trade_pct = float(risk_per_trade_pct if risk_per_trade_pct is not None else inst.risk_per_trade_pct)
+            inst.max_open_positions = candidate_max
             inst.sizing_mode, inst.fixed_position_size, inst.entry_mode = candidate_mode, candidate_fixed, candidate_entry
+            inst.strategy_key = strategy_key or inst.strategy_key
+            inst.strategy_label = strategy_label or inst.strategy_label
+            inst.strategy_version = strategy_version or inst.strategy_version
+            inst.timeframe = timeframe or inst.timeframe
+            inst.last_error = ""
             self.store.save(inst)
+            if rebuild_required and prior_state in ("running", "reconnecting", "starting"):
+                self.start(instance_id)
+            elif rebuild_required and prior_state == "paused":
+                self.start(instance_id)
+                self.pause(instance_id)
+            elif had_runtime:
+                # Risk and position-cap changes affect future entries only and
+                # can be applied atomically without interrupting market data.
+                pipeline = self._runtime[instance_id][2]
+                pipeline.risk_per_trade_pct = inst.risk_per_trade_pct
+                pipeline.max_open_positions = inst.max_open_positions
+            self.ledger.log(level="info", stage="instance",
+                            message=(f"Instance configuration updated: {inst.symbol} "
+                                     f"{inst.strategy_label} {inst.strategy_version} {inst.timeframe}"),
+                            symbol=inst.symbol, instance_id=inst.id)
             return inst
 
     def configure(self, *, max_active_slots: int | None = None,
@@ -861,6 +913,7 @@ class TradingInstanceManager:
             "symbol": inst.symbol, "strategy": inst.strategy_label,
             "strategy_key": inst.strategy_key, "strategy_version": inst.strategy_version,
             "timeframe": inst.timeframe, "capital_allocation": inst.capital_allocation,
+            "max_open_positions": inst.max_open_positions,
             "risk_per_trade_pct": inst.risk_per_trade_pct,
             "sizing_mode": inst.sizing_mode, "fixed_position_size": inst.fixed_position_size,
             "entry_mode": inst.entry_mode, "fill_model": inst.fill_model,

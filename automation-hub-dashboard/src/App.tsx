@@ -48,6 +48,9 @@ export default function App() {
   const [collapsed, setCollapsed] = useState(false);
   const [mobileNav, setMobileNav] = useState(false);   // off-canvas drawer (small screens)
   const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const [selectedInstanceId, setSelectedInstanceId] = useState<string | null>(() => {
+    try { return localStorage.getItem("tradexa.selectedInstanceId"); } catch { return null; }
+  });
   const active = route.page;
 
   const toast = (msg: string, tone: "success" | "error" | "info" = "info") => {
@@ -82,7 +85,11 @@ export default function App() {
 
   const go = (page: string) => { window.location.hash = "/" + slug(page); setMobileNav(false); };
   const viewBot = (id: string) => { window.location.hash = "/bot/" + id; setMobileNav(false); };
-  const viewInstance = (id: string) => { window.location.hash = "/instance/" + id; setMobileNav(false); };
+  const selectInstance = (id: string) => {
+    setSelectedInstanceId(id);
+    try { localStorage.setItem("tradexa.selectedInstanceId", id); } catch { /* private mode */ }
+  };
+  const viewInstance = (id: string) => { selectInstance(id); window.location.hash = "/instance/" + id; setMobileNav(false); };
 
   const renderPage = () => {
     switch (active) {
@@ -129,7 +136,7 @@ export default function App() {
   const title = active === "BotDetail" ? route.botId : active;
 
   return (
-    <AppContext.Provider value={{ go, viewBot, viewInstance, toast }}>
+    <AppContext.Provider value={{ go, viewBot, viewInstance, selectedInstanceId, selectInstance, toast }}>
       <div className={`app ${collapsed ? "sidebar-collapsed" : ""} ${mobileNav ? "mobile-nav-open" : ""}`}>
         <Toasts items={toasts} />
         {mobileNav && <div className="nav-backdrop" onClick={() => setMobileNav(false)} aria-hidden />}

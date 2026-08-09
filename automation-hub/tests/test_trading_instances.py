@@ -141,7 +141,7 @@ def test_worker_start_uses_persisted_instance_execution_not_legacy_runtime(monke
     instance = manager.create(symbol="ETHUSDT", strategy_key="ema", strategy_label="EMA Crossover",
                               strategy_version="v2", timeframe="15m", risk_per_trade_pct=0.01,
                               capital_allocation=800, sizing_mode="fixed", fixed_position_size=3.0,
-                              entry_mode="market")
+                              entry_mode="market", max_open_positions=1)
     monkeypatch.setattr(AutoStrategyEngine, "start", lambda self: True)
     manager.start(instance.id)
     engine, _paper, pipeline, _controls = manager._runtime[instance.id]
@@ -150,6 +150,52 @@ def test_worker_start_uses_persisted_instance_execution_not_legacy_runtime(monke
     assert engine.entry_mode == "market"
     assert pipeline.position_sizing_mode == "fixed"
     assert pipeline.fixed_position_size == 3.0
+    assert pipeline.max_open_positions == 1
+
+
+def test_instance_quick_configuration_persists_and_rebuilds_running_worker(monkeypatch):
+    from services.auto_engine import AutoStrategyEngine
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
+    instance = manager.create(symbol="BTCUSDT", strategy_key="brain", strategy_label="Decision Brain",
+                              strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+                              capital_allocation=1_000, max_open_positions=3)
+    monkeypatch.setattr(AutoStrategyEngine, "start", lambda self: (setattr(self, "running", True), setattr(self, "lifecycle_state", "running"), True)[-1])
+    manager.start(instance.id)
+
+    updated = manager.update_configuration(
+        instance.id, strategy_key="ema", strategy_label="EMA Crossover",
+        strategy_version="v2", timeframe="15m", risk_per_trade_pct=0.0075,
+        capital_allocation=900, max_open_positions=1,
+    )
+
+    assert updated.state == "running"
+    status = manager.status(instance.id)
+    assert status["configuration"]["strategy_key"] == "ema"
+    assert status["configuration"]["strategy_version"] == "v2"
+    assert status["configuration"]["timeframe"] == "15m"
+    assert status["configuration"]["risk_per_trade_pct"] == 0.0075
+    assert status["configuration"]["capital_allocation"] == 900
+    assert status["configuration"]["max_open_positions"] == 1
+    assert status["execution"]["max_open_positions"] == 1
+
+    reloaded = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
+    saved = reloaded.status(instance.id)["configuration"]
+    assert saved["strategy_key"] == "ema"
+    assert saved["timeframe"] == "15m"
+    assert saved["max_open_positions"] == 1
+
+
+def test_instance_quick_configuration_refuses_changes_with_open_position():
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
+    instance = manager.create(symbol="BTCUSDT", strategy_key="brain", strategy_label="Decision Brain",
+                              strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+                              capital_allocation=1_000)
+    InstanceLedger(ledger, instance.id).open_position(symbol="BTCUSDT", side="long", size=0.1, entry=100, stop=95)
+
+    with pytest.raises(ValueError, match="Close the instance's open position"):
+        manager.update_configuration(instance.id, timeframe="15m")
 
 
 def test_instances_start_and_stop_independently_and_slot_limit_is_backend_enforced(monkeypatch):

@@ -376,6 +376,7 @@ export interface AlertRow {
 }
 export interface EngineStatus {
   running: boolean; symbols: string[]; timeframe: string; interval: number;
+  current_symbol?: string | null;
   strategy?: string; entry_mode?: string;
   started_at: string | null; bars: number; signals: number; trades: number; rejections: number;
   state?: "running" | "starting" | "paused" | "stopped" | "error" | "reconnecting";

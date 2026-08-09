@@ -91,7 +91,8 @@ export default function ActiveTradingInstances() {
   const snapshot = instances.data;
   // Running, paused, starting, reconnecting and error states all deserve
   // visibility. Stopped historical instances live on the dedicated page.
-  const active = (snapshot?.instances ?? []).filter((instance) => instance.state !== "stopped");
+  const active = (snapshot?.instances ?? []).filter((instance) => instance.state !== "stopped")
+    .sort((a, b) => Number(b.id === app.selectedInstanceId) - Number(a.id === app.selectedInstanceId));
   const pause = async (id: string) => {
     try { await apiPost(`/instances/${id}/pause`); instances.refetch(); app.toast("Trading instance paused", "success"); }
     catch (error) { app.toast(error instanceof Error ? error.message : "Could not pause instance", "error"); }

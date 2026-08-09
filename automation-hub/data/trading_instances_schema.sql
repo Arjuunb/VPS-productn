@@ -23,6 +23,7 @@ ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS fill_model TEXT NOT NULL 
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS execution_mode TEXT NOT NULL DEFAULT 'paper';
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
 ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS stopped_at TIMESTAMPTZ;
+ALTER TABLE trading_instances ADD COLUMN IF NOT EXISTS max_open_positions INTEGER NOT NULL DEFAULT 3;
 CREATE TABLE IF NOT EXISTS instance_metrics (
  instance_id TEXT PRIMARY KEY REFERENCES trading_instances(id) ON DELETE CASCADE,
  data_json JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL

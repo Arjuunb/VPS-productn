@@ -2,6 +2,7 @@ import Icon from "../common/Icon";
 import Sparkline from "../chart/Sparkline";
 import { Badge } from "../common/ui";
 import { useLive } from "../../lib/api";
+import { useApp } from "../../app-context";
 
 const money = (n: number) => `${n >= 0 ? "+" : "-"}$${Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
 const usd = (n: number) => `$${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
@@ -9,10 +10,12 @@ const usd = (n: number) => `$${n.toLocaleString(undefined, { maximumFractionDigi
 /** Tradexa command-center hero — live account equity, P&L, engine state and a
  *  mini equity curve in one premium banner. Real backend data only. */
 export default function DashboardHero() {
+  const app = useApp();
   const instances = useLive<any>("/instances", 2000);
   const snapshot = instances.data;
   const running = (snapshot?.instances ?? []).filter((row: any) => row.state === "running");
-  const curve = (running[0]?.performance?.equity_curve ?? []).map((p: any) => p.equity);
+  const selected = (snapshot?.instances ?? []).find((row: any) => row.id === app.selectedInstanceId) ?? running[0];
+  const curve = (selected?.performance?.equity_curve ?? []).map((p: any) => p.equity);
   const pnl = snapshot?.today_pnl ?? 0;
   const exposure = snapshot?.max_global_risk_amount ? snapshot.current_global_risk_amount / snapshot.max_global_risk_amount * 100 : 0;
   const expTone = exposure >= 90 ? "red" : exposure >= 60 ? "amber" : "green";
@@ -29,7 +32,7 @@ export default function DashboardHero() {
             <span className={`dot ${running.length ? "online" : "offline"}`} /> {running.length} instance{running.length === 1 ? "" : "s"} running
           </span>
           <span className="hero-dot" />
-          <span className="dim">{running.map((row: any) => `${row.symbol} · ${row.strategy_label} · ${row.timeframe}`).join("  |  ") || "No active Trading Instance"}</span>
+          <span className="dim">{selected ? `${selected.symbol} · ${selected.strategy_label} · ${selected.timeframe}` : "No active Trading Instance"}</span>
         </div>
       </div>
 

@@ -7,6 +7,9 @@ export interface AppApi {
   viewBot: (id: string) => void;
   /** Open one isolated Trading Instance (route #/instance/<id>). */
   viewInstance: (id: string) => void;
+  /** Dashboard/header context. Persisted locally; execution state remains server-owned. */
+  selectedInstanceId: string | null;
+  selectInstance: (id: string) => void;
   /** Show a transient toast notification. */
   toast: (msg: string, tone?: "success" | "error" | "info") => void;
 }
@@ -15,6 +18,8 @@ export const AppContext = createContext<AppApi>({
   go: () => {},
   viewBot: () => {},
   viewInstance: () => {},
+  selectedInstanceId: null,
+  selectInstance: () => {},
   toast: () => {},
 });
 

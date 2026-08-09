@@ -23,6 +23,7 @@ class InstanceCreate(BaseModel):
     fixed_position_size: float = Field(0.0, ge=0)
     entry_mode: str = Field("limit")
     fill_model: str = Field("PerfectFill")
+    max_open_positions: int = Field(3, ge=1, le=50)
 
 
 class InstanceUpdate(BaseModel):
@@ -31,6 +32,10 @@ class InstanceUpdate(BaseModel):
     sizing_mode: Optional[str] = None
     fixed_position_size: Optional[float] = Field(default=None, ge=0)
     entry_mode: Optional[str] = None
+    max_open_positions: Optional[int] = Field(default=None, ge=1, le=50)
+    strategy: Optional[str] = Field(default=None, min_length=1)
+    strategy_version: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    timeframe: Optional[str] = Field(default=None, min_length=2, max_length=8)
 
 
 class PlatformConfig(BaseModel):
@@ -85,7 +90,7 @@ def instance_options():
         # and can become persisted options in a later additive migration.
         "execution_defaults": {"position_sizing_mode": "auto", "entry_mode": "limit",
                                "fill_model": "PerfectFill", "leverage": None,
-                               "max_open_positions": 3},
+                               "max_open_positions": 3, "max_quick_risk_pct": 0.01},
         "sizing_modes": [
             {"key": "auto", "label": "Dynamic Current Equity %", "implemented": True},
             {"key": "fixed", "label": "Fixed Quantity", "implemented": True},
@@ -155,7 +160,8 @@ def create_instance(body: InstanceCreate, x_webhook_secret: Optional[str] = Head
                              risk_per_trade_pct=body.risk_per_trade_pct,
                              capital_allocation=body.capital_allocation, mode=body.mode,
                              sizing_mode=body.sizing_mode, fixed_position_size=body.fixed_position_size,
-                             entry_mode=body.entry_mode, fill_model=body.fill_model)
+                             entry_mode=body.entry_mode, fill_model=body.fill_model,
+                             max_open_positions=body.max_open_positions)
     _wa.ledger.log(level="info", stage="instance", message=f"Instance created: {inst.symbol} {inst.strategy_label} {inst.strategy_version}", symbol=inst.symbol)
     return {"instance": _manager().status(inst.id)}
 
@@ -176,10 +182,25 @@ def update_instance(instance_id: str, body: InstanceUpdate,
                     x_webhook_secret: Optional[str] = Header(default=None)):
     _wa._check_secret(x_webhook_secret)
     try:
+        strategy = _catalog(body.strategy) if body.strategy is not None else None
+        if body.timeframe is not None:
+            from data.historical import TIMEFRAMES
+            if body.timeframe not in TIMEFRAMES:
+                raise HTTPException(400, f"Unsupported timeframe '{body.timeframe}'")
+        if strategy is not None and body.strategy_version is not None:
+            valid_versions = next((row["versions"] for row in instance_options()["strategies"]
+                                   if row["key"] == strategy["key"]), [])
+            if body.strategy_version not in valid_versions:
+                raise HTTPException(400, f"Unknown version '{body.strategy_version}' for {strategy['label']}")
         inst = _manager().update_configuration(
             instance_id, capital_allocation=body.capital_allocation,
             risk_per_trade_pct=body.risk_per_trade_pct, sizing_mode=body.sizing_mode,
-            fixed_position_size=body.fixed_position_size, entry_mode=body.entry_mode)
+            fixed_position_size=body.fixed_position_size, entry_mode=body.entry_mode,
+            max_open_positions=body.max_open_positions,
+            strategy_key=strategy["key"] if strategy else None,
+            strategy_label=strategy["label"] if strategy else None,
+            strategy_version=(body.strategy_version or strategy.get("version")) if strategy else None,
+            timeframe=body.timeframe)
         return {"instance": _manager().status(inst.id)}
     except KeyError: raise HTTPException(404, "Trading instance not found")
     except ValueError as exc: raise HTTPException(409, str(exc))

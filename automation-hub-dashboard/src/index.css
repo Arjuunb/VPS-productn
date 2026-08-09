@@ -1002,13 +1002,14 @@ a.brand:hover { opacity: 0.85; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* ── Interactive header control strip (terminal-style) ─────────────────── */
-.hdr-controls { display: flex; align-items: center; gap: 6px; min-width: 0; flex-wrap: nowrap; }
+.hdr-controls { display: flex; align-items: center; justify-content: center; gap: 6px; min-width: 0;
+  flex: 1 1 auto; flex-wrap: nowrap; margin: 0 12px; }
 .hdr-seg { position: relative; }
 .hdr-static { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px;
   color: var(--text-dim); padding: 6px 8px; white-space: nowrap; }
-.hdr-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px;
+.hdr-chip { height: 32px; display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px;
   color: var(--text); background: rgba(255,255,255,0.03); border: 1px solid var(--line, #26262b);
-  border-radius: 9px; padding: 6px 10px; cursor: pointer; white-space: nowrap;
+  border-radius: 8px; padding: 0 10px; cursor: pointer; white-space: nowrap;
   transition: border-color .18s ease, box-shadow .18s ease, background .18s ease; }
 .hdr-chip:hover, .hdr-chip.open { border-color: rgba(234,181,79,0.45);
   background: rgba(234,181,79,0.06); box-shadow: 0 0 0 1px rgba(234,181,79,0.12), 0 0 14px rgba(234,181,79,0.10); }
@@ -1016,6 +1017,12 @@ a.brand:hover { opacity: 0.85; }
 .hdr-caret { transition: transform .18s ease; }
 .hdr-chip.open .hdr-caret { transform: rotate(180deg); }
 .hdr-gear { padding: 6px 8px; }
+.hdr-chip b { font-weight: 650; text-transform: none; }
+.hdr-instance-copy { min-width: 0; display: grid; gap: 2px; flex: 1; }
+.hdr-instance-copy b { font-family: var(--mono, monospace); }
+.hdr-instance-copy small { color: var(--text-dim); font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; }
+.state-label { text-transform: capitalize !important; }
+.quick-more { display: none; }
 
 .hdr-pop { position: absolute; top: calc(100% + 8px); left: 0; z-index: 1200;
   min-width: 260px; max-width: min(380px, 92vw); padding: 12px;
@@ -1045,6 +1052,7 @@ a.brand:hover { opacity: 0.85; }
 .hdr-item:hover:not(:disabled) { background: rgba(255,255,255,0.05); }
 .hdr-item:disabled { opacity: .45; cursor: not-allowed; }
 .hdr-item.active { border-color: rgba(234,181,79,0.35); background: rgba(234,181,79,0.07); }
+.hdr-item.danger { color: var(--red); }
 .hdr-item b { flex: 1; font-weight: 600; }
 .hdr-tag { font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
   padding: 2px 7px; border-radius: 6px; background: rgba(234,181,79,0.16); color: var(--gold); }
@@ -1058,6 +1066,13 @@ a.brand:hover { opacity: 0.85; }
 .hdr-form input:focus, .hdr-form select:focus { outline: none; border-color: rgba(234,181,79,0.5); }
 .hdr-inline { display: flex; align-items: center; gap: 7px; }
 .hdr-inline input { width: 84px; }
+.hdr-quick-form { margin-top: 10px; }
+.hdr-choice-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; }
+.hdr-overflow-form { display: grid; grid-template-columns: 1fr 90px auto; align-items: center; gap: 8px;
+  padding: 7px 0; border-bottom: 1px solid var(--card-border-soft); font-size: 12px; }
+.hdr-overflow-form:last-child { border-bottom: 0; }
+.hdr-overflow-form input { min-width: 0; width: 100%; color: var(--text); background: #0d0d10;
+  border: 1px solid var(--line, #26262b); border-radius: 7px; padding: 6px 7px; }
 .hdr-check { display: flex !important; flex-direction: row; align-items: center; gap: 8px;
   color: var(--text) !important; font-size: 12.5px !important; cursor: pointer; }
 .hdr-check input { width: auto !important; accent-color: var(--gold); }
@@ -1073,10 +1088,45 @@ a.brand:hover { opacity: 0.85; }
 .hdr-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px;
   position: sticky; bottom: 0; background: #121216; padding-top: 8px; }
 
+.command-trigger { flex: none; font-family: var(--mono, monospace); color: var(--text-dim); }
+.command-overlay { position: fixed; inset: 0; z-index: 1600; display: grid; place-items: start center;
+  padding-top: min(16vh, 150px); background: rgba(4,4,6,.62); backdrop-filter: blur(4px); }
+.command-palette { width: min(620px, calc(100vw - 24px)); overflow: hidden; background: #121216;
+  border: 1px solid rgba(234,181,79,.28); border-radius: 12px; box-shadow: 0 24px 70px rgba(0,0,0,.7); }
+.command-search { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--card-border); }
+.command-search input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text); font-size: 14px; }
+.command-list { max-height: min(52vh, 470px); overflow: auto; padding: 6px; }
+.command-list button { display: flex; align-items: center; justify-content: space-between; gap: 14px; width: 100%;
+  border: 0; border-radius: 7px; padding: 9px 10px; color: var(--text); background: transparent; text-align: left; }
+.command-list button:hover, .command-list button:focus-visible { outline: 0; background: rgba(234,181,79,.09); }
+.command-list button span { color: var(--text-dim); font-size: 11px; }
+.command-foot { display: flex; justify-content: flex-end; gap: 16px; padding: 8px 12px; border-top: 1px solid var(--card-border);
+  color: var(--text-dim); font-size: 10.5px; }
+
+@media (max-width: 1600px) {
+  .quick-secondary { display: none; }
+  .quick-more { display: block; }
+}
+@media (max-width: 1350px) {
+  .quick-risk { display: none; }
+  .more-risk { display: grid; }
+  .topbar { padding-inline: 12px; }
+  .topbar-left .page-title { display: none; }
+}
+@media (min-width: 1351px) { .hdr-overflow-form.more-risk { display: none; } }
+@media (max-width: 1120px) {
+  .quick-controls b { display: none; }
+  .quick-controls .hdr-chip { padding-inline: 9px; }
+  .quick-strategy .hdr-chip b { max-width: 125px; overflow: hidden; text-overflow: ellipsis; }
+}
+
 @media (max-width: 900px) {
   .hide-sm { display: none; }
   .hdr-chip { padding: 6px 8px; }
   .hdr-pop { position: fixed; left: 10px !important; right: 10px !important; top: 58px; max-width: none; }
+  .topbar-left .page-title { display: none; }
+  .hdr-controls { margin-inline: 6px; gap: 4px; justify-content: flex-start; overflow-x: auto; scrollbar-width: none; }
+  .hdr-controls::-webkit-scrollbar { display: none; }
 }
 
 /* ── Trading Mode & Approvals (§7 + §11) ──────────────────────────────── */
