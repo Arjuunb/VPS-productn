@@ -660,15 +660,32 @@ class TradingInstanceManager:
         """Restore independently desired workers after an application restart.
 
         A browser session is deliberately irrelevant here: the persisted
-        server-owned desired state decides whether an instance resumes.
+        server-owned desired state decides whether an instance resumes.  Older
+        deployments could persist more desired workers than the current
+        platform slot limit.  Restore the earliest requested workers only and
+        leave the remainder visibly paused for an operator to start after
+        freeing a slot; never silently exceed the account-level limit.
         """
         restored: list[str] = []
+        restored_trading = 0
         for inst in sorted(self._instances.values(), key=lambda item: item.created_at):
             if not inst.desired_running:
+                continue
+            if inst.mode == "trading" and restored_trading >= self.max_slots:
+                inst.state = "paused"
+                inst.desired_running = False
+                inst.last_error = (
+                    f"Not restored: maximum active trading slots reached ({self.max_slots}). "
+                    "Stop another instance before starting this one."
+                )
+                inst.stopped_at = _now()
+                self.store.save(inst)
                 continue
             try:
                 self.start(inst.id)
                 restored.append(inst.id)
+                if inst.mode == "trading":
+                    restored_trading += 1
             except Exception as exc:  # one broken instance cannot block others
                 inst.state, inst.last_error, inst.desired_running = "error", str(exc)[:500], False
                 self.store.save(inst)

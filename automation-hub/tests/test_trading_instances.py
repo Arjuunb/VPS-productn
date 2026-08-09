@@ -170,3 +170,28 @@ def test_instances_start_and_stop_independently_and_slot_limit_is_backend_enforc
     manager.stop(one.id)
     assert manager.status(one.id)["state"] == "stopped"
     assert manager.status(two.id)["state"] == "running"
+
+
+def test_restore_never_exceeds_the_persisted_active_slot_limit(monkeypatch):
+    from services.auto_engine import AutoStrategyEngine
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
+    manager.configure(max_active_slots=2)
+    for symbol, strategy in (("BTCUSDT", "brain"), ("ETHUSDT", "ema"), ("SOLUSDT", "donchian")):
+        instance = manager.create(symbol=symbol, strategy_key=strategy, strategy_label=strategy,
+                                  strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+                                  capital_allocation=500)
+        instance.state, instance.desired_running = "running", True
+        manager.store.save(instance)
+
+    reloaded = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
+    monkeypatch.setattr(AutoStrategyEngine, "start", lambda self: (setattr(self, "running", True), setattr(self, "lifecycle_state", "running"), True)[-1])
+
+    restored = reloaded.restore_desired_instances()
+
+    assert len(restored) == 2
+    rows = reloaded.list()
+    assert sum(row["state"] == "running" for row in rows) == 2
+    paused = [row for row in rows if row["state"] == "paused"]
+    assert len(paused) == 1
+    assert "maximum active trading slots" in paused[0]["last_error"]
