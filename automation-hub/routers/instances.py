@@ -112,7 +112,8 @@ def _start_instance(manager, instance_id: str, *, restart: bool = False):
 @router.get("/instances")
 def list_instances():
     manager = _manager()
-    return {"instances": manager.list(), **manager.platform_status()}
+    rows = manager.list()
+    return {"instances": rows, **manager.platform_status(runtime_states=rows)}
 
 
 @router.post("/instances/platform")
@@ -247,7 +248,7 @@ def instance_trades(instance_id: str):
     manager = _manager()
     try: manager.status(instance_id)
     except KeyError: raise HTTPException(404, "Trading instance not found")
-    return {"trades": [t for t in _wa.ledger.get_paper_trades() if t.get("instance_id") == instance_id]}
+    return {"trades": _wa.ledger.get_paper_trades(instance_id=instance_id)}
 
 
 @router.get("/instances/{instance_id}/logs")
@@ -255,4 +256,4 @@ def instance_logs(instance_id: str, limit: int = 100):
     manager = _manager()
     try: manager.status(instance_id)
     except KeyError: raise HTTPException(404, "Trading instance not found")
-    return {"logs": [r for r in _wa.ledger.get_logs(max(1, min(limit * 5, 500))) if r.get("instance_id") == instance_id][:limit]}
+    return {"logs": _wa.ledger.get_logs(max(1, min(limit, 500)), instance_id=instance_id)}

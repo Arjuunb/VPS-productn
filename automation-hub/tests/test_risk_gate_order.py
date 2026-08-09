@@ -64,6 +64,8 @@ EXPECTED_GATE_ORDER = [
     "exposure",
     "portfolio_exposure",
     "risk_engine",          # the standalone RiskEngine's mandatory veto — ADDED
+    "global_risk",          # account-level guard unavailable (fail closed)
+    "global_risk",          # account-level limit denied the entry
     "execution",            # rejected at fill
 ]
 

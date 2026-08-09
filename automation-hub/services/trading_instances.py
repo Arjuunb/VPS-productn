@@ -13,7 +13,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
-from data.ledger import Ledger, SqliteLedger
+from data.ledger import Ledger, SqliteLedger, remote_call_with_retry
 from data.tenant_scope import ensure_column
 from execution.paper_engine import FillResult, PaperExecutionEngine
 from services.auto_engine import AutoStrategyEngine
@@ -140,8 +140,7 @@ class InstanceLedger:
         return self._ledger.open_position(**kw, instance_id=self.instance_id)
 
     def get_positions(self, status=None):
-        return [p for p in self._ledger.get_positions(status)
-                if p.get("instance_id") == self.instance_id]
+        return self._ledger.get_positions(status, instance_id=self.instance_id)
 
     def update_position_stop(self, *, symbol, stop):
         return self._ledger.update_position_stop(symbol=symbol, stop=stop, instance_id=self.instance_id)
@@ -151,15 +150,14 @@ class InstanceLedger:
         return self._ledger.record_paper_trade(row)
 
     def get_paper_trades(self):
-        return [t for t in self._ledger.get_paper_trades() if t.get("instance_id") == self.instance_id]
+        return self._ledger.get_paper_trades(instance_id=self.instance_id)
 
     def log(self, *, level, stage, message, symbol=""):
         return self._ledger.log(level=level, stage=stage, message=message, symbol=symbol,
                                 instance_id=self.instance_id)
 
     def get_logs(self, limit=200):
-        return [r for r in self._ledger.get_logs(max(limit * 5, 500))
-                if r.get("instance_id") == self.instance_id][:limit]
+        return self._ledger.get_logs(limit, instance_id=self.instance_id)
 
     def add_alert(self, *, severity, category, title, detail=""):
         return self._ledger.add_alert(severity=severity, category=category, title=title,
@@ -284,7 +282,8 @@ class InstanceStore:
             return
         for table, columns in self._REMOTE_SCHEMA.items():
             try:
-                self._table(table).select(",".join(columns)).limit(1).execute()
+                remote_call_with_retry(lambda table=table, columns=columns:
+                                       self._table(table).select(",".join(columns)).limit(1).execute())
             except Exception as exc:
                 self.available = False
                 self.error = (
@@ -312,7 +311,8 @@ class InstanceStore:
     def delete(self, instance_id: str) -> None:
         """Delete one configuration and its instance-owned auxiliary state."""
         if self.remote:
-            self._table("trading_instances").delete().eq("id", instance_id).execute()
+            remote_call_with_retry(lambda: self._table("trading_instances")
+                                   .delete().eq("id", instance_id).execute())
             return
         with self.ledger._lock:
             for table in ("instance_market_state", "instance_metrics", "instance_engine_logs"):
@@ -323,7 +323,8 @@ class InstanceStore:
     def list(self) -> list[TradingInstance]:
         if self.remote:
             try:
-                rows = self._table("trading_instances").select("*").order("created_at", desc=True).execute().data
+                rows = remote_call_with_retry(lambda: self._table("trading_instances")
+                                              .select("*").order("created_at", desc=True).execute()).data
             except Exception as exc:
                 self.available = False
                 self.error = "Trading instance tables are not installed in Supabase; run data/trading_instances_schema.sql"
@@ -337,7 +338,8 @@ class InstanceStore:
         instance.updated_at = _now()
         row = instance.to_dict()
         if self.remote:
-            self._table("trading_instances").update(row).eq("id", instance.id).execute()
+            remote_call_with_retry(lambda: self._table("trading_instances")
+                                   .update(row).eq("id", instance.id).execute())
         else:
             with self.ledger._lock:
                 self.ledger._c.execute(
@@ -362,7 +364,8 @@ class InstanceStore:
                     "out_of_order_candles": 0, "pending_orders_json": {}}
         try:
             if self.remote:
-                rows = self._table("instance_market_state").select("*").eq("instance_id", instance_id).execute().data
+                rows = remote_call_with_retry(lambda: self._table("instance_market_state")
+                                              .select("*").eq("instance_id", instance_id).execute()).data
                 return {**defaults, **(rows[0] if rows else {})}
             with self.ledger._lock:
                 row = self.ledger._c.execute("SELECT * FROM instance_market_state WHERE instance_id=?", (instance_id,)).fetchone()
@@ -382,7 +385,7 @@ class InstanceStore:
                "warmup_bars": 0, "duplicate_candles": 0, "missing_candles": 0,
                "out_of_order_candles": 0, "updated_at": _now(), **values}
         if self.remote:
-            self._table("instance_market_state").upsert(row).execute()
+            remote_call_with_retry(lambda: self._table("instance_market_state").upsert(row).execute())
         else:
             with self.ledger._lock:
                 self.ledger._c.execute("""INSERT INTO instance_market_state
@@ -404,7 +407,8 @@ class InstanceStore:
     def save_pending_orders(self, instance_id: str, pending_orders: dict) -> None:
         row = {"pending_orders_json": pending_orders, "updated_at": _now()}
         if self.remote:
-            self._table("instance_market_state").update(row).eq("instance_id", instance_id).execute()
+            remote_call_with_retry(lambda: self._table("instance_market_state")
+                                   .update(row).eq("instance_id", instance_id).execute())
             return
         with self.ledger._lock:
             self.ledger._c.execute(
@@ -419,7 +423,8 @@ class InstanceStore:
             # PostgREST accepts a Python dict for JSONB.  A JSON *string* is a
             # JSON string value, not the metrics object, and would make the
             # remote data unusable for future analytics queries.
-            self._table("instance_metrics").upsert({**row, "data_json": metrics}).execute()
+            remote_call_with_retry(lambda: self._table("instance_metrics")
+                                   .upsert({**row, "data_json": metrics}).execute())
         else:
             with self.ledger._lock:
                 self.ledger._c.execute("INSERT OR REPLACE INTO instance_metrics(instance_id,data_json,updated_at) VALUES (:instance_id,:data_json,:updated_at)", row)
@@ -430,7 +435,8 @@ class InstanceStore:
                     "max_global_daily_loss_pct": 0.05, "paper_account_capital": None}
         if self.remote:
             try:
-                rows = self._table("trading_instance_platform_settings").select("*").eq("id", "default").execute().data
+                rows = remote_call_with_retry(lambda: self._table("trading_instance_platform_settings")
+                                              .select("*").eq("id", "default").execute()).data
                 return {**defaults, **(rows[0] if rows else {})}
             except Exception as exc:
                 self.available = False
@@ -447,7 +453,8 @@ class InstanceStore:
                "max_global_daily_loss_pct": max_global_daily_loss_pct,
                "paper_account_capital": paper_account_capital, "updated_at": _now()}
         if self.remote:
-            self._table("trading_instance_platform_settings").upsert(row).execute()
+            remote_call_with_retry(lambda: self._table("trading_instance_platform_settings")
+                                   .upsert(row).execute())
         else:
             with self.ledger._lock:
                 self.ledger._c.execute("""INSERT OR REPLACE INTO trading_instance_platform_settings
@@ -761,7 +768,7 @@ class TradingInstanceManager:
                                           paper_account_capital=self.paper_account_capital)
         return self.platform_status()
 
-    def platform_status(self) -> dict:
+    def platform_status(self, runtime_states: list[dict] | None = None) -> dict:
         active = sum(1 for key, r in self._runtime.items()
                      if r[0].running and self._instances[key].mode == "trading")
         open_positions = [p for p in self.ledger.get_positions("open")
@@ -775,7 +782,10 @@ class TradingInstanceManager:
         instance_trades = [t for t in self.ledger.get_paper_trades() if t.get("instance_id") in instance_ids]
         today_closed = [t for t in instance_trades if str(t.get("closed_at") or "").startswith(today)]
         today_pnl = sum(float(t.get("pnl") or 0) for t in today_closed)
-        runtime_states = [self.status(i) for i in self._instances]
+        # GET /instances already materializes these expensive, storage-backed
+        # snapshots for its response. Reuse them instead of issuing every
+        # Supabase query a second time during the same request.
+        runtime_states = runtime_states if runtime_states is not None else [self.status(i) for i in self._instances]
         unrealized = sum(float((row.get("current_position") or {}).get("unrealized_pnl") or 0)
                          for row in runtime_states)
         total_equity = sum(float((row.get("execution") or {}).get("current_equity") or 0)
@@ -867,7 +877,7 @@ class TradingInstanceManager:
 
     def metrics(self, instance_id: str) -> dict:
         inst = self._instances[instance_id]; runtime = self._runtime.get(instance_id)
-        trades = runtime[1].history() if runtime else [t for t in self.ledger.get_paper_trades() if t.get("instance_id") == instance_id and t.get("status") == "closed"]
+        trades = runtime[1].history() if runtime else [t for t in self.ledger.get_paper_trades(instance_id=instance_id) if t.get("status") == "closed"]
         out = summarize(trades, inst.capital_allocation)
         equity, peak = inst.capital_allocation, inst.capital_allocation
         for trade in sorted(trades, key=lambda item: item.get("closed_at") or ""):
@@ -946,7 +956,10 @@ class TradingInstanceManager:
                 current_position["risk_amount"] = round(abs(entry - float(stop or entry)) * float(position.get("size") or 0), 2)
                 current_position["opened_at"] = position.get("opened_at")
                 current_position["duration_seconds"] = _age_seconds(position.get("opened_at"))
-            engine = {**engine, "open_positions": len(runtime[1].positions()),
+            # positions() is a storage-backed Supabase read in production.
+            # Reuse the snapshot above instead of opening another HTTP request
+            # for the same instance during one status calculation.
+            engine = {**engine, "open_positions": len(positions),
                       "paper_balance": runtime[1].balance()}
             if inst.mode == "trading":
                 market = {**market,

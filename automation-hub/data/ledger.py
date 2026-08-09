@@ -13,6 +13,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +22,39 @@ from typing import Optional, Protocol
 from data.tenant_scope import ensure_column, ensure_tenant_column
 
 _SCHEMA = (Path(__file__).resolve().parent / "ledger_schema.sql").read_text(encoding="utf-8")
+
+
+_TRANSIENT_REMOTE_ERROR_NAMES = {
+    "ConnectError", "ConnectTimeout", "ConnectionNotAvailable",
+    "PoolTimeout", "ReadError", "ReadTimeout", "RemoteProtocolError",
+    "WriteError", "WriteTimeout",
+}
+_TRANSIENT_REMOTE_ERROR_MARKERS = (
+    "connection reset", "connection terminated", "connection aborted",
+    "server disconnected", "server closed the connection", "unexpected eof",
+)
+
+
+def remote_call_with_retry(operation, *, attempts: int = 3):
+    """Retry idempotent PostgREST operations after transient transport loss.
+
+    A long-running Supabase HTTP/2 connection can be closed by the remote
+    endpoint between requests.  Retrying reads, updates and upserts is safe;
+    authentication, RLS, schema and validation errors deliberately propagate
+    on the first attempt so configuration failures stay visible.
+    """
+    total = max(1, int(attempts))
+    for attempt in range(total):
+        try:
+            return operation()
+        except Exception as exc:
+            name = type(exc).__name__
+            message = str(exc).lower()
+            transient = (name in _TRANSIENT_REMOTE_ERROR_NAMES
+                         or any(marker in message for marker in _TRANSIENT_REMOTE_ERROR_MARKERS))
+            if not transient or attempt + 1 >= total:
+                raise
+            time.sleep(0.1 * (2 ** attempt))
 
 
 def _now() -> str:
@@ -42,13 +76,13 @@ class Ledger(Protocol):
     def open_position(self, *, symbol: str, side: str, size: float, entry: float,
                       stop: Optional[float], instance_id: str = "") -> str: ...
     def close_position(self, position_id: str, *, exit_price: float, pnl: float) -> None: ...
-    def get_positions(self, status: Optional[str] = None) -> list[dict]: ...
+    def get_positions(self, status: Optional[str] = None, instance_id: str = "") -> list[dict]: ...
     def record_paper_trade(self, trade: dict) -> str: ...
     def close_paper_trade(self, trade_id: str, *, exit_price: float, pnl: float, rr: float, size: float | None = None) -> None: ...
-    def get_paper_trades(self) -> list[dict]: ...
+    def get_paper_trades(self, instance_id: str = "") -> list[dict]: ...
     # logs / alerts
     def log(self, *, level: str, stage: str, message: str, symbol: str = "", instance_id: str = "") -> None: ...
-    def get_logs(self, limit: int = 200) -> list[dict]: ...
+    def get_logs(self, limit: int = 200, instance_id: str = "") -> list[dict]: ...
     def add_alert(self, *, severity: str, category: str, title: str, detail: str = "", instance_id: str = "") -> None: ...
     def get_alerts(self, limit: int = 100) -> list[dict]: ...
 
@@ -137,12 +171,17 @@ class SqliteLedger:
                             (pnl, _now(), position_id))
             self._c.commit()
 
-    def get_positions(self, status=None):
+    def get_positions(self, status=None, instance_id=""):
         q = "SELECT * FROM positions"
-        args: tuple = ()
+        where, args = [], []
         if status:
-            q += " WHERE status=?"
-            args = (status,)
+            where.append("status=?")
+            args.append(status)
+        if instance_id:
+            where.append("instance_id=?")
+            args.append(instance_id)
+        if where:
+            q += " WHERE " + " AND ".join(where)
         q += " ORDER BY opened_at DESC"
         with self._lock:
             return [dict(r) for r in self._c.execute(q, args)]
@@ -189,9 +228,15 @@ class SqliteLedger:
                     (exit_price, pnl, rr, size, _now(), trade_id))
             self._c.commit()
 
-    def get_paper_trades(self):
+    def get_paper_trades(self, instance_id=""):
+        query = "SELECT * FROM paper_trades"
+        args: tuple = ()
+        if instance_id:
+            query += " WHERE instance_id=?"
+            args = (instance_id,)
+        query += " ORDER BY opened_at DESC"
         with self._lock:
-            return [dict(r) for r in self._c.execute("SELECT * FROM paper_trades ORDER BY opened_at DESC")]
+            return [dict(r) for r in self._c.execute(query, args)]
 
     def reset_paper(self) -> None:
         """Clear paper trades + positions — used ONLY when the operator changes
@@ -209,10 +254,16 @@ class SqliteLedger:
                 (_id(), _now(), symbol, level, stage, message, instance_id))
             self._c.commit()
 
-    def get_logs(self, limit=200):
+    def get_logs(self, limit=200, instance_id=""):
+        query = "SELECT * FROM bot_logs"
+        args: list = []
+        if instance_id:
+            query += " WHERE instance_id=?"
+            args.append(instance_id)
+        query += " ORDER BY ts DESC LIMIT ?"
+        args.append(limit)
         with self._lock:
-            return [dict(r) for r in self._c.execute(
-                "SELECT * FROM bot_logs ORDER BY ts DESC LIMIT ?", (limit,))]
+            return [dict(r) for r in self._c.execute(query, args)]
 
     def add_alert(self, *, severity, category, title, detail="", instance_id=""):
         with self._lock:
@@ -277,13 +328,14 @@ class SupabaseLedger:
         return wid
 
     def webhook_seen(self, alert_id, since_iso):  # pragma: no cover
-        res = self._t("webhook_events").select("id").eq("alert_id", alert_id)\
-            .gte("received_at", since_iso).neq("status", "rejected").limit(1).execute()
+        res = remote_call_with_retry(lambda: self._t("webhook_events").select("id")
+                                     .eq("alert_id", alert_id).gte("received_at", since_iso)
+                                     .neq("status", "rejected").limit(1).execute())
         return bool(res.data)
 
     def get_webhook_events(self, limit=500):  # pragma: no cover
-        rows = self._t("webhook_events").select("*").order("received_at", desc=True)\
-            .limit(int(limit)).execute().data
+        rows = remote_call_with_retry(lambda: self._t("webhook_events").select("*")
+                                      .order("received_at", desc=True).limit(int(limit)).execute()).data
         for d in rows:
             try:
                 d["payload"] = json.loads(d.pop("payload_json") or "{}")
@@ -305,11 +357,15 @@ class SupabaseLedger:
         self._t("positions").update({"status": "closed", "pnl": pnl, "closed_at": _now()})\
             .eq("id", position_id).execute()
 
-    def get_positions(self, status=None):  # pragma: no cover
-        q = self._t("positions").select("*")
-        if status:
-            q = q.eq("status", status)
-        return q.order("opened_at", desc=True).execute().data
+    def get_positions(self, status=None, instance_id=""):  # pragma: no cover
+        def query():
+            q = self._t("positions").select("*")
+            if status:
+                q = q.eq("status", status)
+            if instance_id:
+                q = q.eq("instance_id", instance_id)
+            return q.order("opened_at", desc=True).execute()
+        return remote_call_with_retry(query).data
 
     def update_position_stop(self, *, symbol, stop, instance_id="") -> int:  # pragma: no cover
         q = self._t("positions").update({"stop": stop}).eq("symbol", symbol).eq("status", "open")
@@ -338,8 +394,13 @@ class SupabaseLedger:
             patch["size"] = size   # M-9: closed row shows the actually-closed size
         self._t("paper_trades").update(patch).eq("id", trade_id).execute()
 
-    def get_paper_trades(self):  # pragma: no cover
-        return self._t("paper_trades").select("*").order("opened_at", desc=True).execute().data
+    def get_paper_trades(self, instance_id=""):  # pragma: no cover
+        def query():
+            q = self._t("paper_trades").select("*")
+            if instance_id:
+                q = q.eq("instance_id", instance_id)
+            return q.order("opened_at", desc=True).execute()
+        return remote_call_with_retry(query).data
 
     def log(self, *, level, stage, message, symbol="", instance_id=""):  # pragma: no cover
         row = {"id": _id(), "ts": _now(), "symbol": symbol,
@@ -348,8 +409,13 @@ class SupabaseLedger:
             row["instance_id"] = instance_id
         self._t("bot_logs").insert(row).execute()
 
-    def get_logs(self, limit=200):  # pragma: no cover
-        return self._t("bot_logs").select("*").order("ts", desc=True).limit(limit).execute().data
+    def get_logs(self, limit=200, instance_id=""):  # pragma: no cover
+        def query():
+            q = self._t("bot_logs").select("*")
+            if instance_id:
+                q = q.eq("instance_id", instance_id)
+            return q.order("ts", desc=True).limit(limit).execute()
+        return remote_call_with_retry(query).data
 
     def add_alert(self, *, severity, category, title, detail="", instance_id=""):  # pragma: no cover
         row = {"id": _id(), "ts": _now(), "severity": severity,
@@ -359,7 +425,8 @@ class SupabaseLedger:
         self._t("alerts").insert(row).execute()
 
     def get_alerts(self, limit=100):  # pragma: no cover
-        return self._t("alerts").select("*").order("ts", desc=True).limit(limit).execute().data
+        return remote_call_with_retry(lambda: self._t("alerts").select("*")
+                                      .order("ts", desc=True).limit(limit).execute()).data
 
 
 # Honest Supabase health: get_ledger() records whether Supabase was configured
