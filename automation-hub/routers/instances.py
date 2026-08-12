@@ -155,8 +155,9 @@ def _start_instance(manager, instance_id: str, *, restart: bool = False):
 @router.get("/instances")
 def list_instances():
     manager = _manager()
-    rows = manager.list()
-    return {"instances": rows, **manager.platform_status(runtime_states=rows)}
+    rows, positions, trades = manager.snapshot()
+    return {"instances": rows, **manager.platform_status(
+        runtime_states=rows, open_positions=positions, instance_trades=trades)}
 
 
 @router.post("/instances/platform")

@@ -35,6 +35,18 @@ from services.signal_pipeline import SignalPipeline
 class EngineFeedError(RuntimeError):
     """A transient market-data failure eligible for bounded reconnect attempts."""
 
+    recovery_reason = "Market data connection lost"
+
+
+class EnginePersistenceError(EngineFeedError):
+    """A recoverable durable-state failure; trading remains fail-closed."""
+
+    recovery_reason = "State persistence unavailable"
+
+
+class StrategyExecutionError(RuntimeError):
+    """A strategy implementation failed while evaluating a closed candle."""
+
 
 class MarketDataStaleError(EngineFeedError):
     """The provider is reachable but its latest closed candle is not current."""
@@ -331,6 +343,15 @@ class AutoStrategyEngine:
     def status(self) -> dict:
         feed, feed_err = self.feed_status()
         ws_feed = getattr(self, "ws_feed", None)
+        uptime_s = None
+        if self.started_at:
+            try:
+                started = datetime.fromisoformat(str(self.started_at).replace("Z", "+00:00"))
+                uptime_s = max(0, round((datetime.now(timezone.utc) - started).total_seconds()))
+            except (TypeError, ValueError):
+                # A malformed legacy timestamp is telemetry damage, not a
+                # reason to stop an otherwise healthy trading worker.
+                uptime_s = None
         return {
             "running": self.running,
             "symbols": self.symbols,
@@ -342,6 +363,7 @@ class AutoStrategyEngine:
             "mode": "live" if self.live else "replay",
             "strategy": self.strategy_label,
             "started_at": self.started_at,
+            "uptime_s": uptime_s,
             "lifecycle_state": self.lifecycle_state,
             "stop_reason": self.stop_reason,
             "last_error": self.last_error,
@@ -401,9 +423,12 @@ class AutoStrategyEngine:
                         self._transition("data_stale", str(exc), error=exc)
                     delay = self._schedule_reconnect(exc)
                     if delay is None:
-                        self._mark_error("Market data connection lost", exc)
+                        self._mark_error(getattr(exc, "recovery_reason", "Market data connection lost"), exc)
                         return
                     self._stop.wait(delay)
+                except StrategyExecutionError as exc:
+                    self._mark_error("Strategy execution failed", exc)
+                    return
                 except Exception as exc:  # strategy/config/runtime errors are not blindly retried
                     self._mark_error("Unknown internal error", exc)
                     return
@@ -432,6 +457,7 @@ class AutoStrategyEngine:
                 "timestamp": self.last_transition or self._utc_now(),
                 "symbol": self.symbols[0] if self.symbols else None,
                 "timeframe": self.timeframe,
+                "last_error": self.last_error,
             })
         except Exception as exc:  # observability must not kill execution
             self.ledger.log(level="warning", stage="engine",
@@ -468,6 +494,7 @@ class AutoStrategyEngine:
         self._emit_lifecycle("stopped", reason)
 
     def _schedule_reconnect(self, exc: Exception) -> Optional[float]:
+        reason = getattr(exc, "recovery_reason", "Market data connection lost")
         with self._lock:
             self.reconnect_attempt += 1
             attempt = self.reconnect_attempt
@@ -479,12 +506,12 @@ class AutoStrategyEngine:
                 return None
             delay = min(2.0 ** attempt, 30.0)
             self.lifecycle_state = "recovering"
-            self.stop_reason = "Market data connection lost"
+            self.stop_reason = reason
             self.reconnect_next_at = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
             self.last_transition = self.last_heartbeat
         self._emit_lifecycle("recovering", f"Automatic recovery attempt {attempt}/{self.max_reconnect_attempts}")
         self.ledger.log(level="warning", stage="engine",
-                        message=(f"Market data connection lost — reconnecting "
+                        message=(f"{reason} — reconnecting "
                                  f"(attempt {attempt}/{self.max_reconnect_attempts} in {delay:.0f}s): {safe_error}"))
         return delay
 
@@ -841,7 +868,7 @@ class AutoStrategyEngine:
         try:
             self._candle_checkpoint(timestamp)
         except Exception as exc:  # persistence is critical for exactly-once
-            raise EngineFeedError(f"candle cursor persistence failed: {exc}") from exc
+            raise EnginePersistenceError(f"candle cursor persistence failed: {exc}") from exc
 
     def _checkpoint_pending_orders(self) -> None:
         if self._pending_orders_checkpoint is None:
@@ -850,7 +877,7 @@ class AutoStrategyEngine:
             snapshot = {symbol: dict(order) for symbol, order in self._pending.items()}
             self._pending_orders_checkpoint(snapshot)
         except Exception as exc:  # order persistence is part of instance recovery
-            raise EngineFeedError(f"pending order persistence failed: {exc}") from exc
+            raise EnginePersistenceError(f"pending order persistence failed: {exc}") from exc
 
     def _record_market_snapshot(self, symbol, closed) -> None:
         newest = closed[-1]
@@ -969,7 +996,13 @@ class AutoStrategyEngine:
             # Never close and reopen on the same OHLC candle: its intrabar path
             # is unknowable and doing so would fabricate execution ordering.
             skip_entry_scan = True
-        signal: Optional[Signal] = None if skip_entry_scan else strategy.on_bar(bar)
+        try:
+            signal: Optional[Signal] = None if skip_entry_scan else strategy.on_bar(bar)
+        except Exception as exc:
+            label = getattr(strategy, "label", type(strategy).__name__)
+            raise StrategyExecutionError(
+                f"{label} failed for {sym} {self.timeframe}: "
+                f"{type(exc).__name__}: {exc}") from exc
         outcome: Optional[dict] = None
         if signal is not None:
             outcome = self._on_signal(sym, signal, strategy)

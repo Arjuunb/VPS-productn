@@ -119,7 +119,11 @@ class WebSocketFeed:
 
     def _run(self) -> None:
         import asyncio
-        asyncio.run(self._stream())
+        try:
+            asyncio.run(self._stream())
+        except Exception as exc:  # startup/client failures must remain visible
+            self.available = False
+            self.last_error = f"{type(exc).__name__}: {exc}"[:500]
 
     async def _stream(self) -> None:
         import asyncio

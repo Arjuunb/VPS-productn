@@ -2,10 +2,12 @@
 from datetime import datetime, timedelta, timezone
 import time
 
+import pytest
+
 from bot.types import Bar, Signal, SignalType
 from data.ledger import SqliteLedger
 from execution.paper_engine import PaperExecutionEngine
-from services.auto_engine import AutoStrategyEngine, EngineFeedError
+from services.auto_engine import AutoStrategyEngine, EngineFeedError, StrategyExecutionError
 from services.controls import TradingControl
 from services.signal_pipeline import SignalPipeline
 
@@ -78,6 +80,26 @@ def test_ingest_ignores_in_progress_candle():
 def test_status_reports_mode():
     eng, _ = _engine()
     assert eng.status()["mode"] == "live"
+
+
+def test_status_reports_server_authoritative_worker_uptime():
+    eng, _ = _engine()
+    eng.started_at = (datetime.now(timezone.utc) - timedelta(seconds=75)).isoformat()
+    assert 74 <= eng.status()["uptime_s"] <= 76
+
+
+def test_strategy_exception_is_classified_with_strategy_context():
+    eng, _ = _engine()
+
+    class BrokenStrategy:
+        label = "Broken Strategy"
+        bars = []
+
+        def on_bar(self, _bar):
+            raise ValueError("indicator state corrupt")
+
+    with pytest.raises(StrategyExecutionError, match=r"Broken Strategy failed for BTCUSDT 1h"):
+        eng._process_bar("BTCUSDT", _bars(1)[0], BrokenStrategy())
 
 
 def test_reconnect_lifecycle_is_visible_and_bounded():

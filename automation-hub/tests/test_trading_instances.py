@@ -435,6 +435,141 @@ def test_instance_quick_configuration_refuses_changes_with_open_position():
         manager.update_configuration(instance.id, timeframe="15m")
 
 
+def test_invalid_strategy_replacement_does_not_stop_healthy_worker(monkeypatch):
+    from services.auto_engine import AutoStrategyEngine
+
+    def selective_factory(key, symbol):
+        if key == "broken":
+            raise RuntimeError("strategy package unavailable")
+        return _factory(key, symbol)
+
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=selective_factory,
+                                     live=False, live_poll_s=60)
+    instance = manager.create(symbol="BTCUSDT", strategy_key="brain",
+                              strategy_label="Decision Brain", strategy_version="v1",
+                              timeframe="5m", risk_per_trade_pct=0.005,
+                              capital_allocation=1_000)
+    monkeypatch.setattr(
+        AutoStrategyEngine, "start",
+        lambda self: (setattr(self, "running", True),
+                      setattr(self, "lifecycle_state", "running"), True)[-1],
+    )
+    manager.start(instance.id)
+    original_engine = manager._runtime[instance.id][0]
+
+    with pytest.raises(ValueError, match="Strategy validation failed before restart"):
+        manager.update_configuration(instance.id, strategy_key="broken",
+                                     strategy_label="Broken Strategy")
+
+    assert original_engine.running is True
+    assert manager._runtime[instance.id][0] is original_engine
+    assert manager.status(instance.id)["strategy_key"] == "brain"
+
+
+def test_terminal_worker_error_disables_automatic_restart_and_preserves_detail(monkeypatch):
+    from services.auto_engine import AutoStrategyEngine
+
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory,
+                                     live=False, live_poll_s=60)
+    instance = manager.create(symbol="BTCUSDT", strategy_key="brain",
+                              strategy_label="Decision Brain", strategy_version="v1",
+                              timeframe="5m", risk_per_trade_pct=0.005,
+                              capital_allocation=1_000)
+    monkeypatch.setattr(
+        AutoStrategyEngine, "start",
+        lambda self: (setattr(self, "running", True),
+                      setattr(self, "lifecycle_state", "running"), True)[-1],
+    )
+    manager.start(instance.id)
+    engine = manager._runtime[instance.id][0]
+    engine.last_error = "StrategyExecutionError: indicator state corrupt"
+    engine.last_transition = datetime.now(timezone.utc).isoformat()
+    engine._emit_lifecycle("error", "Strategy execution failed")
+
+    saved = manager._instances[instance.id]
+    assert saved.state == "error"
+    assert saved.desired_running is False
+    assert saved.last_error == "StrategyExecutionError: indicator state corrupt"
+    snapshot = manager.platform_status(runtime_states=[manager.status(instance.id)])
+    assert snapshot["global_status"] != "critical"
+
+
+def test_restore_failure_is_not_retried_on_every_container_restart(monkeypatch):
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory,
+                                     live=False, live_poll_s=60)
+    instance = manager.create(symbol="BTCUSDT", strategy_key="brain",
+                              strategy_label="Decision Brain", strategy_version="v1",
+                              timeframe="5m", risk_per_trade_pct=0.005,
+                              capital_allocation=1_000)
+    instance.desired_running = True
+    instance.state = "running"
+    manager.store.save(instance)
+    monkeypatch.setattr(manager, "start", lambda _id: (_ for _ in ()).throw(
+        RuntimeError("provider configuration invalid")))
+
+    assert manager.restore_desired_instances() == []
+    assert instance.state == "error"
+    assert instance.desired_running is False
+    assert "provider configuration invalid" in instance.last_error
+
+
+def test_paused_instance_cannot_be_reactivated_by_worker_lifecycle_event(monkeypatch):
+    from services.auto_engine import AutoStrategyEngine
+
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory,
+                                     live=False, live_poll_s=60)
+    instance = manager.create(symbol="BTCUSDT", strategy_key="brain",
+                              strategy_label="Decision Brain", strategy_version="v1",
+                              timeframe="5m", risk_per_trade_pct=0.005,
+                              capital_allocation=1_000)
+    monkeypatch.setattr(
+        AutoStrategyEngine, "start",
+        lambda self: (setattr(self, "running", True),
+                      setattr(self, "lifecycle_state", "running"), True)[-1],
+    )
+    manager.start(instance.id)
+    manager.pause(instance.id)
+    engine = manager._runtime[instance.id][0]
+
+    engine.last_transition = datetime.now(timezone.utc).isoformat()
+    engine._emit_lifecycle("running", "Fresh closed market data confirmed")
+
+    assert manager._instances[instance.id].state == "paused"
+    assert manager._instances[instance.id].desired_running is False
+
+
+def test_resume_rebuilds_terminal_runtime_instead_of_labelling_dead_worker_running(monkeypatch):
+    from services.auto_engine import AutoStrategyEngine
+
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory,
+                                     live=False, live_poll_s=60)
+    instance = manager.create(symbol="BTCUSDT", strategy_key="brain",
+                              strategy_label="Decision Brain", strategy_version="v1",
+                              timeframe="5m", risk_per_trade_pct=0.005,
+                              capital_allocation=1_000)
+    monkeypatch.setattr(
+        AutoStrategyEngine, "start",
+        lambda self: (setattr(self, "running", True),
+                      setattr(self, "lifecycle_state", "running"), True)[-1],
+    )
+    manager.start(instance.id)
+    original = manager._runtime[instance.id][0]
+    original.running = False
+    original.lifecycle_state = "error"
+    instance.state = "error"
+
+    resumed = manager.resume(instance.id)
+
+    assert resumed.state == "running"
+    assert manager._runtime[instance.id][0] is not original
+    assert manager._runtime[instance.id][0].running is True
+
+
 def test_instances_start_and_stop_independently_and_slot_limit_is_backend_enforced(monkeypatch):
     from services.auto_engine import AutoStrategyEngine
     ledger = SqliteLedger(":memory:")

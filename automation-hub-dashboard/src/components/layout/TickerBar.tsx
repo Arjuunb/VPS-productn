@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { uptime, useLive } from "../../lib/api";
 import { useApp } from "../../app-context";
 
@@ -6,25 +7,37 @@ type Snapshot = {
   current_global_risk_amount: number; max_global_risk_amount: number;
   market_data_status: string; instances: {
     id: string; symbol: string; strategy_label: string; timeframe: string; state: string;
-    started_at?: string | null; engine?: { started_at?: string | null } | null;
+    started_at?: string | null; engine?: { started_at?: string | null; uptime_s?: number | null; running?: boolean } | null;
   }[];
 };
+
+const ACTIVE_INSTANCE_STATES = new Set(["starting", "bootstrapping", "warming", "syncing", "ready", "running", "data_stale", "recovering", "paused"]);
 
 /** Footer uses the same Trading Instance payload as the dashboard and detail UI. */
 export default function TickerBar() {
   const app = useApp();
   const { data } = useLive<Snapshot>("/instances", 4000);
-  const running = (data?.instances ?? []).filter((row) => row.state === "running");
-  const instances = running.map((row) => `${row.symbol} · ${row.strategy_label} · ${row.timeframe}`).join(" | ") || "No active instance";
-  const selected = running.find((row) => row.id === app.selectedInstanceId) ?? running[0];
+  const [, setClock] = useState(0);
+  useEffect(() => {
+    const timer = window.setInterval(() => setClock((value) => value + 1), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const rows = data?.instances ?? [];
+  const active = rows.filter((row) => row.engine?.running || ACTIVE_INSTANCE_STATES.has(row.state));
+  const runningCount = rows.filter((row) => row.state === "running").length;
+  const instances = active.map((row) => `${row.symbol} · ${row.strategy_label} · ${row.timeframe}`).join(" | ") || "No active instance";
+  const selected = active.find((row) => row.id === app.selectedInstanceId) ?? active[0];
   const activeSince = selected?.engine?.started_at ?? selected?.started_at;
-  const activeSeconds = activeSince ? Math.max(0, (Date.now() - Date.parse(activeSince)) / 1000) : undefined;
+  const parsedStart = activeSince ? Date.parse(activeSince) : Number.NaN;
+  const activeSeconds = Number.isFinite(parsedStart)
+    ? Math.max(0, (Date.now() - parsedStart) / 1000)
+    : selected?.engine?.uptime_s ?? undefined;
   const items: [string, string][] = data ? [
-    ["Mode", "PAPER (simulation)"], ["Instances", `${data.active_slots} / ${data.max_active_slots} running`],
+    ["Mode", "PAPER (simulation)"], ["Instances", `${runningCount} / ${data.max_active_slots} running · ${data.active_slots} workers`],
     ["Market data", data.market_data_status], ["Open positions", String(data.total_open_positions)],
     ["Open risk", `$${data.current_global_risk_amount.toLocaleString()} / $${data.max_global_risk_amount.toLocaleString()}`],
     ["Bot active time", activeSeconds === undefined ? "—" : uptime(activeSeconds)],
     ["Active", selected ? `${selected.symbol} · ${selected.strategy_label} · ${selected.timeframe}` : instances],
   ] : [["System", "backend not reachable"]];
-  return <footer className="ticker"><div className="ticker-items">{items.map(([k, v]) => <span className="ticker-item" key={k}><b>{k}</b><span className="ticker-price">{v}</span></span>)}</div><div className="ticker-meta"><span className={`dot ${running.length ? "online" : "offline"}`} /></div></footer>;
+  return <footer className="ticker"><div className="ticker-items">{items.map(([k, v]) => <span className="ticker-item" key={k}><b>{k}</b><span className="ticker-price">{v}</span></span>)}</div><div className="ticker-meta"><span className={`dot ${active.length ? "online" : "offline"}`} /></div></footer>;
 }

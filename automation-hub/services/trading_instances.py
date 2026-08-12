@@ -453,6 +453,41 @@ class InstanceStore:
             self.error = "Trading Instance market-state migration is not installed; run data/trading_instances_schema.sql"
             raise RuntimeError(self.error) from exc
 
+    def market_states(self, instance_ids: set[str]) -> dict[str, dict]:
+        """Fetch all instance cursors in one storage call for dashboard polling."""
+        if not instance_ids:
+            return {}
+        defaults = lambda key: {  # noqa: E731 - compact per-row factory
+            "instance_id": key, "last_processed_candle_timestamp": None,
+            "market_data_mode": "paper_forward", "market_data_status": "stopped",
+            "last_market_data_timestamp": None, "data_source": None,
+            "warmup_bars": 0, "duplicate_candles": 0, "missing_candles": 0,
+            "out_of_order_candles": 0, "pending_orders_json": {},
+        }
+        try:
+            if self.remote:
+                rows = remote_call_with_retry(lambda: self._table("instance_market_state")
+                                              .select("*").in_("instance_id", list(instance_ids)).execute()).data
+            else:
+                with self.ledger._lock:
+                    rows = [dict(row) for row in self.ledger._c.execute(
+                        "SELECT * FROM instance_market_state")
+                        if row["instance_id"] in instance_ids]
+            indexed = {str(row["instance_id"]): row for row in rows}
+            result = {}
+            for key in instance_ids:
+                values = {**defaults(key), **indexed.get(key, {})}
+                raw_pending = values.get("pending_orders_json")
+                values["pending_orders_json"] = (json.loads(raw_pending)
+                                                  if isinstance(raw_pending, str)
+                                                  else (raw_pending or {}))
+                result[key] = values
+            return result
+        except Exception as exc:
+            self.available = False
+            self.error = "Trading Instance market-state migration is not installed; run data/trading_instances_schema.sql"
+            raise RuntimeError(self.error) from exc
+
     def save_market_state(self, instance_id: str, **values) -> None:
         row = {"instance_id": instance_id, "last_processed_candle_timestamp": None,
                "market_data_mode": "paper_forward", "market_data_status": "warming_up",
@@ -885,12 +920,38 @@ class TradingInstanceManager:
                 with self._lock:
                     target = self._instances.get(instance_id)
                     if target is not None:
-                        target.state = state
+                        # Pause is an operator-owned execution gate. The market
+                        # worker intentionally stays alive to maintain its
+                        # cursor, so background warm-up/recovery transitions
+                        # must not silently turn a paused strategy back on.
+                        preserve_pause = target.state == "paused" and state not in ("error", "stopped")
+                        target.state = "paused" if preserve_pause else state
                         if state == "running":
                             target.last_error = ""
                         elif state in ("data_stale", "recovering", "error"):
-                            target.last_error = str(event.get("reason") or "")[:500]
+                            target.last_error = str(event.get("last_error") or event.get("reason") or "")[:500]
+                        if state == "error":
+                            # Bounded automatic recovery has been exhausted.
+                            # Persist manual-recovery intent so a container
+                            # restart cannot resurrect the same broken worker
+                            # forever and produce an error loop on every boot.
+                            target.desired_running = False
+                            target.stopped_at = str(event.get("timestamp") or _now())
                         self.store.save(target)
+                if state in ("error", "stopped") and "engine" in engine_ref:
+                    runtime_status = engine_ref["engine"].status()
+                    self.store.save_market_state(
+                        instance_id,
+                        last_processed_candle_timestamp=runtime_status.get("last_processed_candle_timestamp"),
+                        market_data_mode="paper_forward",
+                        market_data_status=runtime_status.get("market_data_status", "error"),
+                        last_market_data_timestamp=runtime_status.get("last_closed_candle"),
+                        data_source=runtime_status.get("data_source"),
+                        warmup_bars=int(runtime_status.get("warmup_bars") or 0),
+                        duplicate_candles=int(runtime_status.get("duplicate_candles_ignored") or 0),
+                        missing_candles=int(runtime_status.get("missing_candles") or 0),
+                        out_of_order_candles=int(runtime_status.get("out_of_order_candles") or 0),
+                    )
                 level = "error" if state == "error" else "warning" if state in ("data_stale", "recovering") else "info"
                 self.store.append_engine_log(
                     instance_id, level=level, timestamp=event.get("timestamp"),
@@ -908,7 +969,14 @@ class TradingInstanceManager:
                                         entry_mode=inst.entry_mode, instance_id=instance_id,
                                         lifecycle_callback=lifecycle)
             engine_ref["engine"] = engine
-            probe_strategy = engine.strategy_factory(inst.symbol)
+            try:
+                probe_strategy = engine.strategy_factory(inst.symbol)
+            except Exception as exc:
+                if ws_feed is not None:
+                    ws_feed.stop()
+                raise ValueError(
+                    f"Cannot initialize {inst.strategy_label} {inst.strategy_version}: "
+                    f"{type(exc).__name__}: {exc}") from exc
             required_decision_timeframe = getattr(probe_strategy, "decision_timeframe", None)
             if required_decision_timeframe and inst.timeframe != required_decision_timeframe:
                 if ws_feed is not None:
@@ -951,11 +1019,13 @@ class TradingInstanceManager:
 
     def resume(self, instance_id: str) -> TradingInstance:
         inst = self._instances[instance_id]; runtime = self._runtime.get(instance_id)
-        if runtime:
+        if runtime and runtime[0].running:
             runtime[3].resume()
             inst.state, inst.desired_running = "running", True
             self.store.save(inst)
             return inst
+        # A terminal error can retain its diagnostics object after the worker
+        # thread exits. Never label that dead object running; build a new worker.
         return self.start(instance_id)
 
     def update_configuration(self, instance_id: str, *, capital_allocation: float | None = None,
@@ -1048,7 +1118,29 @@ class TradingInstanceManager:
                 raise ValueError("Close the instance's open position before changing execution configuration")
             if len(open_positions) > candidate_max:
                 raise ValueError("max_open_positions cannot be below the instance's current open-position count")
+            candidate_strategy_key = strategy_key or inst.strategy_key
+            candidate_timeframe = timeframe or inst.timeframe
+            # Validate the replacement before interrupting a healthy worker.
+            # A broken package or incompatible decision timeframe rejects the
+            # edit while the current strategy keeps running.
+            try:
+                probe_strategy = self.strategy_factory(candidate_strategy_key, inst.symbol)
+            except Exception as exc:
+                raise ValueError(
+                    f"Strategy validation failed before restart: {type(exc).__name__}: {exc}") from exc
+            required_timeframe = getattr(probe_strategy, "decision_timeframe", None)
+            if required_timeframe and candidate_timeframe != required_timeframe:
+                raise ValueError(
+                    f"{strategy_label or inst.strategy_label} requires the "
+                    f"{required_timeframe} decision timeframe")
             if had_runtime and rebuild_required:
+                # update_configuration owns the manager lock while it performs
+                # an atomic config swap. Detach the old worker callback before
+                # joining it: otherwise its final lifecycle event waits for the
+                # same manager lock while this thread waits for it to exit. That
+                # lock inversion caused slow strategy switches and allowed a
+                # late "stopped" event to overwrite the replacement worker.
+                self._runtime[instance_id][0]._lifecycle_callback = None
                 self.stop(instance_id)
             inst.capital_allocation = candidate_capital
             inst.risk_per_trade_pct = float(risk_per_trade_pct if risk_per_trade_pct is not None else inst.risk_per_trade_pct)
@@ -1123,18 +1215,23 @@ class TradingInstanceManager:
                                           paper_account_capital=self.paper_account_capital)
         return self.platform_status()
 
-    def platform_status(self, runtime_states: list[dict] | None = None) -> dict:
+    def platform_status(self, runtime_states: list[dict] | None = None, *,
+                        open_positions: list[dict] | None = None,
+                        instance_trades: list[dict] | None = None) -> dict:
         active = sum(1 for key, r in self._runtime.items()
                      if r[0].running and self._instances[key].mode == "trading")
-        open_positions = [p for p in self.ledger.get_positions("open")
-                          if p.get("instance_id") in self._instances]
+        open_positions = (open_positions if open_positions is not None else
+                          [p for p in self.ledger.get_positions("open")
+                           if p.get("instance_id") in self._instances])
         used_risk = sum(abs(float(p.get("entry", 0)) - float(p.get("stop") or p.get("entry", 0)))
                         * float(p.get("size", 0)) for p in open_positions)
         allocated_capital = sum(i.capital_allocation for i in self._instances.values() if i.mode == "trading")
         capital = allocated_capital or 1.0
         today = datetime.now(timezone.utc).date().isoformat()
         instance_ids = set(self._instances)
-        instance_trades = [t for t in self.ledger.get_paper_trades() if t.get("instance_id") in instance_ids]
+        instance_trades = (instance_trades if instance_trades is not None else
+                           [t for t in self.ledger.get_paper_trades()
+                            if t.get("instance_id") in instance_ids])
         today_closed = [t for t in instance_trades if str(t.get("closed_at") or "").startswith(today)]
         today_pnl = sum(float(t.get("pnl") or 0) for t in today_closed)
         # GET /instances already materializes these expensive, storage-backed
@@ -1164,7 +1261,11 @@ class TradingInstanceManager:
         market_states = [str((row.get("market_data") or {}).get("market_data_status") or "")
                          for row in runtime_states if row.get("mode") == "trading"
                          and (row.get("state") in active_lifecycle or row.get("desired_running"))]
-        worker_errors = sum(1 for row in runtime_states if row.get("state") == "error")
+        # Historical/stopped error rows remain visible for diagnosis, but they
+        # are not a current platform outage. Only a worker that is still marked
+        # as desired-running may make the live platform status critical.
+        worker_errors = sum(1 for row in runtime_states
+                            if row.get("state") == "error" and row.get("desired_running"))
         if not self.store.available or worker_errors or any(s in ("error", "disconnected") for s in market_states):
             global_status = "critical"
         elif risk_status != "healthy" or any(s in ("stale", "warming_up") for s in market_states):
@@ -1231,13 +1332,22 @@ class TradingInstanceManager:
                 if inst.mode == "trading":
                     restored_trading += 1
             except Exception as exc:  # one broken instance cannot block others
-                inst.state, inst.last_error = "error", str(exc)[:500]
+                inst.state, inst.desired_running = "error", False
+                inst.last_error = str(exc)[:500]
+                inst.stopped_at = _now()
                 self.store.save(inst)
         return restored
 
-    def metrics(self, instance_id: str) -> dict:
+    def metrics(self, instance_id: str, *, trades_snapshot: list[dict] | None = None) -> dict:
         inst = self._instances[instance_id]; runtime = self._runtime.get(instance_id)
-        trades = runtime[1].history() if runtime else [t for t in self.ledger.get_paper_trades(instance_id=instance_id) if t.get("status") == "closed"]
+        if trades_snapshot is not None:
+            trades = [t for t in trades_snapshot if t.get("status") == "closed"]
+            if runtime is not None:
+                runtime[1]._hist_cache = list(trades)
+        else:
+            trades = (runtime[1].history() if runtime else
+                      [t for t in self.ledger.get_paper_trades(instance_id=instance_id)
+                       if t.get("status") == "closed"])
         out = summarize(trades, inst.capital_allocation)
         equity, peak = inst.capital_allocation, inst.capital_allocation
         for trade in sorted(trades, key=lambda item: item.get("closed_at") or ""):
@@ -1284,14 +1394,17 @@ class TradingInstanceManager:
                 break
         return count
 
-    def status(self, instance_id: str) -> dict:
+    def status(self, instance_id: str, *, market_snapshot: dict | None = None,
+               positions_snapshot: list[dict] | None = None,
+               trades_snapshot: list[dict] | None = None) -> dict:
         inst = self._instances[instance_id]; runtime = self._runtime.get(instance_id)
         engine = runtime[0].status() if runtime else None
-        market = self.store.market_state(instance_id) if inst.mode == "trading" else {
+        market = (market_snapshot if market_snapshot is not None else self.store.market_state(instance_id)) if inst.mode == "trading" else {
             "market_data_mode": "replay", "market_data_status": "research_replay"}
         current_position = None
         if engine is not None:
-            positions = runtime[1].positions()
+            positions = (positions_snapshot if positions_snapshot is not None
+                         else runtime[1].positions())
             position = positions[0] if positions else None
             if position:
                 mark = engine.get("last_prices", {}).get(position["symbol"])
@@ -1344,19 +1457,7 @@ class TradingInstanceManager:
             if state == "stopped":
                 inst.desired_running = False
             self.store.save(inst)
-        if inst.mode == "trading" and engine and state in ("stopped", "error"):
-            # Preserve a terminal data diagnosis for the dashboard after the
-            # worker object disappears on a later process restart.
-            self.store.save_market_state(instance_id,
-                last_processed_candle_timestamp=market.get("last_processed_candle_timestamp"),
-                market_data_mode="paper_forward",
-                market_data_status=engine.get("market_data_status", "error"),
-                last_market_data_timestamp=market.get("last_market_data_timestamp"),
-                data_source=market.get("data_source"), warmup_bars=int(market.get("warmup_bars") or 0),
-                duplicate_candles=int(market.get("duplicate_candles") or 0),
-                missing_candles=int(market.get("missing_candles") or 0),
-                out_of_order_candles=int(market.get("out_of_order_candles") or 0))
-        metrics = self.metrics(instance_id)
+        metrics = self.metrics(instance_id, trades_snapshot=trades_snapshot)
         execution: dict = {
             "current_equity": metrics.get("balance"),
             "starting_equity": inst.starting_equity,
@@ -1484,8 +1585,32 @@ class TradingInstanceManager:
                 "strategy_health": metrics.get("strategy_health"),
                 "last_decision": last_decision, "metrics": metrics}
 
+    def snapshot(self) -> tuple[list[dict], list[dict], list[dict]]:
+        """Materialize one dashboard snapshot without per-instance remote reads."""
+        instance_ids = set(self._instances)
+        markets = self.store.market_states(instance_ids)
+        positions = [row for row in self.ledger.get_positions("open")
+                     if row.get("instance_id") in instance_ids]
+        trades = [row for row in self.ledger.get_paper_trades()
+                  if row.get("instance_id") in instance_ids]
+        positions_by_instance = {key: [] for key in instance_ids}
+        trades_by_instance = {key: [] for key in instance_ids}
+        for row in positions:
+            positions_by_instance.setdefault(str(row.get("instance_id")), []).append(row)
+        for row in trades:
+            trades_by_instance.setdefault(str(row.get("instance_id")), []).append(row)
+        rows = []
+        for instance_id in self._instances:
+            rows.append(self.status(
+                instance_id,
+                market_snapshot=markets.get(instance_id),
+                positions_snapshot=positions_by_instance.get(instance_id, []),
+                trades_snapshot=trades_by_instance.get(instance_id, []),
+            ))
+        return rows, positions, trades
+
     def list(self) -> list[dict]:
-        return [self.status(i) for i in self._instances]
+        return self.snapshot()[0]
 
     def leaderboard(self, sort: str = "realized_pnl") -> list[dict]:
         rows = [{**self.status(i), **self.metrics(i)} for i in self._instances]

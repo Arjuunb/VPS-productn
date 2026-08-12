@@ -71,3 +71,41 @@ def test_platform_snapshot_reuses_already_materialized_instance_rows(monkeypatch
 
     assert snapshot["total_instances"] == 1
     assert snapshot["instance_counts"]["stopped"] == 1
+
+
+def test_dashboard_snapshot_batches_storage_reads(monkeypatch):
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory,
+                                     live=False, live_poll_s=60)
+    for symbol in ("BTCUSDT", "ETHUSDT", "SOLUSDT"):
+        manager.create(symbol=symbol, strategy_key="brain",
+                       strategy_label="Decision Brain", strategy_version="v1",
+                       timeframe="5m", risk_per_trade_pct=0.005,
+                       capital_allocation=1_000)
+
+    calls = {"market": 0, "positions": 0, "trades": 0}
+    original_markets = manager.store.market_states
+    original_positions = ledger.get_positions
+    original_trades = ledger.get_paper_trades
+
+    def markets(ids):
+        calls["market"] += 1
+        return original_markets(ids)
+
+    def positions(*args, **kwargs):
+        calls["positions"] += 1
+        return original_positions(*args, **kwargs)
+
+    def trades(*args, **kwargs):
+        calls["trades"] += 1
+        return original_trades(*args, **kwargs)
+
+    monkeypatch.setattr(manager.store, "market_states", markets)
+    monkeypatch.setattr(ledger, "get_positions", positions)
+    monkeypatch.setattr(ledger, "get_paper_trades", trades)
+
+    rows, open_positions, paper_trades = manager.snapshot()
+
+    assert len(rows) == 3
+    assert open_positions == paper_trades == []
+    assert calls == {"market": 1, "positions": 1, "trades": 1}

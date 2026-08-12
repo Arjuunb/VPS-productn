@@ -25,6 +25,7 @@ type Options = {
 };
 type Menu = "mode" | "instance" | "strategy" | "timeframe" | "risk" | "allocation" | "max" | "engine" | "controls" | "more" | null;
 type Command = { label: string; hint?: string; run: () => void | Promise<void> };
+const ACTIVE_INSTANCE_STATES = new Set(["starting", "bootstrapping", "warming", "syncing", "ready", "running", "data_stale", "recovering", "paused"]);
 
 const money = (value?: number) => `$${Number(value ?? 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
 const shortMoney = (value?: number) => Number(value ?? 0) >= 1000 ? `$${(Number(value) / 1000).toFixed(Number(value) % 1000 ? 1 : 0)}K` : money(value);
@@ -51,15 +52,17 @@ export default function HeaderControls() {
   const options = useLive<Options>("/instances/options", 30000);
   const root = useRef<HTMLDivElement | null>(null);
   const commandInput = useRef<HTMLInputElement | null>(null);
+  const operationInFlight = useRef(false);
   const [open, setOpen] = useState<Menu>(null);
   const [palette, setPalette] = useState(false);
   const [query, setQuery] = useState("");
   const [customRisk, setCustomRisk] = useState("0.50");
   const [allocation, setAllocation] = useState("");
   const [maxPositions, setMaxPositions] = useState("");
+  const [busy, setBusy] = useState(false);
   const rows = live.data?.instances ?? [];
   const selected = rows.find((row) => row.id === app.selectedInstanceId)
-    ?? rows.find((row) => row.state === "running") ?? rows[0];
+    ?? rows.find((row) => ACTIVE_INSTANCE_STATES.has(row.state)) ?? rows[0];
 
   useEffect(() => {
     if (selected && selected.id !== app.selectedInstanceId) app.selectInstance(selected.id);
@@ -88,11 +91,22 @@ export default function HeaderControls() {
   useEffect(() => { if (palette) window.setTimeout(() => commandInput.current?.focus(), 0); }, [palette]);
 
   const update = async (body: Record<string, unknown>, message: string) => {
-    if (!selected) return;
+    if (!selected || operationInFlight.current) return false;
+    operationInFlight.current = true;
+    setBusy(true);
     try {
       await apiPatchJson(`/instances/${selected.id}`, body);
-      setOpen(null); live.refetch(); app.toast(message, "success");
-    } catch (error) { app.toast(error instanceof Error ? error.message : "Update failed", "error"); }
+      const refreshed = await live.refetch();
+      setOpen(null);
+      app.toast(refreshed ? message : `${message}; live status refresh is reconnecting`, refreshed ? "success" : "info");
+      return true;
+    } catch (error) {
+      app.toast(error instanceof Error ? error.message : "Update failed", "error");
+      return false;
+    } finally {
+      operationInFlight.current = false;
+      setBusy(false);
+    }
   };
   const changeExecution = async (body: Record<string, unknown>, message: string) => {
     if (!selected) return;
@@ -100,12 +114,21 @@ export default function HeaderControls() {
     if (active && !window.confirm(`${message} requires a safe engine restart. Continue?`)) return;
     await update(body, `${message} applied`);
   };
-  const lifecycle = async (action: "pause" | "resume" | "restart" | "stop") => {
-    if (!selected) return;
+  const lifecycle = async (action: "start" | "pause" | "resume" | "restart" | "stop") => {
+    if (!selected || operationInFlight.current) return;
+    operationInFlight.current = true;
+    setBusy(true);
     try {
       await apiPost(`/instances/${selected.id}/${action}`);
-      setOpen(null); live.refetch(); app.toast(`Instance ${action} successful`, "success");
-    } catch (error) { app.toast(error instanceof Error ? error.message : `${action} failed`, "error"); }
+      const refreshed = await live.refetch();
+      setOpen(null);
+      app.toast(refreshed ? `Instance ${action} successful` : `Instance ${action} accepted; live status refresh is reconnecting`, refreshed ? "success" : "info");
+    } catch (error) {
+      app.toast(error instanceof Error ? error.message : `${action} failed`, "error");
+    } finally {
+      operationInFlight.current = false;
+      setBusy(false);
+    }
   };
 
   const market = selected?.market_data?.market_data_status ?? "not available";
@@ -122,7 +145,10 @@ export default function HeaderControls() {
     rows.forEach((row) => list.push({ label: `Switch ${row.symbol}`, hint: `${row.strategy_label} · ${row.timeframe} · ${row.state}`, run: () => app.selectInstance(row.id) }));
     (options.data?.strategies ?? []).forEach((strategy) => strategy.versions.forEach((version) => list.push({ label: `Use ${strategy.label}`, hint: version, run: () => changeExecution({ strategy: strategy.key, strategy_version: version }, `Strategy change to ${strategy.label} ${version}`) })));
     (options.data?.timeframes ?? []).forEach((timeframe) => list.push({ label: `Set timeframe ${timeframe}`, run: () => changeExecution({ timeframe }, `Timeframe change to ${timeframe}`) }));
-    [0.0025, 0.005, 0.0075, 0.01].forEach((risk) => list.push({ label: `Set risk ${(risk * 100).toFixed(2)}%`, run: () => update({ risk_per_trade_pct: risk }, "Risk updated") }));
+    [0.0025, 0.005, 0.0075, 0.01].forEach((risk) => list.push({
+      label: `Set risk ${(risk * 100).toFixed(2)}%`,
+      run: async () => { await update({ risk_per_trade_pct: risk }, "Risk updated"); },
+    }));
     list.push(
       { label: "Pause instance", run: () => lifecycle("pause") },
       { label: "Resume instance", run: () => lifecycle("resume") },
@@ -138,7 +164,7 @@ export default function HeaderControls() {
   const runCommand = async (command: Command) => { setPalette(false); setQuery(""); await command.run(); };
 
   return <>
-    <div className="hdr-controls" ref={root} aria-label="Quick trading controls">
+    <div className="hdr-controls" ref={root} aria-label="Quick trading controls" aria-busy={busy}>
       <div className="hdr-seg">
         <Chip menu="mode" open={open} setOpen={setOpen}><span className="dot online" /><b>{modeLabel}</b></Chip>
         {open === "mode" && <Popover label="Trading mode">
@@ -166,7 +192,7 @@ export default function HeaderControls() {
           <p className="hdr-pop-title">Strategy · change safely restarts engine</p>
           {(options.data?.strategies ?? []).flatMap((strategy) => strategy.versions.map((version) => {
             const active = strategy.key === selected?.strategy_key && version === selected?.strategy_version;
-            return <button key={`${strategy.key}-${version}`} className={`hdr-item ${active ? "active" : ""}`}
+            return <button key={`${strategy.key}-${version}`} disabled={busy} className={`hdr-item ${active ? "active" : ""}`}
               onClick={() => active ? setOpen(null) : void changeExecution({ strategy: strategy.key, strategy_version: version }, `Strategy change to ${strategy.label} ${version}`)}>
               <b>{strategy.label} {version}</b>{active && <span className="hdr-tag">active</span>}
             </button>;
@@ -178,7 +204,7 @@ export default function HeaderControls() {
         <Chip menu="timeframe" open={open} setOpen={setOpen}><b className="mono">{selected?.timeframe ?? "—"}</b></Chip>
         {open === "timeframe" && <Popover label="Execution timeframe">
           <p className="hdr-pop-title">Execution timeframe · restart + warm-up</p>
-          <div className="tf-grid">{(options.data?.timeframes ?? []).map((timeframe) => <button key={timeframe} className={`tf-btn ${timeframe === selected?.timeframe ? "active" : ""}`}
+          <div className="tf-grid">{(options.data?.timeframes ?? []).map((timeframe) => <button key={timeframe} disabled={busy} className={`tf-btn ${timeframe === selected?.timeframe ? "active" : ""}`}
             onClick={() => timeframe === selected?.timeframe ? setOpen(null) : void changeExecution({ timeframe }, `Timeframe change to ${timeframe}`)}>{timeframe}</button>)}</div>
         </Popover>}
       </div>
@@ -215,10 +241,12 @@ export default function HeaderControls() {
         <Chip menu="engine" open={open} setOpen={setOpen}><span className={`dot ${stateDot}`} /><b className="state-label">{engineState}</b></Chip>
         {open === "engine" && <Popover label="Engine lifecycle">
           <p className="hdr-pop-title">Actual worker lifecycle</p>
-          <button className="hdr-item" disabled={selected?.state !== "running"} onClick={() => void lifecycle("pause")}><b>Pause</b></button>
-          <button className="hdr-item" disabled={selected?.state !== "paused"} onClick={() => void lifecycle("resume")}><b>Resume</b></button>
-          <button className="hdr-item" disabled={!selected} onClick={() => void lifecycle("restart")}><b>Restart</b></button>
-          <button className="hdr-item danger" disabled={!selected || selected.state === "stopped"} onClick={() => void lifecycle("stop")}><b>Stop</b></button>
+          <button className="hdr-item" disabled={busy || !selected || !["stopped", "error", "created"].includes(selected.state)} onClick={() => void lifecycle("start")}><b>Start</b></button>
+          <button className="hdr-item" disabled={busy || selected?.state !== "running"} onClick={() => void lifecycle("pause")}><b>Pause</b></button>
+          <button className="hdr-item" disabled={busy || selected?.state !== "paused"} onClick={() => void lifecycle("resume")}><b>Resume</b></button>
+          <button className="hdr-item" disabled={busy || !selected} onClick={() => void lifecycle("restart")}><b>Restart</b></button>
+          <button className="hdr-item danger" disabled={busy || !selected || selected.state === "stopped"} onClick={() => void lifecycle("stop")}><b>Stop</b></button>
+          {busy && <p className="hdr-note">Applying and confirming server state…</p>}
           {selected?.last_error && <p className="hdr-note neg">{selected.last_error}</p>}
         </Popover>}
       </div>
