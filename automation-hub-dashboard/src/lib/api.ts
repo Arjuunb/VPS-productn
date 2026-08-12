@@ -379,7 +379,8 @@ export interface EngineStatus {
   current_symbol?: string | null;
   strategy?: string; entry_mode?: string;
   started_at: string | null; bars: number; signals: number; trades: number; rejections: number;
-  state?: "running" | "starting" | "paused" | "stopped" | "error" | "reconnecting";
+  state?: "created" | "starting" | "bootstrapping" | "warming" | "syncing" | "ready" |
+    "running" | "data_stale" | "recovering" | "paused" | "stopped" | "error";
   reason?: string | null; recommended_action?: string;
   lifecycle_state?: string; stop_reason?: string | null; last_error?: string | null;
   last_heartbeat?: string | null; last_activity?: string | null; last_bar_ts?: string | null;

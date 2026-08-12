@@ -5,9 +5,9 @@ classifies losses into NAMED, repeated mistakes, and turns strong patterns
 into bounded, reversible corrections that the live pipeline actually enforces:
 
     symbol-leak      one symbol keeps bleeding      -> trade it at half risk
-    regime-leak      losses cluster in one regime   -> block entries in it
-    low-conviction   sub-threshold entries lose     -> raise the confidence floor
-    revenge-trades   entries right after a loss lose -> enforce a cooldown
+    regime-leak      losses cluster in one regime   -> bounded risk reduction
+    low-conviction   sub-threshold entries lose     -> bounded risk reduction
+    revenge-trades   entries right after a loss lose -> bounded risk reduction
     session-leak     losses cluster in certain hours -> recommendation (report)
     slipped-stops    losses far beyond -1R           -> recommendation (report)
 
@@ -157,7 +157,7 @@ def classify(trades: list[dict], events: Optional[dict] = None) -> list[dict]:
             if s["trades"] >= 5 and s["net_pnl"] < 0 and s["win_rate"] < 35:
                 findings.append({"kind": "regime-leak", "key": regime, "evidence": s,
                                  "lesson": f"'{regime}' entries lose ({s['win_rate']}% win over {s['trades']}, "
-                                           f"{s['net_pnl']:+.2f}) — block entries in this regime."})
+                                           f"{s['net_pnl']:+.2f}) — reduce risk while fresh evidence is collected."})
 
         # 7. edge-regime — the mirror of the leak: a regime that consistently
         # over-earns deserves more capital (bounded), not just equal treatment
@@ -264,7 +264,8 @@ class LearningBook:
                            "multiplier": MIN_RISK_MULT, "evidence": ev}, f["lesson"])
                 elif f["kind"] == "regime-leak":
                     apply(f"regime:{f['key']}",
-                          {"type": "block_regime", "regime": f["key"], "evidence": ev}, f["lesson"])
+                          {"type": "risk_multiplier", "regime": f["key"],
+                           "multiplier": MIN_RISK_MULT, "evidence": ev}, f["lesson"])
                 elif f["kind"] == "low-conviction":
                     apply("confidence-floor",
                           {"type": "confidence_floor", "floor": min(0.65, 0.5 + MAX_CONF_BUMP),
@@ -309,9 +310,43 @@ class LearningBook:
         return self.report()
 
     # ------------------------------------------------------------ enforcement
-    def risk_multiplier(self, symbol: str) -> float:
+    def risk_multiplier(self, symbol: str, *, regime: str = "", confidence: float = 1.0,
+                        minutes_since_loss: Optional[float] = None) -> float:
+        """Bounded soft learning influence; it can reduce size, never veto.
+
+        Kill switches and market/risk integrity remain hard gates elsewhere.
+        Statistical lessons are deliberately advisory because a hard regime
+        block prevented the engine from collecting the new evidence required
+        to falsify or decay that same lesson.
+        """
+        factors = [1.0]
         adj = self.adjustments.get(f"symbol:{(symbol or '').upper()}")
-        return max(MIN_RISK_MULT, float(adj["multiplier"])) if adj else 1.0
+        if adj:
+            factors.append(float(adj.get("multiplier", 1.0)))
+        reg = self.adjustments.get(f"regime:{regime}") if regime else None
+        if reg:
+            factors.append(float(reg.get("multiplier", MIN_RISK_MULT)))
+        floor = self.adjustments.get("confidence-floor")
+        if floor and confidence < float(floor.get("floor", 0.0)):
+            factors.append(MIN_RISK_MULT)
+        cooldown = self.adjustments.get("cooldown")
+        if (cooldown and minutes_since_loss is not None
+                and minutes_since_loss < float(cooldown.get("minutes", 0))):
+            factors.append(MIN_RISK_MULT)
+        return max(MIN_RISK_MULT, min(factors))
+
+    def soft_adjustment(self, *, symbol: str, regime: str = "", confidence: float = 1.0,
+                        minutes_since_loss: Optional[float] = None) -> dict:
+        multiplier = self.risk_multiplier(
+            symbol, regime=regime, confidence=confidence,
+            minutes_since_loss=minutes_since_loss)
+        active = []
+        for key in (f"symbol:{(symbol or '').upper()}", f"regime:{regime}",
+                    "confidence-floor", "cooldown"):
+            if key in self.adjustments:
+                active.append(key)
+        return {"multiplier": multiplier, "active_rules": active,
+                "mode": "soft_risk_adjustment"}
 
     def side_multiplier(self, side: str) -> float:
         """Bounded size-down for a direction that keeps losing while the other
@@ -333,25 +368,8 @@ class LearningBook:
 
     def gate(self, *, symbol: str, regime: str = "", confidence: float = 1.0,
              minutes_since_loss: Optional[float] = None) -> Optional[str]:
-        """Return a human-readable block reason, or None to allow. The key of
-        the rule that fired is left in ``last_gate_key`` so the counterfactual
-        tracker can attribute the veto to the exact rule being graded."""
+        """Compatibility API: learning lessons are no longer hard vetoes."""
         self.last_gate_key = None
-        if regime and f"regime:{regime}" in self.adjustments:
-            ev = self.adjustments[f"regime:{regime}"]["evidence"]
-            self.last_gate_key = f"regime:{regime}"
-            return (f"Learned block: '{regime}' lost {ev['net_pnl']:+.2f} over "
-                    f"{ev['trades']} trades ({ev['win_rate']}% win)")
-        floor = self.adjustments.get("confidence-floor")
-        if floor and confidence < float(floor["floor"]):
-            self.last_gate_key = "confidence-floor"
-            return (f"Learned confidence floor {floor['floor']:.2f} — "
-                    f"entry confidence {confidence:.2f} is below it")
-        cd = self.adjustments.get("cooldown")
-        if cd and minutes_since_loss is not None and minutes_since_loss < float(cd["minutes"]):
-            self.last_gate_key = "cooldown"
-            return (f"Learned cooldown: {cd['minutes']}m after a loss "
-                    f"(only {minutes_since_loss:.0f}m elapsed)")
         return None
 
     # ---------------------------------------------------------------- report

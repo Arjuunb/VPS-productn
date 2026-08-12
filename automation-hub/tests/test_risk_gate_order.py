@@ -49,7 +49,8 @@ EXPECTED_GATE_ORDER = [
     "risk_guard",           # max open positions
     "correlation",
     "event_risk",
-    "learning",
+    # Learning is intentionally absent: it is an observable soft sizing input,
+    # never a hard rejection gate that can self-seal its own evidence stream.
     "risk_guard",           # auto-halt
     "trading_day",
     "session",
@@ -63,6 +64,8 @@ EXPECTED_GATE_ORDER = [
     "sizing",
     "exposure",
     "portfolio_exposure",
+    "venue_rules",          # selected venue metadata unavailable (fail closed)
+    "venue_rules",          # quantity/min-notional rejected by the venue
     "risk_engine",          # the standalone RiskEngine's mandatory veto — ADDED
     "global_risk",          # account-level guard unavailable (fail closed)
     "global_risk",          # account-level limit denied the entry

@@ -191,7 +191,8 @@ def _engine_payload() -> dict:
             state = "paused"
             reason = f"Trading controls are {_wa.controls.state.lower()}"
             recommendation = "Resume trading controls to allow new paper entries."
-        elif state not in ("starting", "reconnecting"):
+        elif state not in ("starting", "bootstrapping", "warming", "syncing",
+                           "ready", "data_stale", "recovering"):
             state = "running"
             recommendation = "Scanning closed candles; no action is required."
     elif state == "error":
@@ -216,8 +217,10 @@ def _engine_payload() -> dict:
         "auto_halted": _wa.pipeline.halted,
         "halt_reason": _wa.pipeline.halt_reason,
         "connected_exchange": getattr(_wa.settings, "default_exchange", "configured"),
-        # The paper engine uses server-side REST polling, not a hidden websocket.
-        "websocket_status": "not used (REST polling)",
+        "websocket_status": (
+            "connected" if (st.get("websocket") or {}).get("connected")
+            else "REST fallback" if (st.get("websocket") or {}).get("available") is False
+            else "not configured"),
         "market_session": session,
         "position_sizing_mode": _wa.pipeline.position_sizing_mode,
         "fixed_position_size": _wa.pipeline.fixed_position_size,

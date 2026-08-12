@@ -72,9 +72,17 @@ def production_readiness():
     except Exception:  # noqa: BLE001
         pass
     st = _wa.engine.status()
+    instance_states = []
+    try:
+        instance_states = [_wa.instance_manager.status(item.id)
+                           for item in _wa.instance_manager._instances.values()
+                           if item.mode == "trading"]
+    except Exception:  # readiness still reports the other independent checks
+        pass
     return readiness(api_ok=True, db_ok=db_ok, db_detail=db_detail, coverage=coverage,
                      strategy_errors=strat_err, order_errors=order_err,
-                     uptime_s=round(_wa.time.time() - _wa._BOOT, 0), engine_running=st.get("running", False))
+                     uptime_s=round(_wa.time.time() - _wa._BOOT, 0),
+                     engine_running=st.get("running", False), active_instances=instance_states)
 
 @router.get("/safety/live-readiness")
 def safety_live_readiness():

@@ -318,8 +318,14 @@ def test_the_timer_can_be_disabled_without_disabling_the_endpoints():
     code = ("import webhook_api as w;"
             "print(w.monitor_runner.status()['running'],"
             " w.monitor_runner.check()['auto_modify'])")
+    # The child starts in automation-hub/, so include both the hub modules and
+    # the repository root that owns the installed ``bot`` package. Docker has
+    # ``pip install -e .``; this path makes the source-tree test equivalent.
+    repo_root = os.path.dirname(pkg_root)
     env = {**os.environ, "HUB_MONITOR_AGENT": "0",
-           "PYTHONPATH": pkg_root + os.pathsep + os.environ.get("PYTHONPATH", "")}
+           "PYTHONPATH": os.pathsep.join((
+               pkg_root, repo_root, os.environ.get("PYTHONPATH", ""),
+           ))}
     r = subprocess.run([sys.executable, "-c", code], capture_output=True,
                        text=True, env=env, cwd=pkg_root, timeout=180)
     assert r.returncode == 0, r.stderr[-2000:]

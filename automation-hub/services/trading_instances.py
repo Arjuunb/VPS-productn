@@ -42,6 +42,11 @@ _TIMEFRAME_SECONDS = {
     "1h": 3600, "2h": 7200, "4h": 14400, "1d": 86400, "1w": 604800,
 }
 
+_ACTIVE_INSTANCE_STATES = {
+    "starting", "bootstrapping", "warming", "syncing", "ready", "running",
+    "data_stale", "recovering",
+}
+
 
 def _age_seconds(value: object) -> Optional[int]:
     if not value:
@@ -74,7 +79,7 @@ def _market_health(market: dict, *, timeframe: str, worker_state: str) -> dict:
         state = "error"
     elif worker_state in ("stopped",) and raw not in ("healthy", "stale", "disconnected"):
         state = "stopped"
-    elif raw == "warming_up" or int(out.get("warmup_bars") or 0) < 150:
+    elif worker_state in ("created", "starting", "bootstrapping", "warming", "syncing", "ready") or raw in ("warming_up", "bootstrapping", "warming", "syncing"):
         state = "warming_up"
     elif age is None:
         state = "error" if raw in ("failed", "error") else "disconnected"
@@ -499,6 +504,19 @@ class InstanceStore:
                 self.ledger._c.execute("INSERT OR REPLACE INTO instance_metrics(instance_id,data_json,updated_at) VALUES (:instance_id,:data_json,:updated_at)", row)
                 self.ledger._c.commit()
 
+    def append_engine_log(self, instance_id: str, *, level: str, message: str,
+                          timestamp: Optional[str] = None) -> None:
+        row = {"id": _id(), "instance_id": instance_id,
+               "ts": timestamp or _now(), "level": level, "message": message}
+        if self.remote:
+            remote_call_with_retry(lambda: self._table("instance_engine_logs").insert(row).execute())
+        else:
+            with self.ledger._lock:
+                self.ledger._c.execute(
+                    "INSERT INTO instance_engine_logs(id,instance_id,ts,level,message) "
+                    "VALUES (:id,:instance_id,:ts,:level,:message)", row)
+                self.ledger._c.commit()
+
     def platform_settings(self) -> dict:
         defaults = {"max_active_slots": 1, "max_global_risk_pct": 0.02,
                     "max_global_daily_loss_pct": 0.05, "paper_account_capital": None}
@@ -537,12 +555,32 @@ class TradingInstanceManager:
                  live: bool, live_poll_s: float, fetcher=None, max_slots: int = 1,
                  max_global_risk_pct: float = 0.02, max_global_daily_loss_pct: float = 0.05,
                  paper_account_capital: float = 10_000.0, decision_store=None,
-                 decision_journal=None, trade_memory=None):
+                 decision_journal=None, trade_memory=None,
+                 max_drawdown_pct: float = 0.20, max_daily_loss_pct: float = 0.0,
+                 max_consecutive_losses: int = 0, cooldown_after_loss_min: int = 0,
+                 session_start: int = 0, session_end: int = 24,
+                 max_weekly_loss_pct: float = 0.0, max_trades_per_day: int = 0,
+                 trading_days_mask: int = 127):
         self.ledger, self.store = ledger, InstanceStore(ledger)
         self.strategy_factory, self.live, self.live_poll_s, self.fetcher = strategy_factory, live, live_poll_s, fetcher
         self.decision_store = decision_store
         self.decision_journal = decision_journal
         self.trade_memory = trade_memory
+        # Instance workers own their positions, but production risk policy is
+        # supplied by the server and applied to every isolated pipeline. These
+        # values were previously omitted, silently disabling several configured
+        # guards for Trading Instances while the legacy engine enforced them.
+        self.pipeline_risk = {
+            "max_drawdown_pct": max_drawdown_pct,
+            "max_daily_loss_pct": max_daily_loss_pct,
+            "max_consecutive_losses": max_consecutive_losses,
+            "cooldown_after_loss_min": cooldown_after_loss_min,
+            "session_start": session_start,
+            "session_end": session_end,
+            "max_weekly_loss_pct": max_weekly_loss_pct,
+            "max_trades_per_day": max_trades_per_day,
+            "trading_days_mask": trading_days_mask,
+        }
         # Forward trading intentionally does not inherit HUB_USE_LIVE_DATA. It
         # always uses the strict provider-only adapter; a missing provider is a
         # fail-closed market-data error, never a replay fallback.
@@ -604,7 +642,7 @@ class TradingInstanceManager:
                                   and item.strategy_key == strategy_key
                                   and item.strategy_version == (strategy_version or "builtin-1")
                                   and item.timeframe == timeframe and item.exchange == exchange
-                                  and item.state in ("running", "paused", "reconnecting", "starting")), None)
+                                  and item.state in (_ACTIVE_INSTANCE_STATES | {"paused"})), None)
                 if duplicate is not None:
                     raise ValueError("This Trading Instance is already active")
                 allocated = sum(item.capital_allocation for item in self._instances.values() if item.mode == "trading")
@@ -683,8 +721,18 @@ class TradingInstanceManager:
     def start(self, instance_id: str) -> TradingInstance:
         with self._lock:
             inst = self._instances[instance_id]
-            if instance_id in self._runtime and self._runtime[instance_id][0].running:
+            prior_runtime = self._runtime.get(instance_id)
+            if prior_runtime is not None and prior_runtime[0].running:
                 return inst
+            # A failed worker may still own a stopped thread and WebSocket feed.
+            # Starting it again must replace those resources, never layer a
+            # second feed over stale process state. Restart remains idempotent.
+            prior_runtime = self._runtime.pop(instance_id, None)
+            if prior_runtime is not None:
+                prior_runtime[0].stop("Replacing inactive worker before start")
+                prior_feed = getattr(prior_runtime[0], "ws_feed", None)
+                if prior_feed is not None:
+                    prior_feed.stop()
             active_trading = sum(1 for key, runtime in self._runtime.items()
                                  if runtime[0].running and self._instances[key].mode == "trading")
             if inst.mode == "trading" and active_trading >= self.max_slots:
@@ -710,6 +758,7 @@ class TradingInstanceManager:
             pipeline = SignalPipeline(scoped, paper, controls, equity=inst.capital_allocation,
                                       risk_per_trade_pct=inst.risk_per_trade_pct, exposure_limit_pct=0.05,
                                       max_open_positions=inst.max_open_positions,
+                                      **self.pipeline_risk,
                                       position_sizing_mode=inst.sizing_mode,
                                       fixed_position_size=inst.fixed_quantity,
                                       equity_provider=paper.current_realized_equity,
@@ -722,6 +771,19 @@ class TradingInstanceManager:
             # provenance so evidence is never silently blended.
             pipeline.journal = self.decision_journal
             pipeline.trade_memory = self.trade_memory
+            # Learning evidence is scoped to this worker's ledger/history. A
+            # BTC Brain lesson can never suppress an ETH Supertrend instance.
+            from services.learning import LearningBook
+            learning_path = None
+            ledger_path = str(getattr(self.ledger, "path", ""))
+            if self.store.remote or (ledger_path and ledger_path != ":memory:"):
+                default_root = (os.path.join(os.path.dirname(ledger_path), "instance-learning")
+                                if ledger_path and ledger_path != ":memory:"
+                                else os.path.join(os.environ.get("HUB_DATA_DIR", "/var/lib/tradexa"),
+                                                  "instance-learning"))
+                root = os.environ.get("HUB_INSTANCE_LEARNING_DIR", default_root)
+                learning_path = os.path.join(root, f"{instance_id}.json")
+            pipeline.learning = LearningBook(learning_path)
             pipeline.journal_context = {
                 "instance_id": inst.id,
                 "strategy_version": inst.strategy_version,
@@ -740,7 +802,7 @@ class TradingInstanceManager:
             fetch_parameters = inspect.signature(self.forward_fetcher).parameters if forward else {}
             supports_exchange = "exchange" in fetch_parameters
             supports_since = "since_ms" in fetch_parameters
-            def instance_forward_fetcher(symbol, timeframe, limit, since_ms=None):
+            def instance_forward_fetcher(symbol, timeframe, limit, since_ms=None, **_ignored):
                 kwargs = {}
                 if supports_since:
                     kwargs["since_ms"] = since_ms
@@ -766,11 +828,34 @@ class TradingInstanceManager:
                     missing_candles=int(market.get("missing_candles") or 0),
                     out_of_order_candles=int(market.get("out_of_order_candles") or 0))
             def checkpoint(timestamp: str) -> None:
+                runtime_status = engine_ref["engine"].status() if "engine" in engine_ref else {}
                 self.store.save_market_state(instance_id,
                     last_processed_candle_timestamp=timestamp,
-                    market_data_mode="paper_forward", market_data_status="healthy",
-                    last_market_data_timestamp=timestamp, data_source="live provider",
-                    warmup_bars=150)
+                    market_data_mode="paper_forward",
+                    market_data_status=runtime_status.get("market_data_status", "healthy"),
+                    last_market_data_timestamp=runtime_status.get("last_closed_candle") or timestamp,
+                    data_source=runtime_status.get("data_source"),
+                    warmup_bars=int(runtime_status.get("warmup_bars") or 0),
+                    duplicate_candles=int(runtime_status.get("duplicate_candles_ignored") or 0),
+                    missing_candles=int(runtime_status.get("missing_candles") or 0),
+                    out_of_order_candles=int(runtime_status.get("out_of_order_candles") or 0))
+            def lifecycle(event: dict) -> None:
+                state = str(event["state"])
+                with self._lock:
+                    target = self._instances.get(instance_id)
+                    if target is not None:
+                        target.state = state
+                        if state == "running":
+                            target.last_error = ""
+                        elif state in ("data_stale", "recovering", "error"):
+                            target.last_error = str(event.get("reason") or "")[:500]
+                        self.store.save(target)
+                level = "error" if state == "error" else "warning" if state in ("data_stale", "recovering") else "info"
+                self.store.append_engine_log(
+                    instance_id, level=level, timestamp=event.get("timestamp"),
+                    message=(f"state={state} reason={event.get('reason') or ''} "
+                             f"symbol={inst.symbol} timeframe={inst.timeframe}"))
+            engine_ref: dict[str, AutoStrategyEngine] = {}
             engine = AutoStrategyEngine(pipeline, paper, scoped, symbols=[inst.symbol], timeframe=inst.timeframe,
                                         strategy_factory=lambda symbol: self.strategy_factory(inst.strategy_key, symbol),
                                         live=forward, live_poll_s=self.live_poll_s,
@@ -779,14 +864,30 @@ class TradingInstanceManager:
                                         candle_checkpoint=checkpoint if forward else None,
                                         initial_pending_orders=market.get("pending_orders_json") if forward else None,
                                         pending_orders_checkpoint=(lambda pending: self.store.save_pending_orders(instance_id, pending)) if forward else None,
-                                        entry_mode=inst.entry_mode)
+                                        entry_mode=inst.entry_mode, instance_id=instance_id,
+                                        lifecycle_callback=lifecycle)
+            engine_ref["engine"] = engine
+            probe_strategy = engine.strategy_factory(inst.symbol)
+            required_decision_timeframe = getattr(probe_strategy, "decision_timeframe", None)
+            if required_decision_timeframe and inst.timeframe != required_decision_timeframe:
+                if ws_feed is not None:
+                    ws_feed.stop()
+                raise ValueError(
+                    f"{inst.strategy_label} {inst.strategy_version} requires "
+                    f"the {required_decision_timeframe} decision timeframe")
             engine.ws_feed = ws_feed
             engine.strategy_label = f"{inst.strategy_label} {inst.strategy_version}"
             engine.decisions = self.decision_store
-            engine.start(); self._runtime[instance_id] = (engine, paper, pipeline, controls)
-            inst.state, inst.desired_running, inst.last_error = "running", True, ""
+            self._runtime[instance_id] = (engine, paper, pipeline, controls)
+            inst.state, inst.desired_running, inst.last_error = "starting", True, ""
             inst.started_at, inst.stopped_at = _now(), None
-            self.store.save(inst); return inst
+            self.store.save(inst)
+            engine.start()
+            observed_state = engine.status().get("lifecycle_state")
+            if observed_state and observed_state != inst.state:
+                inst.state = observed_state
+                self.store.save(inst)
+            return inst
 
     def stop(self, instance_id: str) -> TradingInstance:
         inst = self._instances[instance_id]
@@ -925,7 +1026,7 @@ class TradingInstanceManager:
             inst.timeframe = timeframe or inst.timeframe
             inst.last_error = ""
             self.store.save(inst)
-            if rebuild_required and prior_state in ("running", "reconnecting", "starting"):
+            if rebuild_required and prior_state in _ACTIVE_INSTANCE_STATES:
                 self.start(instance_id)
             elif rebuild_required and prior_state == "paused":
                 self.start(instance_id)
@@ -1011,8 +1112,11 @@ class TradingInstanceManager:
             risk_status, risk_message = "warning", "Risk capacity almost reached"
         else:
             risk_status, risk_message = "healthy", "Global risk within limits"
+        active_lifecycle = {"starting", "bootstrapping", "warming", "syncing", "ready",
+                            "running", "data_stale", "recovering"}
         market_states = [str((row.get("market_data") or {}).get("market_data_status") or "")
-                         for row in runtime_states if row.get("mode") == "trading" and row.get("state") == "running"]
+                         for row in runtime_states if row.get("mode") == "trading"
+                         and (row.get("state") in active_lifecycle or row.get("desired_running"))]
         worker_errors = sum(1 for row in runtime_states if row.get("state") == "error")
         if not self.store.available or worker_errors or any(s in ("error", "disconnected") for s in market_states):
             global_status = "critical"
@@ -1028,7 +1132,9 @@ class TradingInstanceManager:
                 "total_open_positions": len(open_positions),
                 "total_instances": len(self._instances),
                 "instance_counts": {state: sum(1 for row in runtime_states if row.get("state") == state)
-                                    for state in ("running", "paused", "stopped", "error")},
+                                    for state in ("created", "starting", "bootstrapping", "warming", "syncing",
+                                                  "ready", "running", "data_stale", "recovering",
+                                                  "paused", "stopped", "error")},
                 "total_allocated_capital": round(allocated_capital, 2),
                 "paper_account_capital": round(self.paper_account_capital, 2),
                 "total_current_equity": round(total_equity, 2),
@@ -1078,7 +1184,7 @@ class TradingInstanceManager:
                 if inst.mode == "trading":
                     restored_trading += 1
             except Exception as exc:  # one broken instance cannot block others
-                inst.state, inst.last_error, inst.desired_running = "error", str(exc)[:500], False
+                inst.state, inst.last_error = "error", str(exc)[:500]
                 self.store.save(inst)
         return restored
 
@@ -1188,7 +1294,8 @@ class TradingInstanceManager:
             # a clean replay completion likewise must not restart on deploy.
             inst.state = state
             inst.last_error = engine.get("last_error") or engine.get("stop_reason") or ""
-            inst.desired_running = False
+            if state == "stopped":
+                inst.desired_running = False
             self.store.save(inst)
         if inst.mode == "trading" and engine and state in ("stopped", "error"):
             # Preserve a terminal data diagnosis for the dashboard after the

@@ -64,6 +64,20 @@ BUILTIN_STRATEGY_VERSIONS: Mapping[str, BuiltinStrategyVersion] = MappingProxyTy
         fixture_signal_count=22,
         fixture_signal_sha256="f811f8fd7c7d67ce8bc7cbb3719760f12801566960c284dd4deaff7863c68b98",
     ),
+    "adaptive_trend_pullback": BuiltinStrategyVersion(
+        key="adaptive_trend_pullback",
+        version="1.0.0",
+        label="Adaptive MTF Trend Pullback",
+        source_ref="source-controlled production candidate",
+        source_blob="strategy-package-v1.0.0",
+        defaults=(("fast_ema", 20), ("slow_ema", 50), ("adx_period", 14),
+                  ("adx_min", 20), ("regime_confidence_min", 70),
+                  ("quality_minimum", 75), ("minimum_rr", 2.0),
+                  ("target_rr", 2.5), ("stop_atr_buffer", 0.25)),
+        fixture="Deterministic long/short/range/high-volatility multi-timeframe fixtures",
+        fixture_signal_count=2,
+        fixture_signal_sha256="1b2043dd98cf75f32b5ce24d74833794074feae5763612e3dea782ee51a0e701",
+    ),
 })
 
 

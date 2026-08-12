@@ -206,6 +206,9 @@ def _make_strategy(symbol: str):
     if s == "liquidity_sweep":
         from strategies.liquidity_sweep_strategy import LiquiditySweepStrategy
         return LiquiditySweepStrategy(symbol)
+    if s == "adaptive_trend_pullback":
+        from strategies.adaptive_trend_pullback import AdaptiveTrendPullbackConfig, AdaptiveTrendPullbackStrategy
+        return AdaptiveTrendPullbackStrategy(symbol, config=AdaptiveTrendPullbackConfig.from_env())
     from strategies.brain_strategy import DecisionBrain
     return DecisionBrain(symbol)
 
@@ -230,6 +233,9 @@ def _make_instance_strategy(key: str, symbol: str):
     if key == "liquidity_sweep":
         from strategies.liquidity_sweep_strategy import LiquiditySweepStrategy
         return LiquiditySweepStrategy(symbol)
+    if key == "adaptive_trend_pullback":
+        from strategies.adaptive_trend_pullback import AdaptiveTrendPullbackConfig, AdaptiveTrendPullbackStrategy
+        return AdaptiveTrendPullbackStrategy(symbol, config=AdaptiveTrendPullbackConfig.from_env())
     from strategies.brain_strategy import DecisionBrain
     return DecisionBrain(symbol)
 
@@ -274,7 +280,30 @@ instance_manager = TradingInstanceManager(
     decision_store=decision_store,
     decision_journal=pipeline.journal,
     trade_memory=trade_memory,
+    max_drawdown_pct=settings.max_drawdown_pct,
+    max_daily_loss_pct=settings.max_daily_loss_pct,
+    max_consecutive_losses=settings.max_consecutive_losses,
+    cooldown_after_loss_min=settings.cooldown_after_loss_min,
+    session_start=settings.session_start,
+    session_end=settings.session_end,
+    max_weekly_loss_pct=settings.max_weekly_loss_pct,
+    max_trades_per_day=settings.max_trades_per_day,
+    trading_days_mask=settings.trading_days_mask,
 )
+
+def _instance_execution_status():
+    rows = [instance_manager.status(item.id) for item in instance_manager._instances.values()
+            if item.mode == "trading" and item.desired_running]
+    ready = [row for row in rows if row.get("state") in ("ready", "running")]
+    working = [row for row in rows if row.get("state") in
+               ("starting", "bootstrapping", "warming", "syncing", "recovering", "data_stale")]
+    if ready:
+        return {"state": "up", "detail": f"{len(ready)} ready; waiting for valid closed-candle signals"}
+    if working:
+        return {"state": "warming", "detail": f"{len(working)} worker(s) bootstrapping/recovering"}
+    return {"state": "idle", "detail": "no desired paper instance"}
+
+bot_os.set_status_fn("Execution Engine", _instance_execution_status)
 
 # Semi-auto / signal trading modes: the human-approval queue for entries.
 from services.approvals import ApprovalStore  # noqa: E402
@@ -861,6 +890,10 @@ _STRATEGY_CATALOG = [
      "desc": "SMC supply/demand zones: liquidity sweep + CHoCH/BOS + FVG with higher-timeframe bias"},
     {"key": "liquidity_sweep", "label": "Liquidity Sweep",
      "desc": "Stop-hunt wick beyond a prior range, candle reclaim, ATR-defined invalidation"},
+    {"key": "adaptive_trend_pullback", "label": "Adaptive MTF Trend Pullback",
+     "version": builtin_strategy_version("adaptive_trend_pullback"),
+     "supported_timeframes": ["5m"],
+     "desc": "4H regime + 1H trend + 15M pullback location + 5M confirmed entry"},
 ]
 
 # Reconcile the engine label with a persisted strategy choice: the overrides
@@ -963,6 +996,9 @@ def _build_builtin(key: str, symbol: str):
     if key == "liquidity_sweep":
         from strategies.liquidity_sweep_strategy import LiquiditySweepStrategy
         return LiquiditySweepStrategy(symbol)
+    if key == "adaptive_trend_pullback":
+        from strategies.adaptive_trend_pullback import AdaptiveTrendPullbackConfig, AdaptiveTrendPullbackStrategy
+        return AdaptiveTrendPullbackStrategy(symbol, config=AdaptiveTrendPullbackConfig.from_env())
     from strategies.brain_strategy import DecisionBrain
     return DecisionBrain(symbol)
 

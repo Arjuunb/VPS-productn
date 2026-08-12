@@ -151,13 +151,17 @@ class WebSocketFeed:
     def make_fetcher(self, fallback: Callable[[str, str, int], tuple]):
         """A drop-in engine fetcher: WS cache when fresh, REST fallback when not.
         Seeds the cache from the fallback so streams start with warm history."""
-        def fetcher(symbol: str, timeframe: str, limit: int):
-            if self.available and timeframe == self.timeframe and self.fresh(symbol):
+        def fetcher(symbol: str, timeframe: str, limit: int, **kwargs):
+            # A cursor-relative recovery request needs a precise REST window;
+            # the rolling WS cache contains only the newest bars and must not
+            # masquerade as historical backfill.
+            cursor_request = kwargs.get("since_ms") is not None
+            if not cursor_request and self.available and timeframe == self.timeframe and self.fresh(symbol):
                 bars = self.get_bars(symbol, limit)
-                if len(bars) >= min(limit, 30):
+                if len(bars) >= limit:
                     self.websocket_reads += 1
                     return bars, "live (websocket)"
-            bars, src = fallback(symbol, timeframe, limit)
+            bars, src = fallback(symbol, timeframe, limit, **kwargs)
             self.rest_fallback_reads += 1
             # keep the cache warm so the stream picks up with full history
             if bars and timeframe == self.timeframe and not self.get_bars(symbol, 1):

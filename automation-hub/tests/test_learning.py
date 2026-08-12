@@ -78,7 +78,7 @@ def test_book_applies_bounded_corrections_and_relaxes_them(tmp_path):
     assert any(h["action"] == "relaxed" for h in book2.history)
 
 
-def test_book_gate_blocks_learned_regime_and_low_confidence():
+def test_book_softens_learned_regime_and_low_confidence_without_veto():
     book = LearningBook()
     trades = [_trade("BTCUSDT", pnl=-10, alert=f"a{i}",
                      opened=T0 + timedelta(hours=5 * i)) for i in range(5)]
@@ -87,9 +87,11 @@ def test_book_gate_blocks_learned_regime_and_low_confidence():
     events = {f"a{i}": {"confidence": 0.55, "regime": "Ranging"} for i in range(5)}
     events |= {f"b{i}": {"confidence": 0.9, "regime": "Trending"} for i in range(5)}
     book.update(list(reversed(trades)), events, now=T0 + timedelta(days=1))
-    assert book.gate(symbol="BTCUSDT", regime="Ranging") is not None
+    assert book.gate(symbol="BTCUSDT", regime="Ranging") is None
+    assert book.soft_adjustment(symbol="BTCUSDT", regime="Ranging")["multiplier"] < 1.0
     assert book.gate(symbol="BTCUSDT", regime="Trending", confidence=0.9) is None
-    assert book.gate(symbol="BTCUSDT", regime="", confidence=0.5) is not None  # floor
+    assert book.gate(symbol="BTCUSDT", regime="", confidence=0.5) is None
+    assert book.soft_adjustment(symbol="BTCUSDT", confidence=0.5)["multiplier"] < 1.0
 
 
 # ─────────────────────────── pipeline enforcement ───────────────────────────
@@ -104,7 +106,7 @@ def _pipe_with_book():
     return pipe, paper
 
 
-def test_pipeline_rejects_learned_regime_and_halves_probation_risk():
+def test_pipeline_softens_learned_regime_and_halves_probation_risk():
     pipe, paper = _pipe_with_book()
     # teach it: SOL bleeds, and 'Choppy' regime bleeds (via events)
     losers = [_trade("SOLUSDT", pnl=-10, alert=f"a{i}",
@@ -115,10 +117,11 @@ def test_pipeline_rejects_learned_regime_and_halves_probation_risk():
     events |= {f"b{i}": {"confidence": 0.9, "regime": "Trending"} for i in range(6)}
     pipe.learning.update(list(reversed(losers + winners)), events, now=T0)
 
-    blocked = pipe.process({"alert_id": "x1", "symbol": "ETHUSDT", "side": "BUY",
+    adjusted = pipe.process({"alert_id": "x1", "symbol": "ETHUSDT", "side": "BUY",
                             "entry": 100.0, "stop": 95.0, "confidence": 0.9,
                             "regime": "Choppy"})
-    assert not blocked.accepted and blocked.stage == "learning"
+    assert adjusted.accepted
+    assert any(step.rule == "learning" and "soft risk" in step.detail for step in adjusted.steps)
 
     ok = pipe.process({"alert_id": "x2", "symbol": "SOLUSDT", "side": "BUY",
                        "entry": 100.0, "stop": 95.0, "confidence": 1.0,

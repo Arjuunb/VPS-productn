@@ -28,6 +28,7 @@ PRESETS: dict = {
     "EMA 20/50": {"kind": "custom", "side": "long",
                   "rules": [{"type": "ema_cross", "fast": 20, "slow": 50, "dir": "above"}]},
     "Liquidity Sweep": {"kind": "builtin", "key": "liquidity_sweep"},
+    "Adaptive MTF Trend Pullback": {"kind": "builtin", "key": "adaptive_trend_pullback"},
     "Custom Strategy": {"kind": "custom_user"},
 }
 STRATEGY_OPTIONS = list(PRESETS)
@@ -50,6 +51,10 @@ REGISTRY = [
      "timeframes": ["1h", "4h"], "description": "EMA 20 over EMA 50 cross"},
     {"id": "liquidity_sweep", "name": "Liquidity Sweep", "version": "1.0", "kind": "builtin",
      "timeframes": ["5m", "15m", "1h", "4h"], "description": "Stop-hunt wick + confirmed reclaim + ATR invalidation"},
+    {"id": "adaptive_trend_pullback", "name": "Adaptive MTF Trend Pullback",
+     "version": builtin_strategy_version("adaptive_trend_pullback"), "kind": "builtin",
+     "timeframes": ["5m"],
+     "description": "4H regime + 1H trend + 15M pullback + 5M confirmation"},
     {"id": "custom", "name": "Custom Strategy", "version": "1.0", "kind": "custom_user",
      "timeframes": [], "description": "User-built rule strategy"},
 ]

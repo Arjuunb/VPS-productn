@@ -549,16 +549,21 @@ class SignalPipeline:
                                   f"caution: {ev['next_event']['name']} in "
                                   f"{ev['minutes_to_event']:.0f}m → risk ×{econ_risk:.2f}"))
 
-        # 3c3. learned blocks — corrections the bot taught itself from its own
-        # losing trades (bad regime, low conviction, post-loss cooldown)
+        # 3c3. Learning is a soft, observable sizing input. Statistical lessons
+        # must not become a self-sealing hard veto; safety hard-stops remain in
+        # the risk, drawdown, exposure and market-data gates.
+        learning_soft = {"multiplier": 1.0, "active_rules": []}
         if self.learning is not None:
             secs = self._since_last_loss()
-            why = self.learning.gate(symbol=symbol, regime=payload.get("regime", ""),
-                                     confidence=confidence,
-                                     minutes_since_loss=None if secs is None else secs / 60)
-            if why:
-                return reject("learning", why)
-            steps.append(Step("learning", True, "no learned blocks"))
+            learning_soft = self.learning.soft_adjustment(
+                symbol=symbol, regime=payload.get("regime", ""), confidence=confidence,
+                minutes_since_loss=None if secs is None else secs / 60)
+            steps.append(Step(
+                "learning", True,
+                f"soft risk ×{learning_soft['multiplier']:.2f}; "
+                f"rules={','.join(learning_soft['active_rules']) or 'none'}"))
+        else:
+            steps.append(Step("learning", True, "soft learning not configured; risk ×1.00"))
 
         # 3d. drawdown circuit breaker — auto-halt NEW ENTRIES until manual resume
         #     (exits are never blocked, so open positions can always stop out).
@@ -643,7 +648,7 @@ class SignalPipeline:
         # composition is bit-identical to the expression this replaced.
         kf = self._kelly_factor() if self.adaptive_risk else 1.0
         ef = self._equity_curve_factor() if self.equity_throttle else 1.0
-        lf = self.learning.risk_multiplier(symbol) if self.learning is not None else 1.0
+        lf = float(learning_soft["multiplier"])
         af = float(self.allocator(symbol)) if self.allocator is not None else 1.0
         xf = _clamp_context(payload.get("context_size_factor", 1.0))
         # The autonomous engine may reduce new-entry risk when the current

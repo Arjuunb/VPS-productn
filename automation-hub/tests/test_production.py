@@ -18,7 +18,7 @@ def test_healthy_when_all_pass():
                   strategy_errors=0, order_errors=0, uptime_s=500, engine_running=True)
     assert r["status"] == "healthy"
     assert all(c["ok"] for c in r["checks"])
-    assert r["summary"].startswith("6/6")
+    assert r["summary"].startswith("9/9")
 
 
 def test_degraded_on_errors_or_no_data():
@@ -26,8 +26,8 @@ def test_degraded_on_errors_or_no_data():
                   strategy_errors=2, order_errors=1, uptime_s=10, engine_running=False)
     assert r["status"] == "degraded"
     names = {c["name"]: c for c in r["checks"]}
-    assert names["Data freshness"]["ok"] is False
-    assert names["Strategy errors"]["ok"] is False and names["Engine"]["ok"] is False
+    assert names["Historical cache coverage"]["ok"] is False
+    assert names["Strategy errors"]["ok"] is False and names["Execution readiness"]["ok"] is False
 
 
 def test_down_when_db_unreachable():
@@ -35,6 +35,46 @@ def test_down_when_db_unreachable():
                   strategy_errors=0, order_errors=0, uptime_s=5, engine_running=True)
     assert r["status"] == "down"
     assert any(c["name"] == "Database" and c["level"] == "down" for c in r["checks"])
+
+
+def test_active_instance_freshness_and_execution_readiness_are_not_cache_coverage():
+    stale = {"desired_running": True, "state": "data_stale",
+             "market_data": {"market_data_status": "stale"},
+             "engine": {"last_heartbeat": datetime.now(timezone.utc).isoformat(),
+                        "websocket": {"available": False}}}
+    result = readiness(api_ok=True, db_ok=True, db_detail="ok", coverage=_cov(3),
+                       strategy_errors=0, order_errors=0, uptime_s=50,
+                       engine_running=False, active_instances=[stale])
+    checks = {item["name"]: item for item in result["checks"]}
+    assert checks["Historical cache coverage"]["ok"] is True
+    assert checks["Active feed freshness"]["ok"] is False
+    assert checks["Execution readiness"]["ok"] is False
+
+
+def test_readiness_requires_every_desired_websocket_or_explicit_rest_fallback():
+    now = datetime.now(timezone.utc).isoformat()
+    connected = {"desired_running": True, "state": "running",
+                 "market_data": {"market_data_status": "healthy"},
+                 "engine": {"last_heartbeat": now,
+                            "websocket": {"available": True, "rest_fallback_reads": 0}}}
+    disconnected = {"desired_running": True, "state": "running",
+                    "market_data": {"market_data_status": "healthy"},
+                    "engine": {"last_heartbeat": now,
+                               "websocket": {"available": False, "rest_fallback_reads": 0}}}
+    result = readiness(api_ok=True, db_ok=True, db_detail="ok", coverage=_cov(2),
+                       strategy_errors=0, order_errors=0, uptime_s=50,
+                       engine_running=False, active_instances=[connected, disconnected])
+    checks = {item["name"]: item for item in result["checks"]}
+    assert checks["WebSocket connected"]["ok"] is False
+
+    disconnected["engine"]["websocket"]["rest_fallback_reads"] = 2
+    connected["engine"]["websocket"] = {"available": False, "rest_fallback_reads": 1}
+    fallback = readiness(api_ok=True, db_ok=True, db_detail="ok", coverage=_cov(2),
+                         strategy_errors=0, order_errors=0, uptime_s=50,
+                         engine_running=False, active_instances=[connected, disconnected])
+    fallback_check = {item["name"]: item for item in fallback["checks"]}["WebSocket connected"]
+    assert fallback_check["ok"] is True
+    assert "REST forward fallback" in fallback_check["detail"]
 
 
 def test_freshness_summary_counts_and_age():
@@ -61,5 +101,7 @@ def client():
 
 def test_production_endpoint(client):
     r = client.get("/production/readiness").json()
-    assert "status" in r and "checks" in r and len(r["checks"]) == 6
+    # Cache coverage, live-feed freshness, transport health, worker heartbeat,
+    # and execution readiness are deliberately separate operational signals.
+    assert "status" in r and "checks" in r and len(r["checks"]) == 9
     assert "memory_mb" in r and "uptime_s" in r and "data_freshness" in r

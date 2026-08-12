@@ -7,12 +7,14 @@ ledger). Nothing here is decorative — positions, P&L, stops/targets and the
 decision log are all produced by live strategy + risk logic and persisted to
 the ledger (the source of truth the dashboard reads).
 
-Flow per bar (on a background thread, replayed at ``interval`` seconds):
+Flow per closed bar (on a background worker):
     1. mark open positions -> close on stop-loss / take-profit hit
     2. feed the bar to the strategy -> on a Signal, open via the risk pipeline
 
-Data is local (bundled samples or deterministic synthetic), so it runs with no
-exchange keys. Opposite-direction crossovers also flatten via the pipeline's
+Trading Instances use provider REST history only to warm indicators, then
+consume new closed exchange candles through the WebSocket/forward feed. The
+legacy research path may replay local data, but it is never used by a forward
+paper instance. Opposite-direction crossovers also flatten via the pipeline's
 close path, so the engine and webhooks share identical execution semantics.
 """
 from __future__ import annotations
@@ -32,6 +34,10 @@ from services.signal_pipeline import SignalPipeline
 
 class EngineFeedError(RuntimeError):
     """A transient market-data failure eligible for bounded reconnect attempts."""
+
+
+class MarketDataStaleError(EngineFeedError):
+    """The provider is reachable but its latest closed candle is not current."""
 
 
 def _default_strategy_factory(symbol: str):
@@ -70,6 +76,8 @@ class AutoStrategyEngine:
         trade_manager=None,
         entry_mode: Optional[str] = None,
         limit_ttl_bars: int = 3,
+        instance_id: Optional[str] = None,
+        lifecycle_callback: Optional[Callable[[dict], None]] = None,
     ):
         self.pipeline = pipeline
         self.paper = paper
@@ -84,6 +92,7 @@ class AutoStrategyEngine:
         self.timeframe = timeframe
         self.interval = interval
         self.warmup = warmup
+        self.warmup_required_runtime = warmup
         self.live_bars = live_bars
         self.strategy_factory = strategy_factory
         # The rule spec behind the running strategy, when there is one. Set by
@@ -121,7 +130,7 @@ class AutoStrategyEngine:
         self.started_at: Optional[str] = None
         # Lifecycle state is server-owned.  A page refresh must never infer it
         # from a stale client timer or a missing websocket connection.
-        self.lifecycle_state = "stopped"  # starting|running|reconnecting|error|stopped
+        self.lifecycle_state = "stopped"  # bootstrapping|warming|syncing|ready|running|data_stale|recovering|error|stopped
         self.stop_reason = "Not started"
         self.last_error: Optional[str] = None
         self.last_heartbeat: Optional[str] = None
@@ -131,7 +140,8 @@ class AutoStrategyEngine:
         self.reconnect_next_at: Optional[str] = None
         self.autostart_enabled = True  # persisted by the control API
         self.last_trade: Optional[dict] = None
-        self.stats = {"bars": 0, "signals": 0, "trades": 0, "rejections": 0}
+        self.stats = {"bars": 0, "signals": 0, "accepted_signals": 0,
+                      "trades": 0, "rejections": 0}
         self._targets: dict[str, float] = {}
         # Mid-trade management (break-even / scale-out / trailing). The default
         # TradeManager has everything DISABLED — see services/trade_manager.py
@@ -151,6 +161,13 @@ class AutoStrategyEngine:
         import os as _os
         self.entry_mode = (entry_mode or _os.environ.get("HUB_ENTRY_MODE", "limit")).lower()
         self.limit_ttl_bars = max(1, int(limit_ttl_bars))
+        self.instance_id = instance_id
+        self._lifecycle_callback = lifecycle_callback
+        self.bootstrap_status = "not_started"
+        self.last_recovery_attempt: Optional[str] = None
+        self.next_expected_candle: Optional[str] = None
+        self.worker_task_identifier: Optional[str] = None
+        self.rejection_counts: dict[str, int] = {}
         # PARITY: every backtest/simulation filters entries through the
         # TradeBrain quality scorer (min score 60) — the live engine must
         # apply the IDENTICAL gate or live results run worse than the promise.
@@ -165,6 +182,10 @@ class AutoStrategyEngine:
         self.context = ContextModifiers(
             leader_bars_fn=lambda: self._fetcher("BTCUSDT", self.timeframe, 80)[0])
         self._pending: dict[str, dict] = dict(initial_pending_orders or {})
+        # Independently fetched completed candles for context-aware strategies.
+        # The engine filters each series again at every decision timestamp, so
+        # recovery cannot leak a newer 1H/4H close into an older 5M decision.
+        self._multi_timeframe_context: dict[str, dict[str, list]] = {}
         self.stats_missed_entries = 0
         # Shadow A/B: an optional services.shadow.ShadowRun fed the SAME bars
         # the live strategy trades — a candidate audition with zero capital.
@@ -225,7 +246,10 @@ class AutoStrategyEngine:
             self.last_transition = self.last_heartbeat
             from data.ledger import _now
             self.started_at = _now()
-            self._thread = threading.Thread(target=self._run, name="auto-engine", daemon=True)
+            worker_name = f"paper-instance-{self.instance_id or 'legacy'}"
+            self.worker_task_identifier = worker_name
+            self._thread = threading.Thread(target=self._run, name=worker_name, daemon=True)
+            self._emit_lifecycle("starting", "Worker thread created")
             self._thread.start()
             self.ledger.log(level="info", stage="engine",
                             message=f"Autonomous engine started — {', '.join(self.symbols)} ({self.timeframe})")
@@ -250,6 +274,7 @@ class AutoStrategyEngine:
             self.stop_reason = reason
             self.reconnect_next_at = None
             self.last_transition = self._utc_now()
+        self._emit_lifecycle("stopped", reason)
         self.ledger.log(level="info", stage="engine", message=f"Autonomous engine stopped: {reason}")
         return True
 
@@ -278,7 +303,8 @@ class AutoStrategyEngine:
         self._managed.clear()
         self._pending.clear()
         self._checkpoint_pending_orders()
-        self.stats = {"bars": 0, "signals": 0, "trades": 0, "rejections": 0}
+        self.stats = {"bars": 0, "signals": 0, "accepted_signals": 0,
+                      "trades": 0, "rejections": 0}
         self.start()
         return self.status()
 
@@ -296,7 +322,7 @@ class AutoStrategyEngine:
         if self.market_data_status == "stale":
             return "stale", self.last_error or err
         src = self.last_source or ""
-        if src.startswith("live"):
+        if src.startswith("live") or src.startswith("multi-timeframe"):
             return ("connected" if self.stats["bars"] > 0 else "waiting-for-candle"), None
         if src:
             return "fallback", err          # live wanted, static source delivered
@@ -321,6 +347,11 @@ class AutoStrategyEngine:
             "last_error": self.last_error,
             "last_heartbeat": self.last_heartbeat,
             "last_transition": self.last_transition,
+            "instance_id": self.instance_id,
+            "worker_task_identifier": self.worker_task_identifier,
+            "bootstrap_status": self.bootstrap_status,
+            "last_recovery_attempt": self.last_recovery_attempt,
+            "next_expected_candle": self.next_expected_candle,
             "reconnect_attempt": self.reconnect_attempt,
             "max_reconnect_attempts": self.max_reconnect_attempts,
             "reconnect_next_at": self.reconnect_next_at,
@@ -338,7 +369,7 @@ class AutoStrategyEngine:
             "last_closed_candle": self.last_closed_candle,
             "last_processed_candle_timestamp": self.last_processed_candle,
             "warmup_bars": self.warmup_bars,
-            "warmup_required": self.warmup,
+            "warmup_required": self.warmup_required_runtime,
             "duplicate_candles_ignored": self.duplicate_candles_ignored,
             "missing_candles": self.missing_candles,
             "out_of_order_candles": self.out_of_order_candles,
@@ -347,6 +378,7 @@ class AutoStrategyEngine:
             "missed_entries": self.stats_missed_entries,
             "strategy_health_guard": self.strategy_health_guard,
             "strategy_health": self._strategy_health,
+            "rejection_counts": dict(self.rejection_counts),
             **self.stats,
         }
 
@@ -365,6 +397,8 @@ class AutoStrategyEngine:
                             self._mark_stopped("Replay data completed — start a new paper run or enable live market data.")
                     return
                 except EngineFeedError as exc:
+                    if isinstance(exc, MarketDataStaleError):
+                        self._transition("data_stale", str(exc), error=exc)
                     delay = self._schedule_reconnect(exc)
                     if delay is None:
                         self._mark_error("Market data connection lost", exc)
@@ -389,7 +423,32 @@ class AutoStrategyEngine:
     def _heartbeat(self) -> None:
         self.last_heartbeat = self._utc_now()
 
+    def _emit_lifecycle(self, state: str, reason: str) -> None:
+        if self._lifecycle_callback is None:
+            return
+        try:
+            self._lifecycle_callback({
+                "instance_id": self.instance_id, "state": state, "reason": reason,
+                "timestamp": self.last_transition or self._utc_now(),
+                "symbol": self.symbols[0] if self.symbols else None,
+                "timeframe": self.timeframe,
+            })
+        except Exception as exc:  # observability must not kill execution
+            self.ledger.log(level="warning", stage="engine",
+                            message=f"Lifecycle persistence unavailable: {type(exc).__name__}: {exc}")
+
+    def _transition(self, state: str, reason: str, *, error: Optional[Exception] = None) -> None:
+        with self._lock:
+            self.lifecycle_state = state
+            self.stop_reason = reason or None
+            if error is not None:
+                self.last_error = f"{type(error).__name__}: {error}"[:500]
+            self.last_transition = self._utc_now()
+            self.last_heartbeat = self.last_transition
+        self._emit_lifecycle(state, reason)
+
     def _mark_running(self) -> None:
+        changed = self.lifecycle_state != "running"
         with self._lock:
             self.lifecycle_state = "running"
             self.stop_reason = None
@@ -398,12 +457,15 @@ class AutoStrategyEngine:
             self.reconnect_next_at = None
             self.last_transition = self._utc_now()
             self.last_heartbeat = self.last_transition
+        if changed:
+            self._emit_lifecycle("running", "Fresh closed market data confirmed")
 
     def _mark_stopped(self, reason: str) -> None:
         with self._lock:
             self.lifecycle_state = "stopped"
             self.stop_reason = reason
             self.last_transition = self._utc_now()
+        self._emit_lifecycle("stopped", reason)
 
     def _schedule_reconnect(self, exc: Exception) -> Optional[float]:
         with self._lock:
@@ -412,13 +474,15 @@ class AutoStrategyEngine:
             safe_error = f"{type(exc).__name__}: {exc}"[:500]
             self.last_error = safe_error
             self.last_heartbeat = self._utc_now()
+            self.last_recovery_attempt = self.last_heartbeat
             if attempt > self.max_reconnect_attempts:
                 return None
             delay = min(2.0 ** attempt, 30.0)
-            self.lifecycle_state = "reconnecting"
+            self.lifecycle_state = "recovering"
             self.stop_reason = "Market data connection lost"
             self.reconnect_next_at = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
             self.last_transition = self.last_heartbeat
+        self._emit_lifecycle("recovering", f"Automatic recovery attempt {attempt}/{self.max_reconnect_attempts}")
         self.ledger.log(level="warning", stage="engine",
                         message=(f"Market data connection lost — reconnecting "
                                  f"(attempt {attempt}/{self.max_reconnect_attempts} in {delay:.0f}s): {safe_error}"))
@@ -434,6 +498,7 @@ class AutoStrategyEngine:
             self.reconnect_next_at = None
             self.last_heartbeat = self._utc_now()
             self.last_transition = self.last_heartbeat
+        self._emit_lifecycle("error", reason)
         self.ledger.log(level="error", stage="engine",
                         message=f"Engine stopped — {reason}: {detail}" + (f"\n{stack}" if stack else ""))
 
@@ -473,30 +538,47 @@ class AutoStrategyEngine:
         last_ts: dict[str, object] = {}
 
         for sym in self.symbols:
+            self.bootstrap_status = "fetching_rest_history"
+            self._transition("bootstrapping", "Fetching provider history for indicator warm-up")
+            strat = self.strategy_factory(sym)
+            required_warmup = self._required_warmup(strat)
+            self.warmup_required_runtime = required_warmup
+            persisted = self._parse_timestamp(self.last_processed_candle)
             try:
-                bars, src = self._forward_fetch(sym, self.warmup + self.live_bars)
+                bars, src = self._fetch_bootstrap_history(sym, required_warmup, persisted)
             except Exception as exc:  # initial warmup previously killed the thread silently
                 raise EngineFeedError(f"{sym} warmup failed: {exc}") from exc
             if not (src or "").startswith("live"):
                 raise EngineFeedError(f"{sym} live feed unavailable (source: {src or 'none'})")
             self.last_source = src
-            strat = self.strategy_factory(sym)
-            closed = bars[:-1]                     # last candle may be in-progress
+            closed = self._closed_bars(bars, self.timeframe)
             if not closed:
                 raise EngineFeedError(f"{sym} live feed returned no closed candles")
             self._record_market_snapshot(sym, closed)
-            persisted = self._parse_timestamp(self.last_processed_candle)
             # On recovery indicators are warmed only through the persisted
             # cursor.  Newer bars are then processed chronologically below;
             # warming through them first would leak future information.
             warm = [b for b in closed if persisted is None or b.timestamp <= persisted]
-            if persisted is not None and len(warm) < self.warmup:
+            if len(warm) < required_warmup:
                 # The provider's regular window is not long enough to rebuild
                 # state safely from the cursor.  Do not replay/guess; fail
                 # closed and let the bounded reconnect/recovery path retry.
-                raise EngineFeedError(f"{sym} cannot rebuild {self.warmup}-bar warm-up before persisted candle")
-            for b in (warm[-self.warmup:] if persisted is not None else closed[-self.warmup:]):
-                strat.bars.append(b)
+                raise EngineFeedError(
+                    f"{sym} cannot rebuild {required_warmup}-bar warm-up before "
+                    f"{'persisted candle' if persisted is not None else 'live start'} "
+                    f"(provider returned {len(warm)} valid closed candles)")
+            if persisted is not None and warm[-1].timestamp != persisted:
+                raise EngineFeedError(
+                    f"{sym} provider backfill does not contain persisted candle {persisted.isoformat()}")
+            self._require_continuity(warm[-required_warmup:], self.timeframe)
+            self.bootstrap_status = "warming_indicators"
+            self._transition("warming", f"Loading {required_warmup} completed candles into strategy")
+            if self._is_multi_timeframe_strategy(strat):
+                self._refresh_multi_timeframe_context(sym, strat, entry_bars=closed)
+                self._apply_multi_timeframe_context(strat, closed[-1].timestamp)
+            else:
+                for b in warm[-required_warmup:]:
+                    strat.bars.append(b)
             strategies[sym] = strat
             self.warmup_bars = len(strat.bars)
             if persisted is None:
@@ -506,15 +588,21 @@ class AutoStrategyEngine:
                 self.last_processed_candle = last_ts[sym].isoformat()
                 self._checkpoint_candle(self.last_processed_candle)
             else:
+                self.bootstrap_status = "syncing_checkpoint"
+                self._transition("syncing", "Processing unseen closed candles after durable cursor")
                 last_ts[sym] = persisted
                 # Recover missed *closed* candles once and in chronological
                 # order. _ingest ignores the persisted candle itself.
+                unseen = [bar for bar in closed if bar.timestamp > persisted]
+                self._require_continuity([warm[-1], *unseen], self.timeframe)
                 last_ts[sym] = self._ingest(sym, strat, closed, last_ts[sym])
             self.ledger.log(level="info", stage="engine", symbol=sym,
                             message=f"market_data_connected symbol={sym} timeframe={self.timeframe} source={src}")
             self.ledger.log(level="info", stage="engine", symbol=sym,
                             message=f"warmup_complete bars={self.warmup_bars} last_closed={self.last_closed_candle}")
 
+        self.bootstrap_status = "ready"
+        self._transition("ready", "Warm-up and durable cursor synchronization complete")
         self._mark_running()
 
         while not self._stop.is_set():
@@ -528,12 +616,24 @@ class AutoStrategyEngine:
                 self.last_source = src
                 if not (src or "").startswith("live"):
                     raise EngineFeedError(f"{sym} live feed unavailable (source: {src or 'none'})")
-                closed = bars[:-1]
+                closed = self._closed_bars(bars, self.timeframe)
                 if not closed:
                     raise EngineFeedError(f"{sym} provider returned no closed candles")
                 self._record_market_snapshot(sym, closed)
-                self._mark_running()
+                unseen = [item for item in closed
+                          if last_ts[sym] is None or item.timestamp > last_ts[sym]]
+                has_new_candle = bool(unseen)
+                if unseen and last_ts[sym] is not None:
+                    expected = _TF_SECONDS.get(self.timeframe, 3600)
+                    if (unseen[0].timestamp - last_ts[sym]).total_seconds() != expected:
+                        raise EngineFeedError(
+                            f"{sym} missing candle after {last_ts[sym].isoformat()}; "
+                            "entering REST cursor recovery before any decision")
+                    self._require_continuity(unseen, self.timeframe)
+                if self._is_multi_timeframe_strategy(strategies[sym]) and has_new_candle:
+                    self._refresh_multi_timeframe_context(sym, strategies[sym], entry_bars=closed)
                 last_ts[sym] = self._ingest(sym, strategies[sym], closed, last_ts[sym])
+                self._mark_running()
                 self._heartbeat()
             self._stop.wait(self.live_poll_s)
 
@@ -553,6 +653,8 @@ class AutoStrategyEngine:
                 if gap_s > expected * 1.5:
                     self.missing_candles += max(0, int(gap_s // expected) - 1)
             if last_ts is None or b.timestamp > last_ts:
+                if self._is_multi_timeframe_strategy(strat):
+                    self._apply_multi_timeframe_context(strat, b.timestamp)
                 self._process_bar(sym, b, strat)
                 self.stats["bars"] += 1
                 last_ts = b.timestamp
@@ -562,12 +664,167 @@ class AutoStrategyEngine:
                                 message=f"candle_processed timestamp={self.last_processed_candle}")
         return last_ts
 
+    @staticmethod
+    def _is_multi_timeframe_strategy(strategy) -> bool:
+        return bool(getattr(strategy, "required_timeframes", ())) and callable(
+            getattr(strategy, "set_timeframe_context", None))
+
+    def _refresh_multi_timeframe_context(self, symbol: str, strategy, *, entry_bars: list) -> None:
+        """Fetch independent live series for every declared timeframe.
+
+        The strict forward fetcher has no historical/synthetic fallback. Its
+        final candle is conservatively removed on every timeframe because it
+        may still be forming.
+        """
+        required = tuple(getattr(strategy, "required_timeframes", ()))
+        decision_tf = str(getattr(strategy, "decision_timeframe", self.timeframe))
+        if self.timeframe != decision_tf:
+            raise EngineFeedError(
+                f"{getattr(strategy, 'label', 'Multi-timeframe strategy')} requires "
+                f"a {decision_tf} Trading Instance decision timeframe")
+        minimums = getattr(getattr(strategy, "config", None), "minimum_bars", {})
+        context: dict[str, list] = {decision_tf: list(entry_bars)}
+        previous_context = self._multi_timeframe_context.get(symbol, {})
+        decision_duration = _TF_SECONDS.get(decision_tf)
+        decision_close = (entry_bars[-1].timestamp + timedelta(seconds=decision_duration)
+                          if entry_bars and decision_duration else None)
+        sources = []
+        for timeframe in required:
+            if timeframe == decision_tf:
+                continue
+            required_bars = int(minimums.get(timeframe, 70))
+            limit = max(2, required_bars * 2, required_bars + 50)
+            duration = _TF_SECONDS.get(timeframe)
+            cached = list(previous_context.get(timeframe, ()))
+            next_close = (cached[-1].timestamp + timedelta(seconds=duration * 2)
+                          if cached and duration else None)
+            if cached and decision_close is not None and next_close is not None and decision_close < next_close:
+                closed, source = cached, "live (cached closed context)"
+            else:
+                bars, source = self._forward_fetch_for_timeframe(symbol, timeframe, limit)
+                if not str(source or "").startswith("live"):
+                    raise EngineFeedError(f"{symbol} {timeframe} live context unavailable")
+                closed = self._closed_bars(bars, timeframe)
+            if len(closed) < int(minimums.get(timeframe, 1)):
+                raise EngineFeedError(
+                    f"{symbol} {timeframe} returned {len(closed)} completed candles; "
+                    f"requires {minimums.get(timeframe)}")
+            age = ((datetime.now(timezone.utc) - closed[-1].timestamp).total_seconds()
+                   - (duration or 0))
+            if duration is None or max(0.0, age) > duration * 1.5:
+                raise EngineFeedError(
+                    f"{symbol} {timeframe} context stale: age={max(0.0, age):.0f}s")
+            context[timeframe] = closed
+            sources.append(f"{timeframe}:{source}")
+        self._multi_timeframe_context[symbol] = context
+        if sources:
+            self.last_source = "multi-timeframe " + ", ".join(sources)
+
+    def _forward_fetch_for_timeframe(self, symbol: str, timeframe: str, limit: int):
+        bars, source = self._fetcher(symbol, timeframe, limit)
+        if not str(source or "").startswith("live"):
+            raise EngineFeedError(
+                f"forward paper requires live {timeframe} provider data, got {source or 'none'}")
+        return bars, source
+
+    def _apply_multi_timeframe_context(self, strategy, decision_timestamp) -> None:
+        from bot.data.resample import TF_SECONDS
+        required = tuple(getattr(strategy, "required_timeframes", ()))
+        decision_tf = str(getattr(strategy, "decision_timeframe", self.timeframe))
+        decision_close = decision_timestamp + timedelta(seconds=TF_SECONDS[decision_tf])
+        source = self._multi_timeframe_context.get(strategy.symbol, {})
+        causal: dict[str, list] = {}
+        for timeframe in required:
+            duration = TF_SECONDS.get(timeframe)
+            if duration is None:
+                raise EngineFeedError(f"Unsupported strategy context timeframe {timeframe}")
+            causal[timeframe] = [bar for bar in source.get(timeframe, ())
+                                 if bar.timestamp + timedelta(seconds=duration) <= decision_close]
+        strategy.set_timeframe_context(causal)
+
     def _forward_fetch(self, symbol: str, limit: int):
         """Call a strict forward fetcher; historical sources are rejected."""
         bars, source = self._fetcher(symbol, self.timeframe, limit)
         if not str(source or "").startswith("live"):
             raise EngineFeedError(f"forward paper requires live provider data, got {source or 'none'}")
         return bars, source
+
+    @staticmethod
+    def _closed_bars(bars, timeframe: str):
+        from data.forward_market_data import valid_closed_bars
+        duration = _TF_SECONDS.get(timeframe)
+        if duration is None:
+            raise EngineFeedError(f"Unsupported forward timeframe {timeframe}")
+        return valid_closed_bars(bars, duration)
+
+    def _required_warmup(self, strategy) -> int:
+        required = int(self.warmup)
+        configured = getattr(strategy, "warmup_required", None)
+        if configured is not None:
+            required = max(required, int(configured))
+        minimums = getattr(getattr(strategy, "config", None), "minimum_bars", {})
+        decision_tf = str(getattr(strategy, "decision_timeframe", self.timeframe))
+        if isinstance(minimums, dict):
+            required = max(required, int(minimums.get(decision_tf, 0) or 0))
+        return required
+
+    def _require_continuity(self, bars, timeframe: str) -> None:
+        expected = _TF_SECONDS.get(timeframe)
+        if expected is None or len(bars) < 2:
+            return
+        ordered = sorted(bars, key=lambda bar: bar.timestamp)
+        for previous, current in zip(ordered, ordered[1:]):
+            gap = int((current.timestamp - previous.timestamp).total_seconds())
+            if gap != expected:
+                missing = max(0, gap // expected - 1)
+                self.missing_candles += missing
+                raise EngineFeedError(
+                    f"{self.symbols[0]} {timeframe} candle continuity failed between "
+                    f"{previous.timestamp.isoformat()} and {current.timestamp.isoformat()} "
+                    f"({missing} missing); REST repair incomplete")
+
+    def _fetch_with_since(self, symbol: str, timeframe: str, limit: int,
+                          since_ms: Optional[int] = None):
+        try:
+            return self._fetcher(symbol, timeframe, limit, since_ms=since_ms)
+        except TypeError as exc:
+            if since_ms is not None:
+                raise EngineFeedError("forward fetcher does not support cursor backfill") from exc
+            return self._fetcher(symbol, timeframe, limit)
+
+    def _fetch_bootstrap_history(self, symbol: str, required: int,
+                                 persisted: Optional[datetime]):
+        """Fetch warm-up plus buffer and page across downtime when required."""
+        duration = _TF_SECONDS.get(self.timeframe)
+        if duration is None:
+            raise EngineFeedError(f"Unsupported forward timeframe {self.timeframe}")
+        target = max(required * 2, required + 50)
+        if persisted is None:
+            return self._fetch_with_since(symbol, self.timeframe, min(1000, target))
+
+        since = persisted - timedelta(seconds=duration * (required + 10))
+        since_ms = int(since.timestamp() * 1000)
+        merged: dict[datetime, object] = {}
+        source = ""
+        for _page in range(20):
+            page, source = self._fetch_with_since(symbol, self.timeframe, 1000, since_ms)
+            if not str(source or "").startswith("live"):
+                raise EngineFeedError(f"forward paper requires live provider data, got {source or 'none'}")
+            valid = self._closed_bars(page, self.timeframe)
+            before = len(merged)
+            for bar in valid:
+                merged[bar.timestamp] = bar
+            if not valid or len(merged) == before:
+                break
+            newest = valid[-1].timestamp
+            since_ms = int((newest + timedelta(seconds=duration)).timestamp() * 1000)
+            age_after_close = max(0.0, (datetime.now(timezone.utc) - newest).total_seconds() - duration)
+            # Some venues cap OHLCV below the requested 1000 rows. A short page
+            # is therefore not proof that we reached the live edge; page until
+            # freshness or until the provider makes no forward progress.
+            if age_after_close <= duration * 1.5:
+                break
+        return [merged[key] for key in sorted(merged)], source
 
     @staticmethod
     def _parse_timestamp(value):
@@ -610,8 +867,11 @@ class AutoStrategyEngine:
         allowed_age = interval * 1.5
         if age > allowed_age:
             self.market_data_status = "stale"
-            raise EngineFeedError(f"{symbol} market data stale: age={age:.0f}s allowed={allowed_age:.0f}s")
+            raise MarketDataStaleError(
+                f"{symbol} market data stale: age={age:.0f}s allowed={allowed_age:.0f}s")
         self.market_data_status = "healthy"
+        self.next_expected_candle = (
+            newest.timestamp + timedelta(seconds=interval * 2)).isoformat()
 
     def _load_batch(self, sym, strategies, live, seeds, get_bars) -> None:
         bars, src = get_bars(sym, n=self.warmup + self.live_bars,
@@ -688,12 +948,58 @@ class AutoStrategyEngine:
         # credited with a same-candle target/scale-out (conservative ordering).
         filled_this_bar = self._check_pending(sym, bar)
         # 2. stop-loss / take-profit exits against this bar's range.
+        position_before_exit = self.paper.open_position(sym)
         self._check_exit(sym, bar, strategy, entry_bar=filled_this_bar)
+        position_after_exit = self.paper.open_position(sym)
         # 3. strategy decision on the new bar.
-        signal: Optional[Signal] = strategy.on_bar(bar)
+        # A lifecycle-aware strategy must not keep proposing entries while its
+        # authoritative instance-scoped broker already owns a position. The
+        # ordinary strategies retain their historical pipeline-rejection
+        # behaviour for backward compatibility.
+        lifecycle_aware = callable(getattr(strategy, "mark_position_managing", None))
+        skip_entry_scan = False
+        if lifecycle_aware and position_after_exit is not None:
+            if filled_this_bar:
+                strategy.mark_position_open("Resting paper order filled on the completed candle")
+            else:
+                strategy.mark_position_managing()
+            skip_entry_scan = True
+        elif lifecycle_aware and position_before_exit is not None and position_after_exit is None:
+            strategy.mark_position_closed("Stop, target, or managed exit completed")
+            # Never close and reopen on the same OHLC candle: its intrabar path
+            # is unknowable and doing so would fabricate execution ordering.
+            skip_entry_scan = True
+        signal: Optional[Signal] = None if skip_entry_scan else strategy.on_bar(bar)
         outcome: Optional[dict] = None
         if signal is not None:
             outcome = self._on_signal(sym, signal, strategy)
+            if hasattr(strategy, "lifecycle_state"):
+                kind = (outcome or {}).get("kind")
+                try:
+                    from strategies.adaptive_trend_pullback.models import SetupState
+                    if kind == "opened":
+                        marker = getattr(strategy, "mark_position_open", None)
+                        marker() if callable(marker) else setattr(strategy, "lifecycle_state", SetupState.POSITION_OPEN)
+                    elif kind in ("pending", "queued"):
+                        strategy.lifecycle_state = SetupState.ORDER_PENDING
+                    elif kind in ("rejected", "error"):
+                        strategy.lifecycle_state = SetupState.BLOCKED
+                except Exception:  # noqa: BLE001 — strategy telemetry is non-load-bearing
+                    pass
+        elif skip_entry_scan and callable(getattr(strategy, "decision_report", None)):
+            strategy_decision = strategy.decision_report()
+            outcome = {"kind": "strategy_decision", "strategy_decision": strategy_decision}
+        elif callable(getattr(strategy, "decision_report", None)):
+            try:
+                strategy_decision = strategy.decision_report()
+                outcome = {"kind": "strategy_decision", "strategy_decision": strategy_decision}
+                self.ledger.log(
+                    level="info", stage="strategy_decision", symbol=sym,
+                    message=(f"{getattr(strategy, 'label', 'Strategy')} "
+                             f"{strategy_decision.get('decision')}: "
+                             f"{strategy_decision.get('reason')}")[:500])
+            except Exception:  # noqa: BLE001 — decision telemetry never blocks the bar
+                pass
         if self.core_v2_observer is not None:
             try:
                 self.core_v2_observer.observe(
@@ -1079,6 +1385,7 @@ class AutoStrategyEngine:
                     pass
         if decision is not None and decision["decision"] == "rejected":
             self.stats["rejections"] += 1
+            self.rejection_counts["quality"] = self.rejection_counts.get("quality", 0) + 1
             why = decision["reason"]
             self.ledger.log(level="info", stage="brain", symbol=sym,
                             message=f"{sym} {side} blocked by decision gate: {why}")
@@ -1099,6 +1406,7 @@ class AutoStrategyEngine:
         ctx_why = self.context.gate(sym, "long" if signal.type == SignalType.LONG else "short")
         if ctx_why and pos is None:
             self.stats["rejections"] += 1
+            self.rejection_counts["context"] = self.rejection_counts.get("context", 0) + 1
             self.ledger.log(level="info", stage="context", symbol=sym,
                             message=f"{sym} {side} blocked: {ctx_why}")
             if self.counterfactual is not None:
@@ -1181,6 +1489,7 @@ class AutoStrategyEngine:
             return {"kind": "error", "reason": "pipeline error (see engine log)"}
         fill = res.fill or {}
         if res.accepted and fill.get("action") == "opened":
+            self.stats["accepted_signals"] += 1
             if decision_id is not None and self.decisions is not None:
                 try:
                     self.decisions.mark_executed(decision_id)
@@ -1204,6 +1513,8 @@ class AutoStrategyEngine:
             return {"kind": "closed", "fill": fill}
         elif not res.accepted:
             self.stats["rejections"] += 1
+            stage = str(res.stage or "unknown")
+            self.rejection_counts[stage] = self.rejection_counts.get(stage, 0) + 1
             return {"kind": "rejected", "stage": res.stage, "reason": res.reason,
                     "decision": decision, "verdict": v}
         return {"kind": "noop", "decision": decision, "verdict": v}

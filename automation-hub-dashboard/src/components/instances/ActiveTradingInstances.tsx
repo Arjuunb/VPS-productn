@@ -31,8 +31,9 @@ const price = (value?: number | null) => value == null ? "—" : `$${value.toLoc
 function displayState(instance: Instance): string {
   if (instance.state === "paused") return "Paused";
   if (instance.state === "error") return "Error";
-  if (instance.state === "reconnecting") return "Reconnecting";
-  if (instance.state === "starting") return "Starting";
+  if (instance.state === "recovering") return "Recovering";
+  if (instance.state === "data_stale") return "Data stale";
+  if (["starting", "bootstrapping", "warming", "syncing", "ready"].includes(instance.state)) return instance.state.replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
   if (instance.state === "stopped") return "Stopped";
   if (instance.current_position) return "Position open";
   return "Waiting for setup";
@@ -89,7 +90,7 @@ export default function ActiveTradingInstances() {
   const app = useApp();
   const instances = useLive<InstanceSnapshot>("/instances", 2000);
   const snapshot = instances.data;
-  // Running, paused, starting, reconnecting and error states all deserve
+  // Running, paused, bootstrap/recovery and error states all deserve
   // visibility. Stopped historical instances live on the dedicated page.
   const active = (snapshot?.instances ?? []).filter((instance) => instance.state !== "stopped")
     .sort((a, b) => Number(b.id === app.selectedInstanceId) - Number(a.id === app.selectedInstanceId));

@@ -1,12 +1,27 @@
 """Trading Instance API — isolated paper engines and instance analytics."""
 from __future__ import annotations
 
-import webhook_api as _wa
+import importlib
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional
 
 router = APIRouter()
+
+
+class _WebhookAPIProxy:
+    """Resolve legacy application singletons without an import-order cycle.
+
+    ``webhook_api`` mounts this router, while a few focused consumers import the
+    router directly.  Eagerly importing the parent module here left
+    ``routers.instances`` only partly initialised in the latter case.
+    """
+
+    def __getattr__(self, name):
+        return getattr(importlib.import_module("webhook_api"), name)
+
+
+_wa = _WebhookAPIProxy()
 
 
 class InstanceCreate(BaseModel):
@@ -94,7 +109,8 @@ def instance_options():
         key = row["key"]
         builtin = str(row.get("version") or "unversioned")
         strategies.append({"key": key, "label": row["label"],
-                           "versions": list(dict.fromkeys([builtin, *versions_by_strategy.get(key, [])]))})
+                           "versions": list(dict.fromkeys([builtin, *versions_by_strategy.get(key, [])])),
+                           "supported_timeframes": row.get("supported_timeframes", list(TIMEFRAMES))})
     return {
         "symbols": list(SYMBOLS), "timeframes": list(TIMEFRAMES),
         "strategies": strategies,
@@ -183,6 +199,8 @@ def create_instance(body: InstanceCreate, x_webhook_secret: Optional[str] = Head
         raise HTTPException(400, f"Unsupported pair '{body.symbol.upper()}'")
     if body.timeframe not in TIMEFRAMES:
         raise HTTPException(400, f"Unsupported timeframe '{body.timeframe}'")
+    if body.timeframe not in strategy.get("supported_timeframes", TIMEFRAMES):
+        raise HTTPException(400, f"{strategy['label']} requires a 5m Trading Instance decision timeframe")
     try:
         inst = _manager().create(symbol=body.symbol, strategy_key=strategy["key"], strategy_label=strategy["label"],
                                  strategy_version=body.strategy_version or strategy.get("version", "unversioned"), timeframe=body.timeframe,
@@ -235,9 +253,9 @@ def update_instance(instance_id: str, body: InstanceUpdate,
                     x_webhook_secret: Optional[str] = Header(default=None)):
     _wa._check_secret(x_webhook_secret)
     try:
+        from data.historical import TIMEFRAMES
         strategy = _catalog(body.strategy) if body.strategy is not None else None
         if body.timeframe is not None:
-            from data.historical import TIMEFRAMES
             if body.timeframe not in TIMEFRAMES:
                 raise HTTPException(400, f"Unsupported timeframe '{body.timeframe}'")
         if strategy is not None and body.strategy_version is not None:
@@ -245,6 +263,11 @@ def update_instance(instance_id: str, body: InstanceUpdate,
                                    if row["key"] == strategy["key"]), [])
             if body.strategy_version not in valid_versions:
                 raise HTTPException(400, f"Unknown version '{body.strategy_version}' for {strategy['label']}")
+        current = _manager().status(instance_id)
+        effective_strategy = strategy or _catalog(current["strategy_key"])
+        effective_timeframe = body.timeframe or current["timeframe"]
+        if effective_timeframe not in effective_strategy.get("supported_timeframes", list(TIMEFRAMES)):
+            raise HTTPException(400, f"{effective_strategy['label']} requires a 5m Trading Instance decision timeframe")
         inst = _manager().update_configuration(
             instance_id, capital_allocation=body.capital_allocation,
             risk_per_trade_pct=body.risk_per_trade_pct, sizing_mode=body.sizing_mode,

@@ -96,7 +96,7 @@ export default function HeaderControls() {
   };
   const changeExecution = async (body: Record<string, unknown>, message: string) => {
     if (!selected) return;
-    const active = ["running", "paused", "reconnecting", "starting"].includes(selected.state);
+    const active = ["running", "ready", "paused", "recovering", "data_stale", "starting", "bootstrapping", "warming", "syncing"].includes(selected.state);
     if (active && !window.confirm(`${message} requires a safe engine restart. Continue?`)) return;
     await update(body, `${message} applied`);
   };
@@ -112,7 +112,7 @@ export default function HeaderControls() {
   const riskBlocked = Boolean(live.data?.global_risk_status && live.data.global_risk_status !== "healthy");
   const dataDegraded = ["error", "disconnected", "stale"].includes(market);
   const engineState = !selected ? "stopped" : riskBlocked ? "risk blocked" : dataDegraded && selected.state === "running" ? "degraded" : selected.state;
-  const stateDot = engineState === "running" ? "online" : engineState === "paused" || engineState === "starting" || engineState === "reconnecting" ? "warn" : "offline";
+  const stateDot = engineState === "running" || engineState === "ready" ? "online" : ["paused", "starting", "bootstrapping", "warming", "syncing", "recovering", "data_stale"].includes(engineState) ? "warn" : "offline";
   const modeLabel = selected?.mode === "research" ? "RESEARCH" : "PAPER";
   const strategyVersion = selected ? `${selected.strategy_label} ${selected.strategy_version}` : "Strategy";
   const maxQuickRisk = (options.data?.execution_defaults?.max_quick_risk_pct ?? 0.01) * 100;

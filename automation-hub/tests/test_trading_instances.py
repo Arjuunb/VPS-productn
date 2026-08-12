@@ -52,6 +52,76 @@ def test_instances_keep_pair_strategy_version_and_metrics_separate():
     assert manager.leaderboard()[0]["strategy_version"] in {"v1", "v2"}
 
 
+def test_instance_worker_receives_server_risk_policy():
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(
+        ledger, strategy_factory=_factory, live=False, live_poll_s=60,
+        max_drawdown_pct=0.08, max_daily_loss_pct=0.02,
+        max_consecutive_losses=3, cooldown_after_loss_min=90,
+        session_start=7, session_end=20, max_weekly_loss_pct=0.04,
+        max_trades_per_day=8, trading_days_mask=31,
+    )
+    instance = manager.create(
+        symbol="BTCUSDT", strategy_key="brain", strategy_label="Decision Brain",
+        strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+        capital_allocation=1_000,
+    )
+    manager.start(instance.id)
+    pipeline = manager._runtime[instance.id][2]
+    assert pipeline.max_drawdown_pct == 0.08
+    assert pipeline.max_daily_loss_pct == 0.02
+    assert pipeline.max_consecutive_losses == 3
+    assert pipeline.cooldown_after_loss_min == 90
+    assert (pipeline.session_start, pipeline.session_end) == (7, 20)
+    assert pipeline.max_weekly_loss_pct == 0.04
+    assert pipeline.max_trades_per_day == 8
+    assert pipeline.trading_days_mask == 31
+    manager.stop(instance.id)
+
+
+def test_instance_learning_books_are_worker_scoped():
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
+    manager.configure(max_active_slots=2)
+    first = manager.create(symbol="BTCUSDT", strategy_key="brain", strategy_label="Decision Brain",
+                           strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+                           capital_allocation=500)
+    second = manager.create(symbol="ETHUSDT", strategy_key="brain", strategy_label="Decision Brain",
+                            strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+                            capital_allocation=500)
+    manager.start(first.id)
+    manager.start(second.id)
+    first_learning = manager._runtime[first.id][2].learning
+    second_learning = manager._runtime[second.id][2].learning
+    assert first_learning is not second_learning
+    first_learning.adjustments["symbol:BTCUSDT"] = {"multiplier": 0.5}
+    assert second_learning.risk_multiplier("BTCUSDT") == 1.0
+    manager.stop(first.id)
+    manager.stop(second.id)
+
+
+def test_instance_learning_book_survives_local_sqlite_restart(tmp_path):
+    ledger_path = tmp_path / "ledger.db"
+    ledger = SqliteLedger(str(ledger_path))
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
+    instance = manager.create(symbol="BTCUSDT", strategy_key="brain", strategy_label="Decision Brain",
+                              strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+                              capital_allocation=500)
+    manager.start(instance.id)
+    learning = manager._runtime[instance.id][2].learning
+    learning.adjustments["symbol:BTCUSDT"] = {"type": "risk_multiplier", "multiplier": 0.5}
+    learning._save()
+    manager.stop(instance.id)
+
+    restarted = TradingInstanceManager(SqliteLedger(str(ledger_path)), strategy_factory=_factory,
+                                       live=False, live_poll_s=60)
+    restarted.start(instance.id)
+    restored = restarted._runtime[instance.id][2].learning
+    assert restored.risk_multiplier("BTCUSDT") == 0.5
+    assert restored.path == str(tmp_path / "instance-learning" / f"{instance.id}.json")
+    restarted.stop(instance.id)
+
+
 def test_research_instance_execution_adapter_never_places_orders():
     ledger = SqliteLedger(":memory:")
     paper = ResearchExecutionEngine(InstanceLedger(ledger, "research"), 1_000)

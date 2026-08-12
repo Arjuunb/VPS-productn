@@ -85,7 +85,7 @@ def test_reconnect_lifecycle_is_visible_and_bounded():
     delay = eng._schedule_reconnect(EngineFeedError("temporary provider timeout"))
     state = eng.status()
     assert delay == 2.0
-    assert state["lifecycle_state"] == "reconnecting"
+    assert state["lifecycle_state"] == "recovering"
     assert state["reconnect_attempt"] == 1
     assert state["last_error"] == "EngineFeedError: temporary provider timeout"
 
@@ -110,8 +110,8 @@ def test_live_worker_recovers_after_a_transient_warmup_failure():
         # This engine uses its default 1h timeframe; return actual 1h-spaced
         # provider bars so strict freshness is what the test is exercising.
         newest = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-        return [Bar(newest - timedelta(hours=3 - i), 100, 101, 99, 100, 1)
-                for i in range(4)], "live (test)"
+        return [Bar(newest - timedelta(hours=300 - i), 100, 101, 99, 100, 1)
+                for i in range(301)], "live (test)"
 
     eng = AutoStrategyEngine(pipe, paper, led, symbols=["BTCUSDT"], live=True,
                              live_poll_s=0.01, fetcher=fetcher)

@@ -12,8 +12,9 @@ type Props = {
 };
 
 const stateTone = (state?: string) => {
-  if (state === "running") return "green";
-  if (state === "starting" || state === "reconnecting") return "blue";
+  if (state === "running" || state === "ready") return "green";
+  if (["starting", "bootstrapping", "warming", "syncing", "recovering"].includes(state ?? "")) return "blue";
+  if (state === "data_stale") return "amber";
   if (state === "paused") return "amber";
   return "red";
 };
@@ -24,7 +25,7 @@ export default function EngineControlCard({ engine, logs, onRefresh, toast }: Pr
   const [busy, setBusy] = useState<string | null>(null);
   const [showLogs, setShowLogs] = useState(false);
   const state = engine?.state ?? "stopped";
-  const working = state === "starting" || state === "reconnecting";
+  const working = ["starting", "bootstrapping", "warming", "syncing", "recovering"].includes(state);
   const canStart = state === "stopped" || state === "error";
   const canPause = engine?.running && state === "running" && engine.trading_state === "Active";
   const canResume = state === "paused" || engine?.trading_state !== "Active";
@@ -49,7 +50,7 @@ export default function EngineControlCard({ engine, logs, onRefresh, toast }: Pr
     <div className="risk-item" key={label}><span className="dim">{label}</span><b>{value ?? "—"}</b></div>
   );
   const lastTrade = engine?.last_trade;
-  const reconnectNote = state === "reconnecting"
+  const reconnectNote = state === "recovering"
     ? `Reconnecting… Attempt ${engine?.reconnect_attempt ?? 0} of ${engine?.max_reconnect_attempts ?? 5}`
     : null;
 

@@ -111,17 +111,18 @@ def test_counterfactual_evidence_falsifies_a_learned_rule():
     assert any(h["action"] == "falsified" for h in book.history)
 
 
-def test_gate_exposes_the_rule_key_that_fired():
+def test_learning_regime_rule_is_soft_and_does_not_expose_a_veto_key():
     book = LearningBook()
     _teach_regime_block(book)
     why = book.gate(symbol="BTCUSDT", regime="Ranging")
-    assert why is not None and book.last_gate_key == "regime:Ranging"
+    assert why is None and book.last_gate_key is None
+    assert book.soft_adjustment(symbol="BTCUSDT", regime="Ranging")["multiplier"] < 1.0
     book.gate(symbol="BTCUSDT", regime="Trending")
     assert book.last_gate_key is None
 
 
 # ─────────────────────── pipeline + engine wiring ───────────────────────
-def test_pipeline_records_graded_vetoes_with_attribution():
+def test_pipeline_applies_learning_as_soft_risk_without_counterfactual_veto():
     led = SqliteLedger(":memory:")
     paper = PaperExecutionEngine(led)
     pipe = SignalPipeline(led, paper, TradingControl(), equity=10_000,
@@ -132,15 +133,13 @@ def test_pipeline_records_graded_vetoes_with_attribution():
     r = pipe.process({"alert_id": "v1", "symbol": "BTCUSDT", "side": "BUY",
                       "entry": 100.0, "stop": 95.0, "target": 115.0,
                       "confidence": 0.9, "regime": "Ranging"})
-    assert not r.accepted and r.stage == "learning"
-    assert len(pipe.counterfactual.open) == 1
-    v = pipe.counterfactual.open[0]
-    assert v["rule"] == "learning:regime:Ranging" and v["target"] == 115.0
+    assert r.accepted
+    assert len(pipe.counterfactual.open) == 0
     # mechanical rejects (invalid stop, dedup, data quality) are NOT graded —
     # there is no judgment to grade
     r2 = pipe.process({"alert_id": "v2", "symbol": "ETHUSDT", "side": "BUY",
                        "entry": 100.0, "stop": None, "confidence": 0.9})
-    assert not r2.accepted and len(pipe.counterfactual.open) == 1
+    assert not r2.accepted and len(pipe.counterfactual.open) == 0
 
 
 def test_engine_resolves_vetoes_and_grades_missed_limits():

@@ -10,6 +10,7 @@ from strategies.ema_strategy import EMAStrategy
 from strategies.rsi_strategy import RSIStrategy
 from strategies.smc_strategy import SMCStrategy
 from strategies.liquidity_sweep_strategy import LiquiditySweepStrategy
+from strategies.adaptive_trend_pullback import AdaptiveTrendPullbackStrategy
 
 # key -> (class, human label, ready?)
 STRATEGIES: dict[str, tuple[type[HubStrategy], str, bool]] = {
@@ -17,6 +18,7 @@ STRATEGIES: dict[str, tuple[type[HubStrategy], str, bool]] = {
     "rsi": (RSIStrategy, "RSI Scalper", True),
     "smc": (SMCStrategy, "SMC (Smart Money)", True),
     "liquidity_sweep": (LiquiditySweepStrategy, "Liquidity Sweep", True),
+    "adaptive_trend_pullback": (AdaptiveTrendPullbackStrategy, "Adaptive MTF Trend Pullback", True),
 }
 
 # key -> (human label, asset class, ready?)

@@ -8,14 +8,46 @@ never an invitation to replay old market history.
 from __future__ import annotations
 
 import os
+import math
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
-from typing import Optional
+from typing import Iterable, Optional
 
 from bot.types import Bar
 
 
 class ForwardMarketDataUnavailable(RuntimeError):
     """No trustworthy current market data is available for a forward worker."""
+
+
+def valid_closed_bars(bars: Iterable[Bar], timeframe_seconds: int, *,
+                      now: Optional[datetime] = None) -> list[Bar]:
+    """Return sorted, unique, structurally valid, genuinely closed candles.
+
+    Provider payloads do not consistently include a forming final candle.  The
+    former positional ``bars[:-1]`` rule therefore discarded a real closed
+    candle on some venues and made a healthy 5-minute feed look five minutes
+    older.  Closure is a property of timestamp + timeframe, not list position.
+    """
+    now = now or datetime.now(timezone.utc)
+    unique: dict[datetime, Bar] = {}
+    for bar in bars:
+        stamp = getattr(bar, "timestamp", None)
+        values = [getattr(bar, name, None) for name in ("open", "high", "low", "close", "volume")]
+        if not isinstance(stamp, datetime) or any(value is None or not math.isfinite(float(value)) for value in values):
+            continue
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        else:
+            stamp = stamp.astimezone(timezone.utc)
+        o, h, low, close, volume = (float(value) for value in values)
+        if min(o, h, low, close) <= 0 or volume < 0 or h < max(o, close, low) or low > min(o, close, h):
+            continue
+        if stamp + timedelta(seconds=timeframe_seconds) > now:
+            continue
+        # Normalize naive/provider-local timestamps before later comparisons.
+        unique[stamp] = Bar(stamp, o, h, low, close, volume)
+    return [unique[key] for key in sorted(unique)]
 
 
 def fetch_forward_bars(symbol: str, timeframe: str, limit: int,
