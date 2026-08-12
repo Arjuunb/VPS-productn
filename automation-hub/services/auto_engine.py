@@ -122,8 +122,10 @@ class AutoStrategyEngine:
         self.last_processed_candle = initial_last_processed_candle
         self._candle_checkpoint = candle_checkpoint
         self._pending_orders_checkpoint = pending_orders_checkpoint
+        self.last_received_candle: Optional[str] = None
         self.last_closed_candle: Optional[str] = None
         self.warmup_bars = 0
+        self.warmup_evidence: dict[str, object] = {}
         self.market_data_status = "replay" if not live else "warming_up"
         self.duplicate_candles_ignored = 0
         self.missing_candles = 0
@@ -174,6 +176,7 @@ class AutoStrategyEngine:
         self.entry_mode = (entry_mode or _os.environ.get("HUB_ENTRY_MODE", "limit")).lower()
         self.limit_ttl_bars = max(1, int(limit_ttl_bars))
         self.instance_id = instance_id
+        self.strategy_version = ""
         self._lifecycle_callback = lifecycle_callback
         self.bootstrap_status = "not_started"
         self.last_recovery_attempt: Optional[str] = None
@@ -388,10 +391,12 @@ class AutoStrategyEngine:
             "feed_error": feed_err,          # last real fetch error, if any
             "websocket": ws_feed.status() if ws_feed is not None else None,
             "market_data_status": self.market_data_status,
+            "last_received_candle": self.last_received_candle,
             "last_closed_candle": self.last_closed_candle,
             "last_processed_candle_timestamp": self.last_processed_candle,
             "warmup_bars": self.warmup_bars,
             "warmup_required": self.warmup_required_runtime,
+            "warmup_evidence": dict(self.warmup_evidence),
             "duplicate_candles_ignored": self.duplicate_candles_ignored,
             "missing_candles": self.missing_candles,
             "out_of_order_candles": self.out_of_order_candles,
@@ -400,6 +405,8 @@ class AutoStrategyEngine:
             "missed_entries": self.stats_missed_entries,
             "strategy_health_guard": self.strategy_health_guard,
             "strategy_health": self._strategy_health,
+            "learning": (self.pipeline.learning.report()
+                         if getattr(self.pipeline, "learning", None) is not None else None),
             "rejection_counts": dict(self.rejection_counts),
             **self.stats,
         }
@@ -419,8 +426,11 @@ class AutoStrategyEngine:
                             self._mark_stopped("Replay data completed — start a new paper run or enable live market data.")
                     return
                 except EngineFeedError as exc:
-                    if isinstance(exc, MarketDataStaleError):
-                        self._transition("data_stale", str(exc), error=exc)
+                    # A provider timeout/disconnect is stale market data even
+                    # before an age threshold can be calculated.  Persist the
+                    # degraded state first so operators see the real outage,
+                    # then enter the bounded recovery loop.
+                    self._transition("data_stale", str(exc), error=exc)
                     delay = self._schedule_reconnect(exc)
                     if delay is None:
                         self._mark_error(getattr(exc, "recovery_reason", "Market data connection lost"), exc)
@@ -578,7 +588,29 @@ class AutoStrategyEngine:
             if not (src or "").startswith("live"):
                 raise EngineFeedError(f"{sym} live feed unavailable (source: {src or 'none'})")
             self.last_source = src
+            self._record_received_candle(bars)
             closed = self._closed_bars(bars, self.timeframe)
+            unique_timestamps = {
+                getattr(bar, "timestamp", None) for bar in bars
+                if getattr(bar, "timestamp", None) is not None
+            }
+            from data.forward_market_data import valid_closed_bars
+            structurally_valid = valid_closed_bars(
+                bars, _TF_SECONDS[self.timeframe],
+                now=datetime.max.replace(tzinfo=timezone.utc),
+            )
+            valid_timestamps = {bar.timestamp for bar in closed}
+            self.warmup_evidence = {
+                "required": required_warmup,
+                "requested": max(required_warmup * 2, required_warmup + 50),
+                "fetched": len(bars),
+                "valid_closed": len(closed),
+                "duplicates_removed": max(0, len(bars) - len(unique_timestamps)),
+                "malformed_rejected": max(0, len(unique_timestamps) - len(structurally_valid)),
+                "incomplete_excluded": max(0, len(structurally_valid) - len(valid_timestamps)),
+                "oldest": closed[0].timestamp.isoformat() if closed else None,
+                "newest": closed[-1].timestamp.isoformat() if closed else None,
+            }
             if not closed:
                 raise EngineFeedError(f"{sym} live feed returned no closed candles")
             self._record_market_snapshot(sym, closed)
@@ -614,6 +646,8 @@ class AutoStrategyEngine:
                 last_ts[sym] = closed[-1].timestamp
                 self.last_processed_candle = last_ts[sym].isoformat()
                 self._checkpoint_candle(self.last_processed_candle)
+                self.bootstrap_status = "syncing_checkpoint"
+                self._transition("syncing", "Initial durable cursor committed; no warm-up candle traded")
             else:
                 self.bootstrap_status = "syncing_checkpoint"
                 self._transition("syncing", "Processing unseen closed candles after durable cursor")
@@ -622,7 +656,8 @@ class AutoStrategyEngine:
                 # order. _ingest ignores the persisted candle itself.
                 unseen = [bar for bar in closed if bar.timestamp > persisted]
                 self._require_continuity([warm[-1], *unseen], self.timeframe)
-                last_ts[sym] = self._ingest(sym, strat, closed, last_ts[sym])
+                if unseen:
+                    last_ts[sym] = self._ingest(sym, strat, unseen, last_ts[sym])
             self.ledger.log(level="info", stage="engine", symbol=sym,
                             message=f"market_data_connected symbol={sym} timeframe={self.timeframe} source={src}")
             self.ledger.log(level="info", stage="engine", symbol=sym,
@@ -641,6 +676,7 @@ class AutoStrategyEngine:
                 except Exception as exc:
                     raise EngineFeedError(f"{sym} fetch failed: {exc}") from exc
                 self.last_source = src
+                self._record_received_candle(bars)
                 if not (src or "").startswith("live"):
                     raise EngineFeedError(f"{sym} live feed unavailable (source: {src or 'none'})")
                 closed = self._closed_bars(bars, self.timeframe)
@@ -659,7 +695,9 @@ class AutoStrategyEngine:
                     self._require_continuity(unseen, self.timeframe)
                 if self._is_multi_timeframe_strategy(strategies[sym]) and has_new_candle:
                     self._refresh_multi_timeframe_context(sym, strategies[sym], entry_bars=closed)
-                last_ts[sym] = self._ingest(sym, strategies[sym], closed, last_ts[sym])
+                if unseen:
+                    last_ts[sym] = self._ingest(
+                        sym, strategies[sym], unseen, last_ts[sym])
                 self._mark_running()
                 self._heartbeat()
             self._stop.wait(self.live_poll_s)
@@ -900,6 +938,16 @@ class AutoStrategyEngine:
         self.next_expected_candle = (
             newest.timestamp + timedelta(seconds=interval * 2)).isoformat()
 
+    def _record_received_candle(self, bars) -> None:
+        """Expose the newest provider event separately from the closed cursor."""
+        timestamps = [getattr(bar, "timestamp", None) for bar in bars]
+        valid = [stamp for stamp in timestamps if isinstance(stamp, datetime)]
+        if not valid:
+            return
+        newest = max(stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None
+                     else stamp.astimezone(timezone.utc) for stamp in valid)
+        self.last_received_candle = newest.isoformat()
+
     def _load_batch(self, sym, strategies, live, seeds, get_bars) -> None:
         bars, src = get_bars(sym, n=self.warmup + self.live_bars,
                              timeframe=self.timeframe, seed=seeds[sym])
@@ -918,6 +966,7 @@ class AutoStrategyEngine:
 
     def _process_bar(self, sym: str, bar, strategy) -> None:
         from datetime import datetime, timezone
+        decision_identity = self._decision_identity(sym, bar.timestamp)
         # record activity so diagnostics can tell a live trade from a stalled feed
         try:
             self.last_bar_ts = bar.timestamp.isoformat()
@@ -1005,7 +1054,8 @@ class AutoStrategyEngine:
                 f"{type(exc).__name__}: {exc}") from exc
         outcome: Optional[dict] = None
         if signal is not None:
-            outcome = self._on_signal(sym, signal, strategy)
+            outcome = self._on_signal(
+                sym, signal, strategy, decision_identity=decision_identity)
             if hasattr(strategy, "lifecycle_state"):
                 kind = (outcome or {}).get("kind")
                 try:
@@ -1065,6 +1115,11 @@ class AutoStrategyEngine:
                     position=self.paper.open_position(sym),
                     session=(self.pipeline.session_start, self.pipeline.session_end,
                              self.pipeline.trading_days_mask))
+                report.update({
+                    "instance_id": self.instance_id or "",
+                    "strategy_version": self.strategy_version or "",
+                    "decision_identity": decision_identity,
+                })
                 self.reports.record(report)
             except Exception as e:  # noqa: BLE001 — never block the engine
                 print(f"[explain] cycle report failed for {sym}: {type(e).__name__}: {e}")
@@ -1173,6 +1228,13 @@ class AutoStrategyEngine:
         stamp = timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp)
         scope = getattr(self.ledger, "instance_id", "") or "legacy"
         return f"auto:{scope}:{sym}:{self.timeframe}:{stamp}:{action}"
+
+    def _decision_identity(self, sym: str, timestamp) -> str:
+        """Stable identity for one instance strategy evaluation on one candle."""
+        stamp = timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp)
+        scope = self.instance_id or getattr(self.ledger, "instance_id", "") or "legacy"
+        version = self.strategy_version or self.strategy_label or "unversioned"
+        return f"{scope}:{version}:{sym}:{self.timeframe}:{stamp}"
 
     def _check_exit(self, sym: str, bar, strategy=None, *, entry_bar: bool = False) -> None:
         pos = self.paper.open_position(sym)
@@ -1363,7 +1425,8 @@ class AutoStrategyEngine:
                                      "side": None, "entry": None})["target"] = tg
             return out
 
-    def _on_signal(self, sym: str, signal: Signal, strategy=None) -> Optional[dict]:
+    def _on_signal(self, sym: str, signal: Signal, strategy=None, *,
+                   decision_identity: str | None = None) -> Optional[dict]:
         # The brain re-asserts its view every bar; only act when it CHANGES the
         # position (open from flat, or flip/close an opposite). Holding the same
         # direction is a no-op, so the decision log stays signal — not spam.
@@ -1411,6 +1474,9 @@ class AutoStrategyEngine:
             instance_id = getattr(self.ledger, "instance_id", "")
             if instance_id:
                 decision["instance_id"] = instance_id
+            decision["ts"] = signal.timestamp.isoformat()
+            decision["decision_identity"] = (
+                decision_identity or self._decision_identity(sym, signal.timestamp))
             if self.decisions is not None:
                 try:
                     decision_id = self.decisions.record(decision)
@@ -1422,6 +1488,9 @@ class AutoStrategyEngine:
             why = decision["reason"]
             self.ledger.log(level="info", stage="brain", symbol=sym,
                             message=f"{sym} {side} blocked by decision gate: {why}")
+            self._record_skipped_decision(
+                sym=sym, side=side, signal=signal, stage="brain", reason=why,
+                decision_identity=decision["decision_identity"])
             if self.counterfactual is not None:
                 try:
                     self.counterfactual.record_veto(
@@ -1442,6 +1511,10 @@ class AutoStrategyEngine:
             self.rejection_counts["context"] = self.rejection_counts.get("context", 0) + 1
             self.ledger.log(level="info", stage="context", symbol=sym,
                             message=f"{sym} {side} blocked: {ctx_why}")
+            self._record_skipped_decision(
+                sym=sym, side=side, signal=signal, stage="context", reason=ctx_why,
+                decision_identity=(decision_identity
+                                   or self._decision_identity(sym, signal.timestamp)))
             if self.counterfactual is not None:
                 try:
                     self.counterfactual.record_veto(
@@ -1485,6 +1558,8 @@ class AutoStrategyEngine:
             "mode": "live" if self.live else "paper",
             "open_trades": len(self.paper.positions()),
             "timestamp": signal.timestamp.isoformat(),
+            "instance_id": self.instance_id or getattr(self.ledger, "instance_id", "") or "",
+            "decision_identity": decision_identity or self._decision_identity(sym, signal.timestamp),
         }
         # Maker entry: when FLAT, park a resting limit instead of paying the
         # spread. Flips/closes (opposite side of an open position) stay
@@ -1551,6 +1626,26 @@ class AutoStrategyEngine:
             return {"kind": "rejected", "stage": res.stage, "reason": res.reason,
                     "decision": decision, "verdict": v}
         return {"kind": "noop", "decision": decision, "verdict": v}
+
+    def _record_skipped_decision(self, *, sym: str, side: str, signal,
+                                 stage: str, reason: str,
+                                 decision_identity: str) -> None:
+        """Persist one strategy-level veto without allowing telemetry to trade."""
+        store = getattr(self.pipeline, "skipped", None)
+        if store is None:
+            return
+        try:
+            store.record(
+                symbol=sym, side=side, stage=stage, reason=reason,
+                entry=signal.entry, stop=signal.stop_loss,
+                target=signal.take_profit, strategy=self.strategy_label,
+                timeframe=self.timeframe,
+                snapshot=getattr(signal, "snapshot", None) or {},
+                instance_id=self.instance_id or "",
+                decision_identity=decision_identity,
+            )
+        except Exception:  # noqa: BLE001 — evidence must never change execution
+            pass
 
     def _health_factor(self, sym: str) -> float:
         """Return a bounded, evidence-based new-entry risk multiplier.

@@ -590,6 +590,16 @@ def test_instances_start_and_stop_independently_and_slot_limit_is_backend_enforc
     assert manager.status(two.id)["state"] == "running"
 
 
+def test_new_instance_has_created_state_before_first_start():
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
+    instance = manager.create(symbol="BTCUSDT", strategy_key="brain", strategy_label="Decision Brain",
+                              strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+                              capital_allocation=500)
+    assert instance.state == "created"
+    assert manager.status(instance.id)["state"] == "created"
+
+
 def test_restore_never_exceeds_the_persisted_active_slot_limit(monkeypatch):
     from services.auto_engine import AutoStrategyEngine
     ledger = SqliteLedger(":memory:")

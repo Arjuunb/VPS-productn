@@ -46,12 +46,17 @@ class DecisionStore:
                    reason TEXT,
                    executed INTEGER NOT NULL DEFAULT 0,
                    components_json TEXT,
-                   instance_id TEXT NOT NULL DEFAULT ''
+                   instance_id TEXT NOT NULL DEFAULT '',
+                   decision_identity TEXT NOT NULL DEFAULT ''
                )""")
         self._c.execute("CREATE INDEX IF NOT EXISTS ix_decisions_ts ON decisions(ts)")
         self._c.execute("CREATE INDEX IF NOT EXISTS ix_decisions_decision ON decisions(decision)")
         ensure_column(self._c, "decisions", "instance_id", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(self._c, "decisions", "decision_identity", "TEXT NOT NULL DEFAULT ''")
         self._c.execute("CREATE INDEX IF NOT EXISTS ix_decisions_instance_ts ON decisions(instance_id, ts)")
+        self._c.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_decisions_identity "
+            "ON decisions(decision_identity) WHERE decision_identity <> ''")
         ensure_tenant_column(self._c, "decisions")   # Phase C-3: schema-only, additive
         self._c.commit()
 
@@ -62,8 +67,9 @@ class DecisionStore:
                    (ts, symbol, timeframe, strategy, side, regime, htf_bias,
                     setup_quality_score, volume_score, rr_score, confidence,
                     passed_json, failed_json, decision, reason, executed,
-                    components_json, instance_id)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    components_json, instance_id, decision_identity)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(decision_identity) WHERE decision_identity <> '' DO NOTHING""",
                 (d.get("ts") or _utcnow(), d["symbol"], d.get("timeframe"),
                  d.get("strategy"), d.get("side"), d.get("regime"),
                  d.get("htf_bias"),
@@ -73,7 +79,15 @@ class DecisionStore:
                  json.dumps(d.get("failed_rules") or []),
                  d["decision"], d.get("reason"),
                  1 if d.get("executed") else 0,
-                 json.dumps(d.get("components") or {}), d.get("instance_id") or ""))
+                 json.dumps(d.get("components") or {}), d.get("instance_id") or "",
+                 d.get("decision_identity") or ""))
+            if cur.rowcount == 0 and d.get("decision_identity"):
+                row = self._c.execute(
+                    "SELECT id FROM decisions WHERE decision_identity=?",
+                    (d["decision_identity"],),
+                ).fetchone()
+                self._c.commit()
+                return int(row["id"])
             self._c.commit()
             return int(cur.lastrowid)
 

@@ -50,6 +50,17 @@ def test_forward_cursor_processes_each_new_closed_candle_once_and_persists():
     assert engine.duplicate_candles_ignored == 4
 
 
+def test_live_loop_passes_only_unseen_candles_to_ingest_contract():
+    """Repeated provider windows are not counted as thousands of duplicates."""
+    start = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=15)
+    engine = _engine(cursor=start.isoformat())
+    bars = [_bar(start), _bar(start + timedelta(minutes=5))]
+    unseen = [bar for bar in bars if bar.timestamp > start]
+    engine._process_bar = lambda *_args: None  # type: ignore[method-assign]
+    engine._ingest("BTCUSDT", object(), unseen, start)
+    assert engine.duplicate_candles_ignored == 0
+
+
 def test_closed_candle_filter_keeps_latest_closed_and_excludes_forming():
     now = datetime(2026, 8, 12, 12, 7, tzinfo=timezone.utc)
     closed = _bar(datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc))

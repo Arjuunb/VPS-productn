@@ -13,7 +13,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from data.tenant_scope import ensure_tenant_column
+from data.tenant_scope import ensure_column, ensure_tenant_column
 
 
 class CycleStore:
@@ -35,23 +35,43 @@ class CycleStore:
                 price REAL,
                 decision TEXT NOT NULL,     -- BUY | SELL | WAIT | SKIP
                 score INTEGER,
-                report_json TEXT
+                report_json TEXT,
+                instance_id TEXT NOT NULL DEFAULT '',
+                strategy_version TEXT NOT NULL DEFAULT '',
+                decision_identity TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS ix_cycles_ts ON cycle_reports(ts);
             CREATE INDEX IF NOT EXISTS ix_cycles_symbol ON cycle_reports(symbol);
             """)
             ensure_tenant_column(self._c, "cycle_reports")   # Phase C-3: schema-only, additive
+            ensure_column(self._c, "cycle_reports", "instance_id", "TEXT NOT NULL DEFAULT ''")
+            ensure_column(self._c, "cycle_reports", "strategy_version", "TEXT NOT NULL DEFAULT ''")
+            ensure_column(self._c, "cycle_reports", "decision_identity", "TEXT NOT NULL DEFAULT ''")
+            self._c.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_cycles_decision_identity "
+                "ON cycle_reports(decision_identity) WHERE decision_identity <> ''")
             self._c.commit()
 
     def record(self, report: dict) -> int:
         with self._lock:
             cur = self._c.execute(
                 """INSERT INTO cycle_reports
-                   (ts, symbol, timeframe, price, decision, score, report_json)
-                   VALUES (?,?,?,?,?,?,?)""",
+                   (ts, symbol, timeframe, price, decision, score, report_json,
+                    instance_id, strategy_version, decision_identity)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(decision_identity) WHERE decision_identity <> '' DO NOTHING""",
                 (report.get("ts"), report.get("symbol"), report.get("timeframe"),
                  report.get("price"), report.get("decision"), report.get("score"),
-                 json.dumps(report)))
+                 json.dumps(report), report.get("instance_id") or "",
+                 report.get("strategy_version") or "",
+                 report.get("decision_identity") or ""))
+            if cur.rowcount == 0 and report.get("decision_identity"):
+                row = self._c.execute(
+                    "SELECT id FROM cycle_reports WHERE decision_identity=?",
+                    (report["decision_identity"],),
+                ).fetchone()
+                self._c.commit()
+                return int(row["id"])
             # prune beyond the retention cap (cheap: only when we crossed it)
             self._c.execute(
                 "DELETE FROM cycle_reports WHERE id <= "

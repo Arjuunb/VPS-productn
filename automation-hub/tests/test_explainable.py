@@ -123,6 +123,17 @@ def test_cycle_store_prunes_to_cap():
     assert store.count() <= 51                # cap enforced (±1 on the boundary)
 
 
+def test_cycle_decision_identity_is_idempotent():
+    store = CycleStore(":memory:")
+    report = {"ts": "2026-01-01T00:00:00+00:00", "symbol": "BTCUSDT",
+              "timeframe": "5m", "price": 1.0, "decision": "WAIT", "score": 50,
+              "decision_identity": "instance:v1:BTCUSDT:5m:2026-01-01T00:00:00+00:00"}
+    first = store.record(report)
+    second = store.record(report)
+    assert second == first
+    assert store.count() == 1
+
+
 # ─────────────────────── lifecycle telemetry (MFE/MAE) ───────────────────────
 def test_managed_trade_tracks_mfe_and_mae():
     mt = ManagedTrade(side="long", entry=100.0, stop=95.0, target=115.0, risk=5.0)

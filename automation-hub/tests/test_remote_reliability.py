@@ -70,7 +70,7 @@ def test_platform_snapshot_reuses_already_materialized_instance_rows(monkeypatch
     snapshot = manager.platform_status(runtime_states=rows)
 
     assert snapshot["total_instances"] == 1
-    assert snapshot["instance_counts"]["stopped"] == 1
+    assert snapshot["instance_counts"]["created"] == 1
 
 
 def test_dashboard_snapshot_batches_storage_reads(monkeypatch):

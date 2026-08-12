@@ -89,6 +89,16 @@ def test_store_survives_restart(tmp_path):
     assert len(DecisionStore(p).list()) == 1     # fresh instance, same file
 
 
+def test_decision_identity_is_idempotent():
+    store = DecisionStore(":memory:")
+    decision = _decision()
+    decision["decision_identity"] = "instance:v1:BTCUSDT:5m:2026-01-01T00:00:00+00:00"
+    first = store.record(decision)
+    second = store.record(decision)
+    assert second == first
+    assert store.count() == 1
+
+
 # ─────────────── risk gates still block trading (pipeline layer) ───────────────
 def _pipe(**kw):
     from data.ledger import SqliteLedger

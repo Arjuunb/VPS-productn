@@ -40,6 +40,8 @@ class WebSocketFeed:
         self._bars: dict[str, deque] = {s: deque(maxlen=max_bars) for s in self.symbols}
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
+        self._loop = None
+        self._stream_task = None
         self._stop = threading.Event()
         self.available = False          # a stream is (or was) connected
         self.last_error: str = ""
@@ -104,7 +106,15 @@ class WebSocketFeed:
             self.last_error = f"ccxt.pro unavailable: {e}"
             return False
         if self._thread and self._thread.is_alive():
-            return True
+            if not self._stop.is_set():
+                return True
+            # A rapid stop/start can observe the prior async client while it is
+            # still closing. Never report a successful reconnect while that
+            # thread still owns the stop flag and is about to exit.
+            self._thread.join(timeout=2.0)
+            if self._thread.is_alive():
+                self.last_error = "previous WebSocket worker is still stopping; REST fallback remains active"
+                return False
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="ws-feed", daemon=True)
         self._thread.start()
@@ -112,18 +122,46 @@ class WebSocketFeed:
 
     def stop(self) -> None:
         self._stop.set()
+        loop, task = self._loop, self._stream_task
+        if loop is not None and task is not None and loop.is_running():
+            # watch_ohlcv may block until the venue publishes another candle.
+            # Cancel it on its own event loop so Stop/Restart does not leave a
+            # ghost feed alive for an entire timeframe.
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass  # loop completed between the state check and callback
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             # Keep shutdown bounded so a slow venue cannot hang an API action.
-            thread.join(timeout=2.0)
+            thread.join(timeout=5.0)
+        if thread is None or not thread.is_alive():
+            self.available = False
 
     def _run(self) -> None:
         import asyncio
+        loop = asyncio.new_event_loop()
+        self._loop = loop
+        asyncio.set_event_loop(loop)
+        task = loop.create_task(self._stream())
+        self._stream_task = task
         try:
-            asyncio.run(self._stream())
+            loop.run_until_complete(task)
+        except asyncio.CancelledError:
+            pass
         except Exception as exc:  # startup/client failures must remain visible
             self.available = False
             self.last_error = f"{type(exc).__name__}: {exc}"[:500]
+        finally:
+            pending = asyncio.all_tasks(loop)
+            for pending_task in pending:
+                pending_task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.close()
+            self._stream_task = None
+            self._loop = None
+            self.available = False
 
     async def _stream(self) -> None:
         import asyncio

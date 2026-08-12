@@ -28,6 +28,18 @@ def test_store_records_filters_and_searches():
     assert stages == {"controls": 1, "risk_guard": 1}
 
 
+def test_skip_decision_identity_is_idempotent():
+    store = SkippedTradeStore(":memory:")
+    identity = "instance:v1:BTCUSDT:5m:2026-01-01T00:00:00+00:00"
+    first = store.record(symbol="BTCUSDT", side="BUY", stage="brain",
+                         reason="quality", decision_identity=identity)
+    second = store.record(symbol="BTCUSDT", side="BUY", stage="brain",
+                          reason="quality", decision_identity=identity)
+    assert second == first
+    assert store.total() == 1
+    assert store.categories() == [{"category": "quality", "count": 1}]
+
+
 # ─────────────────────────── pipeline integration ───────────────────────────
 def _pipe():
     from data.ledger import SqliteLedger

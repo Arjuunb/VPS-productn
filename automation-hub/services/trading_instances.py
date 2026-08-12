@@ -78,9 +78,11 @@ def _market_health(market: dict, *, timeframe: str, worker_state: str) -> dict:
     raw = str(out.get("market_data_status") or "").lower()
     if worker_state in ("error",) or raw == "error":
         state = "error"
+    elif worker_state == "created":
+        state = "stopped"
     elif worker_state in ("stopped",) and raw not in ("healthy", "stale", "disconnected"):
         state = "stopped"
-    elif worker_state in ("created", "starting", "bootstrapping", "warming", "syncing", "ready") or raw in ("warming_up", "bootstrapping", "warming", "syncing"):
+    elif worker_state in ("starting", "bootstrapping", "warming", "syncing", "ready") or raw in ("warming_up", "bootstrapping", "warming", "syncing"):
         state = "warming_up"
     elif age is None:
         state = "error" if raw in ("failed", "error") else "disconnected"
@@ -126,7 +128,7 @@ class TradingInstance:
     # Trading instances are always forward paper. Research remains the only
     # instance mode allowed to consume a historical replay.
     market_data_mode: str = "paper_forward"
-    state: str = "stopped"             # running | paused | stopped | error
+    state: str = "created"             # created | running | paused | stopped | error
     desired_running: bool = False
     created_at: str = field(default_factory=_now)
     started_at: Optional[str] = None
@@ -591,7 +593,8 @@ class TradingInstanceManager:
                  live: bool, live_poll_s: float, fetcher=None, max_slots: int = 1,
                  max_global_risk_pct: float = 0.02, max_global_daily_loss_pct: float = 0.05,
                  paper_account_capital: float = 10_000.0, decision_store=None,
-                 decision_journal=None, trade_memory=None,
+                 decision_journal=None, trade_memory=None, skipped_store=None,
+                 cycle_store=None,
                  max_drawdown_pct: float = 0.20, max_daily_loss_pct: float = 0.0,
                  max_consecutive_losses: int = 0, cooldown_after_loss_min: int = 0,
                  session_start: int = 0, session_end: int = 24,
@@ -602,6 +605,8 @@ class TradingInstanceManager:
         self.decision_store = decision_store
         self.decision_journal = decision_journal
         self.trade_memory = trade_memory
+        self.skipped_store = skipped_store
+        self.cycle_store = cycle_store
         # Instance workers own their positions, but production risk policy is
         # supplied by the server and applied to every isolated pipeline. These
         # values were previously omitted, silently disabling several configured
@@ -847,6 +852,7 @@ class TradingInstanceManager:
             # provenance so evidence is never silently blended.
             pipeline.journal = self.decision_journal
             pipeline.trade_memory = self.trade_memory
+            pipeline.skipped = self.skipped_store
             # Learning evidence is scoped to this worker's ledger/history. A
             # BTC Brain lesson can never suppress an ETH Supertrend instance.
             from services.learning import LearningBook
@@ -986,7 +992,9 @@ class TradingInstanceManager:
                     f"the {required_decision_timeframe} decision timeframe")
             engine.ws_feed = ws_feed
             engine.strategy_label = f"{inst.strategy_label} {inst.strategy_version}"
+            engine.strategy_version = inst.strategy_version
             engine.decisions = self.decision_store
+            engine.reports = self.cycle_store
             self._runtime[instance_id] = (engine, paper, pipeline, controls)
             inst.state, inst.desired_running, inst.last_error = "starting", True, ""
             inst.started_at, inst.stopped_at = _now(), None

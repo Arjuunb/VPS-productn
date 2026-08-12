@@ -14,7 +14,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Optional
 
-from data.tenant_scope import ensure_tenant_column
+from data.tenant_scope import ensure_column, ensure_tenant_column
 
 
 def _utcnow() -> str:
@@ -31,7 +31,8 @@ _CATEGORY = {
     "risk_guard": "risk", "correlation": "risk", "daily_loss": "risk",
     "weekly_loss": "risk", "max_trades": "risk", "portfolio_exposure": "risk",
     "risk": "risk", "exposure": "risk", "event_risk": "risk",
-    "learning": "signal", "context": "signal", "execution": "signal",
+    "brain": "quality", "learning": "signal", "context": "signal",
+    "execution": "signal",
 }
 
 
@@ -56,10 +57,17 @@ class SkippedTradeStore:
                    reason TEXT,
                    entry REAL, stop REAL, target REAL,
                    strategy TEXT, timeframe TEXT,
-                   snapshot_json TEXT
+                   snapshot_json TEXT,
+                   instance_id TEXT NOT NULL DEFAULT '',
+                   decision_identity TEXT NOT NULL DEFAULT ''
                )""")
         self._c.execute("CREATE INDEX IF NOT EXISTS ix_skipped_ts ON skipped_trades(ts)")
         self._c.execute("CREATE INDEX IF NOT EXISTS ix_skipped_stage ON skipped_trades(stage)")
+        ensure_column(self._c, "skipped_trades", "instance_id", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(self._c, "skipped_trades", "decision_identity", "TEXT NOT NULL DEFAULT ''")
+        self._c.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_skipped_decision_identity "
+            "ON skipped_trades(decision_identity) WHERE decision_identity <> ''")
         ensure_tenant_column(self._c, "skipped_trades")   # Phase C-3: schema-only, additive
         self._c.commit()
 
@@ -67,15 +75,25 @@ class SkippedTradeStore:
                status: str = "rejected", entry: Optional[float] = None,
                stop: Optional[float] = None, target: Optional[float] = None,
                strategy: str = "", timeframe: str = "",
-               snapshot: Optional[dict] = None) -> int:
+               snapshot: Optional[dict] = None, instance_id: str = "",
+               decision_identity: str = "") -> int:
         with self._lock:
             cur = self._c.execute(
                 """INSERT INTO skipped_trades
                    (ts, symbol, side, stage, status, reason, entry, stop, target,
-                    strategy, timeframe, snapshot_json)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    strategy, timeframe, snapshot_json, instance_id, decision_identity)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(decision_identity) WHERE decision_identity <> '' DO NOTHING""",
                 (_utcnow(), symbol, side, stage, status, reason, entry, stop, target,
-                 strategy, timeframe, json.dumps(snapshot or {})))
+                 strategy, timeframe, json.dumps(snapshot or {}), instance_id,
+                 decision_identity))
+            if cur.rowcount == 0 and decision_identity:
+                row = self._c.execute(
+                    "SELECT id FROM skipped_trades WHERE decision_identity=?",
+                    (decision_identity,),
+                ).fetchone()
+                self._c.commit()
+                return int(row["id"])
             self._c.commit()
             return int(cur.lastrowid)
 

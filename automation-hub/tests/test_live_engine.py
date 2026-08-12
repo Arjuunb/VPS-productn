@@ -82,6 +82,46 @@ def test_status_reports_mode():
     assert eng.status()["mode"] == "live"
 
 
+def test_status_distinguishes_received_provider_candle_from_latest_closed_candle():
+    eng, _ = _engine()
+    stamp = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    bars = [Bar(stamp - timedelta(hours=2), 100, 101, 99, 100, 1),
+            Bar(stamp - timedelta(hours=1), 100, 101, 99, 100, 1),
+            Bar(stamp, 100, 101, 99, 100, 1)]
+    eng._record_received_candle(bars)
+    eng._record_market_snapshot("BTCUSDT", bars[:-1])
+    status = eng.status()
+    assert status["last_received_candle"] == bars[-1].timestamp.isoformat()
+    assert status["last_closed_candle"] == bars[-2].timestamp.isoformat()
+
+
+def test_websocket_stop_cancels_a_blocked_async_stream():
+    from data.ws_feed import WebSocketFeed
+
+    class Loop:
+        def __init__(self):
+            self.callback = None
+
+        def is_running(self):
+            return True
+
+        def call_soon_threadsafe(self, callback):
+            self.callback = callback
+            callback()
+
+    class Task:
+        cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    feed = WebSocketFeed(["BTCUSDT"], timeframe="5m", exchange="kraken")
+    loop, task = Loop(), Task()
+    feed._loop, feed._stream_task = loop, task
+    feed.stop()
+    assert task.cancelled is True
+
+
 def test_status_reports_server_authoritative_worker_uptime():
     eng, _ = _engine()
     eng.started_at = (datetime.now(timezone.utc) - timedelta(seconds=75)).isoformat()
@@ -145,6 +185,8 @@ def test_live_worker_recovers_after_a_transient_warmup_failure():
         while calls["n"] < 2 and time.time() < deadline:
             time.sleep(0.01)
         assert calls["n"] >= 2
+        while eng.status()["lifecycle_state"] != "running" and time.time() < deadline:
+            time.sleep(0.01)
         assert eng.status()["lifecycle_state"] == "running"
     finally:
         eng.stop()

@@ -422,7 +422,9 @@ class SignalPipeline:
                         symbol=symbol, side=side, stage=stage, reason=reason,
                         status=status, entry=entry, stop=stop, target=payload.get("target"),
                         strategy=payload.get("strategy", ""), timeframe=payload.get("timeframe", ""),
-                        snapshot=payload.get("snapshot") or {})
+                        snapshot=payload.get("snapshot") or {},
+                        instance_id=str(payload.get("instance_id") or ""),
+                        decision_identity=str(payload.get("decision_identity") or ""))
                 except Exception:  # noqa: BLE001 — logging must never block trading
                     pass
             if (self.counterfactual is not None and stage in _GRADED_STAGES
