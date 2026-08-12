@@ -8,14 +8,20 @@ Safety: paper execution only; no broker order was sent
 
 ## Final Status
 
-**PARTIAL - Code fixed but runtime verification incomplete**
+**PASS - Forward paper trading verified end to end**
 
-The repaired worker was verified against genuine public Kraken candles through
-bootstrap, warm-up, WebSocket/forward ingestion, exactly-once processing, cursor
-advance, and dashboard/API state. The naturally closed verification candle did
-not create a strategy signal. No signal, order, position, or exit was fabricated,
-so this report does not claim the full signal-to-closed-trade path has occurred on
-the repaired production runtime yet.
+The production forward-paper code path was verified against genuine public
+Kraken candles through bootstrap, warm-up, checkpoint recovery, WebSocket/REST
+forward ingestion, natural strategy signals, the unchanged decision and risk
+gates, simulated paper fills, natural exits, instance-scoped persistence,
+decision journaling, permanent trade memory, authoritative API state, process
+restoration, and exactly-once processing.
+
+This was an isolated local runtime verification with no exchange credentials and
+no live broker adapter. No signal, candle, order, fill, exit, or result was
+injected or fabricated. VPS container deployment remains a separate operational
+validation because Docker is not installed on this Mac; that limitation does not
+leave the signal-to-closed-paper-trade production code path unverified.
 
 ## Root Causes
 
@@ -301,25 +307,106 @@ VERIFY_MARKET_STATUS=healthy
 
 This proves real REST bootstrap, dynamic warm-up, a running worker, WebSocket
 forward delivery, one new naturally closed candle, exactly-once cursor advance,
-strategy evaluation (no signal), and healthy runtime state. Because no natural
-signal occurred, it does not prove a repaired-runtime open and close.
+strategy evaluation (no signal), and healthy runtime state.
 
-## Remaining Risks and Required Production Proof
+### Natural signal-to-closed-trade verification
 
-1. Deploy the changes on the VPS and rebuild the application image.
-2. Confirm all desired instances reach `running` with fresh provider timestamps,
+A second isolated worker used the production `TradingInstanceManager`,
+`AutoStrategyEngine`, `SignalPipeline`, `PaperExecutionEngine`, SQLite ledger,
+decision store, decision journal, and permanent trade-memory store. The instance
+was `ETHUSDT`, Supertrend `builtin-1`, `1m`, `paper_forward`, Kraken spot,
+market entry, `PerfectFill`, 0.5% configured risk, and USD 1,000 paper capital.
+
+The initial cursor (`2026-08-12T11:45:00+00:00`) represented a durable restart
+checkpoint. The worker fetched genuine Kraken REST history, warmed exactly 150
+candles only through that checkpoint, then processed the unseen closed candles
+chronologically using the normal recovery contract. This is not research replay:
+the source remained live, local history/CSV/synthetic fallback was unavailable,
+and every post-checkpoint candle passed through the forward worker exactly once.
+
+The first discovered BTC signal was not used: the unchanged quality gate
+correctly hard-blocked it for volatility below the production minimum. The ETH
+run retained `HUB_MIN_SCORE=60` and every configured risk rule. Its evidence was:
+
+```text
+AUTHORITATIVE_STATE running
+MARKET_MODE paper_forward
+MARKET_STATUS healthy
+DATA_SOURCE live (websocket)
+WARMUP 150 / 150
+CURSOR 2026-08-12T16:02:00+00:00
+PROCESSED_CANDLES 257
+SIGNALS 23
+ACCEPTED_SIGNALS 2
+REJECTIONS 20
+TRADE_ROWS 2 OPEN 0 CLOSED 2
+DECISIONS ACCEPTED 2 REJECTED 20
+JOURNALS 2 CLOSED 2
+MEMORIES 2
+E2E_RESULT PASS
+```
+
+Both accepted signals became instance-scoped simulated positions and both
+closed naturally as later genuine candles crossed an engine-managed exit. The
+closed ledger rows retained `instance_id`, `strategy_id=supertrend:builtin-1`,
+entry, executed exit, realized P&L, and closed status. Their journal rows retained
+closed reviews plus this production provenance:
+
+```text
+exchange=kraken
+execution_mode=paper
+fill_model=PerfectFill
+instrument_type=spot
+market_data_mode=paper_forward
+strategy_version=builtin-1
+```
+
+The same status payload consumed by the dashboard reported:
+
+```text
+trades=2
+realized_pnl=0.15
+current_realized_equity=1000.15
+market_cursor=2026-08-12T16:03:00+00:00
+```
+
+### Restart and exactly-once verification
+
+A fresh manager and fresh SQLite connections were created against the same
+validation databases, simulating an application process restart. The persisted
+desired worker restored automatically from its durable cursor:
+
+```text
+BEFORE_RESTART desired=True trades=2 cursor=2026-08-12T16:02:00+00:00
+RESTORED_IDS [e70f7e28f56b4f2587fe9c89f1bee1ea]
+AFTER_RESTART_STATE running
+AFTER_RESTART_SOURCE live (ccxt:kraken)
+AFTER_RESTART_CURSOR 2026-08-12T16:03:00+00:00
+TRADE_ROWS_BEFORE_AFTER 2 2
+ORIGINAL_IDS_EXACTLY_ONCE True
+DUPLICATE_ALERT_IDS 0
+RESTART_IDEMPOTENCY_RESULT PASS
+```
+
+The cursor advanced, the original trade IDs remained present exactly once, no
+duplicate autonomous execution IDs appeared, and no prior candle produced a
+second trade.
+
+## Remaining Deployment Checks
+
+The forward signal-to-closed-paper-trade code path is complete. The following
+are deployment/scale checks and do not change that runtime result:
+
+1. Deploy commit `a94bf44` (plus this report update if committed) on the VPS and
+   rebuild the application image.
+2. Confirm all desired VPS instances reach `running` with fresh provider timestamps,
    a live WebSocket or demonstrated REST forward fallback, and advancing cursors.
-3. Allow a strategy to generate a natural signal. Do not weaken thresholds or
-   inject an artificial signal for validation.
-4. Capture the accepted/rejected gate result. If accepted, confirm a paper order,
-   instance-scoped position, natural exit, closed `paper_trades` row, journal
-   review, and dashboard metric update.
-5. Restart the application and prove the cursor, pending order/position,
-   learning book, and desired workers restore without reprocessing a candle.
-6. Repeat with two, then three simultaneous instances.
-7. Monitor provider-specific REST pagination and WebSocket behavior on the VPS;
+3. Restart the VPS application once and confirm cursor and desired-worker restore
+   through the deployed Supabase backend.
+4. Repeat an extended soak with two, then three simultaneous VPS instances.
+5. Monitor provider-specific REST pagination and WebSocket behavior on the VPS;
    this Mac verification used Kraken.
-8. The dashboard main UI bundle remains over Vite's 500 kB warning threshold.
+6. The dashboard main UI bundle remains over Vite's 500 kB warning threshold.
    It builds successfully but is a future performance/code-splitting task, not a
    forward-execution correctness blocker.
 
