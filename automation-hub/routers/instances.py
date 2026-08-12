@@ -232,6 +232,10 @@ def delete_instance(instance_id: str, x_webhook_secret: Optional[str] = Header(d
         raise HTTPException(404, "Trading instance not found")
     except ValueError as exc:
         raise HTTPException(409, str(exc))
+    except RuntimeError as exc:
+        # Preserve an actionable persistence/backend reason for the dashboard
+        # instead of collapsing a Supabase outage into an opaque HTTP 500.
+        raise HTTPException(503, str(exc))
     _wa.ledger.log(level="info", stage="instance",
                    message=f"Trading Instance deleted: {deleted_id}")
     return {"deleted_instance_id": deleted_id}
@@ -287,6 +291,7 @@ def update_instance(instance_id: str, body: InstanceUpdate,
         return {"instance": _manager().status(inst.id)}
     except KeyError: raise HTTPException(404, "Trading instance not found")
     except ValueError as exc: raise HTTPException(409, str(exc))
+    except RuntimeError as exc: raise HTTPException(503, str(exc))
 
 
 @router.post("/instances/{instance_id}/{action}")
@@ -302,6 +307,7 @@ def instance_action(instance_id: str, action: str, x_webhook_secret: Optional[st
         else: raise HTTPException(404, "Unknown instance action")
     except KeyError: raise HTTPException(404, "Trading instance not found")
     except ValueError as exc: raise HTTPException(409, str(exc))
+    except RuntimeError as exc: raise HTTPException(503, str(exc))
     return {"instance": manager.status(inst.id)}
 
 

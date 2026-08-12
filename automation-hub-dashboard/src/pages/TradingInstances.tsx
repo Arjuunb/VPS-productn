@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import AreaLine from "../components/chart/AreaLine";
 import Card from "../components/common/Card";
 import Icon from "../components/common/Icon";
 import { Badge, Field, PageHeader, StatCard } from "../components/common/ui";
-import { apiPatchJson, apiPost, apiPostJson, useLive } from "../lib/api";
+import { apiDelete, apiPatchJson, apiPost, apiPostJson, useLive } from "../lib/api";
 import { useApp } from "../app-context";
 
 type Metric = Record<string, any>;
@@ -27,20 +27,37 @@ const duration = (seconds: unknown) => {
 };
 const titleCase = (value?: string) => value ? value.replace(/_/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase()) : "Not available";
 const tone = (state?: string) => state === "running" || state === "ready" || state === "healthy" ? "green" : state === "paused" || state === "warning" || state === "stale" || state === "warming_up" || state === "starting" || state === "bootstrapping" || state === "warming" || state === "syncing" || state === "recovering" || state === "data_stale" ? "amber" : state === "error" || state === "critical" || state === "disconnected" ? "red" : "default";
+const runtimeHealth = (instance: Instance) => instance.state === "error" ? "Runtime error" : instance.state === "data_stale" ? "Data stale" : instance.state === "recovering" ? "Recovering" : instance.state === "paused" ? "Paused" : instance.state === "stopped" ? "Stopped" : instance.strategy_health?.status ?? "Insufficient data";
+const recordedError = (instance: Instance) => instance.last_error || String(instance.engine?.last_error || instance.engine?.stop_reason || "");
+const recoveryGuidance = (message: string) => {
+  const text = message.toLowerCase();
+  if (text.includes("cursor") || text.includes("recoverable") || text.includes("backfill") || text.includes("previously processed")) return "The saved market cursor is outside the venue's recoverable window. If this old instance has no open position, delete it and create a fresh instance with the current built-in strategy version.";
+  if (text.includes("migration") || text.includes("schema") || text.includes("instance_market_state")) return "Apply the current trading_instances_schema.sql migration in Supabase, then restart the app container.";
+  if (text.includes("slot") || text.includes("capacity") || text.includes("allocation")) return "Stop or delete an unused instance, or reduce its allocation before starting another worker.";
+  if (text.includes("websocket") || text.includes("market data") || text.includes("disconnect") || text.includes("timeout")) return "Use Restart once. If recovery fails again, verify the configured venue and inspect the app logs before recreating the instance.";
+  return "Use Restart once and review the app logs. If this is an obsolete instance with no open position, delete it and create a fresh one.";
+};
 
 function Detail({ label, value, negative = false }: { label: string; value: React.ReactNode; negative?: boolean }) {
   return <div style={{ minWidth: 0, marginBottom: 8 }}><div className="dim" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: ".06em" }}>{label}</div><div className={negative ? "neg" : ""} style={{ overflowWrap: "anywhere" }}>{value}</div></div>;
 }
 
-function InstanceActions({ instance, action, compact = false }: { instance: Instance; action: (id: string, name: string) => Promise<void>; compact?: boolean }) {
+function InstanceActions({ instance, action, remove, actionBusy, locked = false, deleting = false, compact = false }: { instance: Instance; action: (instance: Instance, name: string) => Promise<void>; remove: (instance: Instance) => Promise<void>; actionBusy?: string | null; locked?: boolean; deleting?: boolean; compact?: boolean }) {
   const cls = compact ? "btn btn-soft btn-sm" : "btn btn-soft btn-sm";
   const working = ["starting", "bootstrapping", "warming", "syncing", "ready", "data_stale", "recovering"].includes(instance.state);
+  const busyName = actionBusy?.startsWith(`${instance.id}:`) ? actionBusy.slice(instance.id.length + 1) : "";
+  // Actions are serialized so two rapid controls cannot race durable worker
+  // state. Disable every row while one lifecycle request is in flight.
+  const rowBusy = locked || deleting || Boolean(actionBusy);
+  const progressLabels: Record<string, string> = { start: "Starting…", pause: "Pausing…", resume: "Resuming…", stop: "Stopping…", restart: "Restarting…" };
+  const label = (name: string, idle: string) => busyName === name ? progressLabels[name] : idle;
   return <div className="row-actions" style={{ justifyContent: "flex-start", gap: 6, flexWrap: "wrap" }}>
-    {(instance.state === "running" || instance.state === "ready") && <button className={`${cls} btn-warn`} onClick={() => void action(instance.id, "pause")}>Pause</button>}
-    {(instance.state === "running" || instance.state === "ready" || working) && <button className={`${cls} btn-danger`} onClick={() => void action(instance.id, "stop")}>Stop</button>}
-    {instance.state === "paused" && <><button className={`${cls} btn-primary`} onClick={() => void action(instance.id, "resume")}>Resume</button><button className={`${cls} btn-danger`} onClick={() => void action(instance.id, "stop")}>Stop</button></>}
-    {!working && instance.state !== "running" && instance.state !== "ready" && instance.state !== "paused" && <button className={`${cls} btn-primary`} onClick={() => void action(instance.id, "start")}>Start</button>}
-    <button className={cls} onClick={() => void action(instance.id, "restart")}>Restart</button>
+    {(instance.state === "running" || instance.state === "ready") && <button className={`${cls} btn-warn`} disabled={rowBusy} onClick={() => void action(instance, "pause")}>{label("pause", "Pause")}</button>}
+    {(instance.state === "running" || instance.state === "ready" || working) && <button className={`${cls} btn-danger`} disabled={rowBusy} onClick={() => void action(instance, "stop")}>{label("stop", "Stop")}</button>}
+    {instance.state === "paused" && <><button className={`${cls} btn-primary`} disabled={rowBusy} onClick={() => void action(instance, "resume")}>{label("resume", "Resume")}</button><button className={`${cls} btn-danger`} disabled={rowBusy} onClick={() => void action(instance, "stop")}>{label("stop", "Stop")}</button></>}
+    {!working && instance.state !== "running" && instance.state !== "ready" && instance.state !== "paused" && <button className={`${cls} btn-primary`} disabled={rowBusy} onClick={() => void action(instance, "start")}>{label("start", "Start")}</button>}
+    <button className={cls} disabled={rowBusy} onClick={() => void action(instance, "restart")}>{label("restart", "Restart")}</button>
+    {(instance.state === "stopped" || instance.state === "error") && <button className={`${cls} btn-danger`} disabled={rowBusy} onClick={() => void remove(instance)}>{deleting ? "Deleting…" : "Delete"}</button>}
   </div>;
 }
 
@@ -53,6 +70,10 @@ export default function TradingInstancesPage({ instanceId }: { instanceId?: stri
   const [range, setRange] = useState<"today" | "7d" | "30d" | "all">("all");
   const [filters, setFilters] = useState({ status: "", pair: "", strategy: "", timeframe: "", version: "", query: "", sort: "newest" });
   const [busy, setBusy] = useState(false);
+  const [actionBusy, setActionBusy] = useState<string | null>(null);
+  const [actionErrors, setActionErrors] = useState<Record<string, string>>({});
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const operationLock = useRef(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [form, setForm] = useState({ symbol: "", strategy: "", strategy_version: "", timeframe: "", exchange: "", risk: "0.5", capital: "1000", max_open_positions: "3", sizing_mode: "fixed_starting_equity_percent", fixed_quantity: "", profit_reinvestment: false, maximum_risk_amount: "", minimum_equity: "", entry_mode: "limit", fill_model: "" });
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -101,9 +122,19 @@ export default function TradingInstancesPage({ instanceId }: { instanceId?: stri
   const current = rows.find((row) => row.id === (instanceId ?? selected)) ?? rows[0];
   const formStrategy = options.data?.strategies.find((row) => row.key === form.strategy);
   const editStrategy = options.data?.strategies.find((row) => row.key === editForm.strategy);
+  const capacityKnown = live.data?.available_paper_capital !== undefined && live.data?.available_paper_capital !== null;
+  const availableAllocation = capacityKnown ? Number(live.data?.available_paper_capital) : 0;
+  const requestedAllocation = Number(form.capital);
+  const invalidAllocation = !Number.isFinite(requestedAllocation) || requestedAllocation <= 0;
+  const allocationUnavailable = capacityKnown && requestedAllocation > availableAllocation + 1e-9;
+  const formRisk = Number(form.risk);
+  const invalidRisk = !Number.isFinite(formRisk) || formRisk <= 0 || formRisk > 5;
+  const invalidFixedQuantity = form.sizing_mode === "fixed_quantity" && (!Number.isFinite(Number(form.fixed_quantity)) || Number(form.fixed_quantity) <= 0);
+  const controlsUnavailable = Boolean(live.error);
+  const createDisabled = busy || controlsUnavailable || Boolean(options.error) || !capacityKnown || !form.symbol || !form.strategy || !form.strategy_version || !form.timeframe || invalidAllocation || allocationUnavailable || invalidRisk || invalidFixedQuantity;
 
   const create = async () => {
-    if (busy || !form.symbol || !form.strategy || !form.strategy_version || !form.timeframe) return;
+    if (createDisabled) return;
     setCreateError(null);
     setBusy(true);
     try {
@@ -112,7 +143,13 @@ export default function TradingInstancesPage({ instanceId }: { instanceId?: stri
       // Never append the POST payload optimistically: creation may fail while
       // Supabase validates the durable per-instance market cursor.
       setSelected(created.instance.id);
-      live.refetch();
+      const refreshed = await live.refetch();
+      if (!refreshed) {
+        const message = "Instance was created, but the authoritative list could not be refreshed. Controls remain disabled until the backend reconnects.";
+        setCreateError(message);
+        app.toast(message, "error");
+        return;
+      }
       app.toast("Trading instance created — start it when ready", "success");
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not create instance";
@@ -121,10 +158,65 @@ export default function TradingInstancesPage({ instanceId }: { instanceId?: stri
     }
     finally { setBusy(false); }
   };
-  const action = async (id: string, name: string) => {
-    try { await apiPost(`/instances/${id}/${name}`); live.refetch(); app.toast(`Instance ${name} completed`, "success"); }
-    catch (error) { app.toast(error instanceof Error ? error.message : `Could not ${name} instance`, "error"); }
+  const action = async (instance: Instance, name: string) => {
+    if (operationLock.current) return;
+    const label = `${instance.symbol} · ${instance.strategy_label} ${instance.strategy_version} · ${instance.timeframe}`;
+    if (name === "restart" && !window.confirm(`Restart this Trading Instance?\n\n${label}\n\nThe worker and market-data connection will be rebuilt from its persisted cursor.`)) return;
+    if (name === "stop" && !window.confirm(`Stop this Trading Instance?\n\n${label}\n\nIts configuration and market cursor will remain saved.`)) return;
+    const key = `${instance.id}:${name}`;
+    operationLock.current = true;
+    setActionBusy(key);
+    try {
+      await apiPost(`/instances/${instance.id}/${name}`);
+      setActionErrors((current) => { const next = { ...current }; delete next[instance.id]; return next; });
+      const refreshed = await live.refetch();
+      if (!refreshed) {
+        const message = `Instance ${name} completed, but its authoritative state could not be refreshed.`;
+        setActionErrors((current) => ({ ...current, [instance.id]: message }));
+        app.toast(message, "error");
+        return;
+      }
+      app.toast(`Instance ${name} completed`, "success");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : `Could not ${name} instance`;
+      setActionErrors((current) => ({ ...current, [instance.id]: message }));
+      await live.refetch();
+      app.toast(message, "error");
+    } finally {
+      operationLock.current = false;
+      setActionBusy(null);
+    }
   };
+  const remove = async (instance: Instance) => {
+    if (operationLock.current) return;
+    const label = `${instance.symbol} · ${instance.strategy_label} ${instance.strategy_version} · ${instance.timeframe}`;
+    if (!window.confirm(`Permanently delete this stopped Trading Instance?\n\n${label}\n\nIts configuration and runtime cursor will be removed. Closed trade records remain in the ledger. An instance with an open position cannot be deleted.`)) return;
+    operationLock.current = true;
+    setDeletingId(instance.id);
+    setActionBusy(`${instance.id}:delete`);
+    try {
+      await apiDelete<{ deleted_instance_id: string }>(`/instances/${instance.id}`);
+      setActionErrors((current) => { const next = { ...current }; delete next[instance.id]; return next; });
+      if ((instanceId ?? selected) === instance.id) setSelected(null);
+      const refreshed = await live.refetch();
+      if (!refreshed) {
+        const message = "Trading instance was deleted, but the authoritative list could not be refreshed.";
+        setActionErrors((current) => ({ ...current, [instance.id]: message }));
+        app.toast(message, "error");
+        return;
+      }
+      app.toast("Trading instance deleted", "success");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not delete Trading Instance";
+      setActionErrors((current) => ({ ...current, [instance.id]: message }));
+      app.toast(message, "error");
+    } finally {
+      operationLock.current = false;
+      setDeletingId(null);
+      setActionBusy(null);
+    }
+  };
+  const errorFor = (instance: Instance) => actionErrors[instance.id] || recordedError(instance);
   const beginEdit = (instance: Instance) => {
     setEditError(null);
     setEditingId(instance.id);
@@ -186,6 +278,8 @@ export default function TradingInstancesPage({ instanceId }: { instanceId?: stri
 
   return <>
     <PageHeader title="Trading Instances" subtitle="independent paper workers · live closed candles, simulated orders, no real funds" />
+    {live.error && <div className="instance-risk-notice red" role="alert" style={{ marginBottom: 12 }}><b>Trading Instances unavailable</b><br />{live.error}<br /><span className="dim">Creation and lifecycle controls remain disabled until the authoritative backend state reconnects.</span></div>}
+    {options.error && <div className="instance-risk-notice red" role="alert" style={{ marginBottom: 12 }}><b>Instance options unavailable</b><br />{options.error}</div>}
     <div className="stat-row instance-overview">
       <StatCard label="Active slots" value={`${live.data?.active_slots ?? "—"} / ${live.data?.max_active_slots ?? "—"}`} sub="running paper workers" />
       <StatCard label="Total instances" value={String(live.data?.total_instances ?? rows.length)} sub={`running ${live.data?.instance_counts?.running ?? 0} · paused ${live.data?.instance_counts?.paused ?? 0} · stopped ${live.data?.instance_counts?.stopped ?? 0} · error ${live.data?.instance_counts?.error ?? 0}`} />
@@ -203,7 +297,7 @@ export default function TradingInstancesPage({ instanceId }: { instanceId?: stri
           <Field label="Strategy version"><select value={form.strategy_version} onChange={(e) => setForm({ ...form, strategy_version: e.target.value })}>{(formStrategy?.versions ?? []).map((value) => <option key={value}>{value}</option>)}</select></Field>
           <Field label="Timeframe"><select value={form.timeframe} onChange={(e) => setForm({ ...form, timeframe: e.target.value })}>{(formStrategy?.supported_timeframes ?? options.data?.timeframes ?? []).map((value) => <option key={value}>{value}</option>)}</select></Field>
           <Field label="Venue / instrument" hint="live candles and executable lot filters"><select value={form.exchange} onChange={(e) => setForm({ ...form, exchange: e.target.value })}>{(options.data?.exchanges ?? []).map((value) => <option key={value.key} value={value.key}>{value.label}</option>)}</select></Field>
-          <Field label="Capital allocation"><input value={form.capital} onChange={(e) => setForm({ ...form, capital: e.target.value })} inputMode="decimal" /></Field>
+          <Field label="Capital allocation" hint={capacityKnown ? `${money(availableAllocation)} available` : "Loading available capital…"}><input value={form.capital} max={capacityKnown ? availableAllocation : undefined} min="0.01" type="number" step="0.01" onChange={(e) => setForm({ ...form, capital: e.target.value })} inputMode="decimal" /></Field>
           <Field label="Risk per trade (%)"><input value={form.risk} onChange={(e) => setForm({ ...form, risk: e.target.value })} inputMode="decimal" /></Field>
           <Field label="Maximum open positions"><input type="number" min="1" max="50" step="1" value={form.max_open_positions} onChange={(e) => setForm({ ...form, max_open_positions: e.target.value })} /></Field>
           <Field label="Sizing mode"><select value={form.sizing_mode} onChange={(e) => setForm({ ...form, sizing_mode: e.target.value })}>{(options.data?.sizing_modes ?? []).filter((value) => value.implemented).map((value) => <option key={value.key} value={value.key}>{value.label}</option>)}</select></Field>
@@ -216,8 +310,12 @@ export default function TradingInstancesPage({ instanceId }: { instanceId?: stri
           <Field label="Execution / data"><input readOnly value="Simulated fills / live closed candles" /></Field>
         </div>
         <p className="dim" style={{ margin: "10px 0 0", fontSize: 12 }}>Realistic execution models spread, slippage, latency and fees. Perfect Fill is retained only for controlled ideal-fill comparisons. Historical replay cannot be created as a paper-trading instance.</p>
+        {invalidAllocation && <div className="instance-risk-notice amber" role="status" style={{ marginTop: 10 }}>Capital allocation must be a valid value greater than zero.</div>}
+        {allocationUnavailable && <div className="instance-risk-notice amber" role="status" style={{ marginTop: 10 }}>{availableAllocation <= 0 ? "No paper-account allocation is available. Stop does not release allocation: delete an unused stopped/error instance, or increase the paper-account capital in platform settings." : `Allocation must not exceed the available ${money(availableAllocation)}.`}</div>}
+        {invalidRisk && <div className="instance-risk-notice amber" role="status" style={{ marginTop: 10 }}>Risk per trade must be greater than 0% and no more than 5%.</div>}
+        {invalidFixedQuantity && <div className="instance-risk-notice amber" role="status" style={{ marginTop: 10 }}>Fixed quantity must be greater than zero.</div>}
         {createError && <div className="instance-risk-notice red" role="alert" style={{ marginTop: 10 }}>{createError}</div>}
-        <button className="btn btn-primary" disabled={busy || !form.symbol} aria-busy={busy} style={{ marginTop: 10 }} onClick={() => void create()}><Icon name="plus" size={14} /> {busy ? "Creating…" : "Create instance"}</button>
+        <button className="btn btn-primary" disabled={createDisabled} aria-busy={busy} style={{ marginTop: 10 }} onClick={() => void create()}><Icon name="plus" size={14} /> {busy ? "Creating…" : "Create instance"}</button>
       </Card>
       <Card className="instance-filter-card" title="Filters & display" subtitle="instance-scoped records only">
         <div className="form-grid-2">
@@ -242,11 +340,11 @@ export default function TradingInstancesPage({ instanceId }: { instanceId?: stri
 
     <Card className="instance-active-card" title="Active Trading Instances" subtitle="live runtime is separate from historical performance" right={<Badge text={`${active.filter((row) => row.state === "running").length} running · ${active.length} active`} tone={active.length ? "green" : "default"} />}>
       {view === "table" ? <div className="tablewrap"><table className="data-table"><thead><tr><th>Pair</th><th>Strategy</th><th>Version</th><th>TF</th><th>State</th><th>Capital</th><th>Risk</th><th>P&L</th><th>Trades</th><th>WR</th><th>PF</th><th>Market data</th><th>Position</th><th>Health</th><th></th></tr></thead><tbody>
-        {filtered.map((row) => <tr key={row.id}><td><button className="btn btn-link" onClick={() => setSelected(row.id)}>{row.symbol}</button></td><td>{row.strategy_label}</td><td>{row.strategy_version}</td><td>{row.timeframe}</td><td><Badge text={titleCase(row.state)} tone={tone(row.state) as any} /></td><td>{money(row.capital_allocation)}</td><td>{pct(row.risk_per_trade_pct * 100)}</td><td className={Number(row.performance?.net_pnl ?? row.metrics?.realized_pnl) < 0 ? "neg" : "pos"}>{signedMoney(row.performance?.net_pnl ?? row.metrics?.realized_pnl)}</td><td>{row.performance?.trades ?? row.metrics?.trades ?? "—"}</td><td>{pct(row.performance?.win_rate ?? row.metrics?.win_rate, 1)}</td><td>{number(row.performance?.profit_factor ?? row.metrics?.profit_factor)}</td><td>{titleCase(row.market_data?.market_data_status)}</td><td>{row.current_position ? `${row.current_position.side} ${row.current_position.symbol}` : "—"}</td><td>{row.strategy_health?.status ?? "Not available"}</td><td><InstanceActions instance={row} action={action} compact /></td></tr>)}
+        {filtered.map((row) => <tr key={row.id}><td><button className="btn btn-link" onClick={() => setSelected(row.id)}>{row.symbol}</button></td><td>{row.strategy_label}</td><td>{row.strategy_version}</td><td>{row.timeframe}</td><td><Badge text={titleCase(row.state)} tone={tone(row.state) as any} />{(row.state === "error" || actionErrors[row.id]) && <div className="neg" title={errorFor(row) || "No error reason recorded"} style={{ marginTop: 5, maxWidth: 260, whiteSpace: "normal", overflowWrap: "anywhere", fontSize: 11 }}>{errorFor(row) || "No error reason recorded"}</div>}</td><td>{money(row.capital_allocation)}</td><td>{pct(row.risk_per_trade_pct * 100)}</td><td className={Number(row.performance?.net_pnl ?? row.metrics?.realized_pnl) < 0 ? "neg" : "pos"}>{signedMoney(row.performance?.net_pnl ?? row.metrics?.realized_pnl)}</td><td>{row.performance?.trades ?? row.metrics?.trades ?? "—"}</td><td>{pct(row.performance?.win_rate ?? row.metrics?.win_rate, 1)}</td><td>{number(row.performance?.profit_factor ?? row.metrics?.profit_factor)}</td><td>{titleCase(row.market_data?.market_data_status)}</td><td>{row.current_position ? `${row.current_position.side} ${row.current_position.symbol}` : "—"}</td><td className={row.state === "error" ? "neg" : ""}>{runtimeHealth(row)}</td><td><InstanceActions instance={row} action={action} remove={remove} actionBusy={actionBusy} locked={controlsUnavailable} deleting={deletingId === row.id} compact /></td></tr>)}
         {!filtered.length && <tr><td colSpan={15} className="dim ta-center">No instances match the current filters.</td></tr>}
       </tbody></table></div> : <div style={{ display: "grid", gap: 12 }}>
         {active.map((row) => <article key={row.id} className="instance-worker-row">
-          <section className="instance-worker-column instance-identity"><div className="dim" style={{ fontSize: 10 }}>RUNTIME</div><Badge text={titleCase(row.state)} tone={tone(row.state) as any} /><h3>{row.symbol}</h3><div>{row.strategy_label}</div><div className="dim">{row.strategy_version} · Paper simulation · live data</div><div className="instance-worker-actions"><InstanceActions instance={row} action={action} /></div><button className="btn btn-link" onClick={() => setSelected(row.id)}>Open details</button></section>
+          <section className="instance-worker-column instance-identity"><div className="dim" style={{ fontSize: 10 }}>RUNTIME</div><Badge text={titleCase(row.state)} tone={tone(row.state) as any} /><h3>{row.symbol}</h3><div>{row.strategy_label}</div><div className="dim">{row.strategy_version} · Paper simulation · live data</div>{(row.state === "error" || actionErrors[row.id]) && <div className="instance-risk-notice red" style={{ marginTop: 8 }}><b>{errorFor(row) || "No error reason recorded"}</b><br /><span className="dim">Recommended: {recoveryGuidance(errorFor(row))}</span></div>}<div className="instance-worker-actions"><InstanceActions instance={row} action={action} remove={remove} actionBusy={actionBusy} locked={controlsUnavailable} deleting={deletingId === row.id} /></div><button className="btn btn-link" onClick={() => setSelected(row.id)}>Open details</button></section>
           <section className="instance-worker-column"><Detail label="Timeframe" value={row.timeframe} /><Detail label="Venue / instrument" value={`${titleCase(row.effective_exchange ?? row.exchange)} / ${titleCase(row.instrument_type)}`} /><Detail label="Allocation / realized equity" value={`${money(row.capital_allocation)} / ${money(row.execution?.current_realized_equity)}`} /><Detail label="Risk % / next max risk" value={`${pct(row.risk_per_trade_pct * 100)} / ${money(row.execution?.next_trade_risk_amount)}`} /><Detail label="Next quantity" value={row.execution?.next_trade_quantity ?? "Calculated from the next valid stop"} /><Detail label="Sizing / entry" value={`${titleCase(row.sizing_mode ?? row.execution?.position_sizing_mode)} / ${titleCase(row.entry_mode ?? row.execution?.entry_mode)}`} /><Detail label="Risk basis / reinvest" value={`${money(row.execution?.risk_basis)} / ${row.profit_reinvestment ? "On" : "Off"}`} /></section>
           <section className="instance-worker-column"><Detail label="Source / WebSocket" value={`${row.market_data?.data_source ?? "Not available"} / ${row.engine?.websocket?.available ? "Connected" : "REST fallback"}`} /><Detail label="Last closed / processed" value={`${timestamp(row.market_data?.last_market_data_timestamp)} / ${timestamp(row.market_data?.last_processed_candle_timestamp)}`} /><Detail label="Next expected / feed age" value={`${timestamp(row.engine?.next_expected_candle)} / ${duration(row.market_data?.market_data_age_seconds)}`} /><Detail label="Bootstrap / market status" value={`${titleCase(row.engine?.bootstrap_status)} / ${titleCase(row.market_data?.market_data_status)}`} /><Detail label="Warm-up" value={`${row.market_data?.warmup_bars ?? "—"} / ${row.engine?.warmup_required ?? "—"}`} /><Detail label="Duplicate / missing / out-of-order" value={`${row.market_data?.duplicate_candles ?? "—"} / ${row.market_data?.missing_candles ?? "—"} / ${row.market_data?.out_of_order_candles ?? "—"}`} /><Detail label="Recovery" value={`${row.engine?.reconnect_attempt ?? 0} · ${timestamp(row.engine?.last_recovery_attempt)}`} /></section>
           <section className="instance-worker-column"><div className="dim" style={{ fontSize: 10, marginBottom: 8 }}>HISTORICAL PERFORMANCE — NOT RUNTIME HEALTH</div><Detail label="Net P&L / return" value={`${signedMoney(row.performance?.net_pnl)} / ${pct(row.performance?.return_pct, 3)}`} /><Detail label="Trades / win rate" value={`${row.performance?.trades ?? "—"} / ${pct(row.performance?.win_rate, 1)}`} /><Detail label="Profit factor / average R" value={`${number(row.performance?.profit_factor)} / ${number(row.performance?.average_rr, 3)}R`} /><Detail label="Expectancy / max DD" value={`${money(row.performance?.expectancy)} / ${pct(row.performance?.max_drawdown_pct)}`} /><Detail label="Sharpe (per-trade R)" value={number(row.performance?.sharpe_ratio)} /><Detail label="Historical strategy health" value={row.strategy_health?.status ?? "Not available"} /></section>
@@ -262,7 +360,7 @@ export default function TradingInstancesPage({ instanceId }: { instanceId?: stri
         {curve.length > 1 ? <div className="chart-md"><AreaLine labels={curve.map((point: any) => point.t ? new Date(point.t).toLocaleDateString() : "Start")} series={[{ name: "Equity", data: curve.map((point: any) => Number(point.equity)), color: "#eab54f" }]} valueFormatter={(value) => money(value)} /></div> : <div className="dim ta-center" style={{ padding: 48 }}>Insufficient data</div>}
       </Card>
       <Card title={`${current.symbol} status`} subtitle="actual worker, decision, risk, and position state">
-        {current.last_error && <div className="instance-risk-notice amber"><b>{titleCase(current.state)}</b><br />{current.last_error}</div>}
+        {errorFor(current) && <div className="instance-risk-notice amber"><b>{titleCase(current.state)}</b><br />{errorFor(current)}<br /><span className="dim">Recommended: {recoveryGuidance(errorFor(current))}</span></div>}
         <div className="form-grid-2"><Detail label="Last decision" value={current.last_decision ? `${titleCase(current.last_decision.decision)} · ${current.last_decision.side ?? "No side"}` : "Not available"} /><Detail label="Decision reason" value={current.last_decision?.reason ?? "Not available"} /><Detail label="Strategy health" value={current.strategy_health?.status ?? "Not available"} /><Detail label="Health sample" value={current.strategy_health?.sample_size ?? "Not available"} /><Detail label="Starting / realized equity" value={`${money(current.execution?.starting_equity)} / ${money(current.execution?.current_realized_equity)}`} /><Detail label="Unrealized / mark-to-market" value={`${signedMoney(current.execution?.unrealized_pnl)} / ${money(current.execution?.mark_to_market_equity)}`} /><Detail label="Gross P&L / fees / net" value={`${signedMoney(current.execution?.gross_realized_pnl)} / ${money(current.execution?.fees_paid)} / ${signedMoney(current.execution?.realized_pnl)}`} /><Detail label="Available capital" value={money(current.execution?.available_capital)} /><Detail label="Sizing / basis / next risk" value={`${titleCase(current.sizing_mode)} / ${money(current.execution?.risk_basis)} / ${money(current.execution?.next_trade_risk_amount)}`} /><Detail label="Risk cap / equity floor" value={`${money(current.maximum_risk_amount)} / ${money(current.minimum_equity)}`} /></div>
         {current.current_position ? <details style={{ marginTop: 8 }}><summary style={{ cursor: "pointer" }}>Open position · {current.current_position.side} {current.current_position.symbol}</summary><div className="form-grid-2" style={{ marginTop: 10 }}><Detail label="Entry / current" value={`${number(current.current_position.entry, 8)} / ${number(current.current_position.mark, 8)}`} /><Detail label="Stop / target" value={`${number(current.current_position.stop, 8)} / ${number(current.current_position.target, 8)}`} /><Detail label="Quantity / risk" value={`${number(current.current_position.size, 8)} / ${money(current.current_position.risk_amount)}`} /><Detail label="Current R / P&L" value={`${number(current.current_position.current_r, 3)}R / ${signedMoney(current.current_position.unrealized_pnl)}`} /><Detail label="Duration" value={duration(current.current_position.duration_seconds)} /></div></details> : <p className="dim" style={{ marginTop: 12 }}>No open position for this instance.</p>}
         {editingId !== current.id ? <button className="btn btn-soft" style={{ marginTop: 10 }} onClick={() => beginEdit(current)}><Icon name="settings" size={14} /> Edit complete configuration</button> : <details open style={{ marginTop: 12 }}>
@@ -291,6 +389,6 @@ export default function TradingInstancesPage({ instanceId }: { instanceId?: stri
       </Card>
     </div>}
 
-    {(["paused", "stopped", "error"] as const).map((state) => <details key={state} style={{ marginTop: 12 }}><summary className="card" style={{ cursor: "pointer", padding: 12 }}>{titleCase(state)} · {inactive(state).length}</summary>{inactive(state).map((row) => <Card key={row.id} title={`${row.symbol} · ${row.strategy_label}`} subtitle={`${row.strategy_version} · ${row.timeframe}`}><div className="grid-2-eq"><div>{row.last_error ? <div className="instance-risk-notice amber">{row.last_error}</div> : <p className="dim">No error reason recorded.</p>}</div><InstanceActions instance={row} action={action} /></div></Card>)}</details>)}
+    {(["paused", "stopped", "error"] as const).map((state) => <details key={state} style={{ marginTop: 12 }}><summary className="card" style={{ cursor: "pointer", padding: 12 }}>{titleCase(state)} · {inactive(state).length}</summary>{inactive(state).map((row) => <Card key={row.id} title={`${row.symbol} · ${row.strategy_label}`} subtitle={`${row.strategy_version} · ${row.timeframe}`}><div className="grid-2-eq"><div>{errorFor(row) ? <div className="instance-risk-notice amber"><b>{errorFor(row)}</b><br /><span className="dim">Recommended: {recoveryGuidance(errorFor(row))}</span></div> : <p className="dim">No error reason recorded.</p>}</div><InstanceActions instance={row} action={action} remove={remove} actionBusy={actionBusy} locked={controlsUnavailable} deleting={deletingId === row.id} /></div></Card>)}</details>)}
   </>;
 }

@@ -121,7 +121,7 @@ export interface LiveState<T> {
   data: T | null;
   error: string | null;
   loading: boolean;
-  refetch: () => void;
+  refetch: () => Promise<boolean>;
 }
 
 // ---- shared polling layer ----
@@ -142,7 +142,7 @@ interface _Poller {
   data: unknown;
   error: string | null;
   hasData: boolean;
-  inFlight: boolean;
+  inFlight: Promise<boolean> | null;
   fails: number;
   timer: ReturnType<typeof setTimeout> | null;
 }
@@ -163,23 +163,28 @@ function _schedule(p: _Poller, delay?: number): void {
   p.timer = setTimeout(() => { void _tick(p); }, d);
 }
 
-async function _tick(p: _Poller): Promise<void> {
-  if (p.subs.size === 0) return;
-  if (typeof document !== "undefined" && document.hidden) { _schedule(p); return; }
-  if (p.inFlight) { _schedule(p); return; }        // don't stack requests
-  p.inFlight = true;
-  try {
-    const d = await apiGet<unknown>(p.path);
-    p.data = d; p.hasData = true; p.error = null; p.fails = 0;
-    p.subs.forEach((s) => { s.onData(d); s.onError(null); s.onLoading(false); });
-  } catch (e) {
-    p.error = e instanceof Error ? e.message : "request failed";
-    p.fails += 1;
-    p.subs.forEach((s) => { s.onError(p.error); s.onLoading(false); });
-  } finally {
-    p.inFlight = false;
-    _schedule(p);
-  }
+async function _tick(p: _Poller): Promise<boolean> {
+  if (p.subs.size === 0) return false;
+  if (typeof document !== "undefined" && document.hidden) { _schedule(p); return false; }
+  if (p.inFlight) return p.inFlight;               // share the active request
+  const request = (async () => {
+    try {
+      const d = await apiGet<unknown>(p.path);
+      p.data = d; p.hasData = true; p.error = null; p.fails = 0;
+      p.subs.forEach((s) => { s.onData(d); s.onError(null); s.onLoading(false); });
+      return true;
+    } catch (e) {
+      p.error = e instanceof Error ? e.message : "request failed";
+      p.fails += 1;
+      p.subs.forEach((s) => { s.onError(p.error); s.onLoading(false); });
+      return false;
+    } finally {
+      p.inFlight = null;
+      _schedule(p);
+    }
+  })();
+  p.inFlight = request;
+  return request;
 }
 
 // resume promptly (and reset backoff) when the tab becomes visible again
@@ -192,7 +197,7 @@ if (typeof document !== "undefined") {
 function _subscribe(path: string, sub: _Sub): () => void {
   let p = _pollers.get(path);
   if (!p) {
-    p = { path, subs: new Set(), data: null, error: null, hasData: false, inFlight: false, fails: 0, timer: null };
+    p = { path, subs: new Set(), data: null, error: null, hasData: false, inFlight: null, fails: 0, timer: null };
     _pollers.set(path, p);
   }
   const poller = p;
@@ -229,9 +234,14 @@ export function useLive<T>(path: string, intervalMs = 2500): LiveState<T> {
     return _subscribe(path, sub);
   }, [path, intervalMs]);
 
-  const refetch = useCallback(() => {
+  const refetch = useCallback(async () => {
     const p = _pollers.get(path);
-    if (p) _schedule(p, 0);
+    if (p) {
+      if (p.timer) clearTimeout(p.timer);
+      p.timer = null;
+      return _tick(p);
+    }
+    return false;
   }, [path]);
 
   return { data, error, loading, refetch };

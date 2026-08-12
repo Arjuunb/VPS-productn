@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import inspect
+import math
 import threading
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -614,16 +615,25 @@ class TradingInstanceManager:
             self.store.assert_runtime_schema()
             if mode not in ("trading", "research"):
                 raise ValueError("mode must be trading or research")
+            capital_allocation = float(capital_allocation)
+            risk_per_trade_pct = float(risk_per_trade_pct)
+            if not math.isfinite(capital_allocation) or capital_allocation <= 0:
+                raise ValueError("capital_allocation must be a finite value greater than zero")
+            if not math.isfinite(risk_per_trade_pct) or not 0 < risk_per_trade_pct <= 0.05:
+                raise ValueError("risk_per_trade_pct must be a finite value in (0, 0.05]")
             sizing_mode = normalize_sizing_mode(sizing_mode)
             quantity = float(fixed_quantity if fixed_quantity is not None else fixed_position_size)
             if sizing_mode not in SIZING_MODES:
                 raise ValueError(f"sizing_mode must be one of {', '.join(SIZING_MODES)}")
-            if sizing_mode == FIXED_QUANTITY and quantity <= 0:
-                raise ValueError("fixed_quantity must be greater than zero for fixed quantity sizing")
-            if maximum_risk_amount is not None and float(maximum_risk_amount) <= 0:
-                raise ValueError("maximum_risk_amount must be greater than zero")
-            if minimum_equity is not None and not 0 < float(minimum_equity) <= float(capital_allocation):
-                raise ValueError("minimum_equity must be greater than zero and no more than the allocation")
+            if not math.isfinite(quantity) or (sizing_mode == FIXED_QUANTITY and quantity <= 0):
+                raise ValueError("fixed_quantity must be finite and greater than zero for fixed quantity sizing")
+            if (maximum_risk_amount is not None
+                    and (not math.isfinite(float(maximum_risk_amount)) or float(maximum_risk_amount) <= 0)):
+                raise ValueError("maximum_risk_amount must be a finite value greater than zero")
+            if (minimum_equity is not None
+                    and (not math.isfinite(float(minimum_equity))
+                         or not 0 < float(minimum_equity) <= capital_allocation)):
+                raise ValueError("minimum_equity must be finite, greater than zero and no more than the allocation")
             if entry_mode not in ("limit", "market"):
                 raise ValueError("entry_mode must be 'limit' or 'market'")
             from services.fill_model import normalize_fill_model
@@ -692,7 +702,38 @@ class TradingInstanceManager:
                 raise ValueError("Stop the Trading Instance before deleting it")
             if InstanceLedger(self.ledger, instance_id).get_positions("open"):
                 raise ValueError("Close this instance's open positions before deleting it")
+            # Delete durable state first. If the database rejects the delete,
+            # keep the in-memory worker intact so a transient persistence error
+            # cannot silently stop an instance that still exists after restart.
             self.store.delete(instance_id)
+            # A terminal-error worker has stopped its engine thread, but its
+            # independently owned WebSocket feed may still be alive. Cleanup is
+            # best-effort after durable deletion; stale network resources must
+            # never make the already-completed delete appear to have failed.
+            if runtime is not None:
+                # The durable row no longer exists. Detach callbacks before
+                # shutdown so a racing final candle/lifecycle event cannot
+                # recreate auxiliary state or issue writes against a deleted
+                # Supabase parent row.
+                if hasattr(runtime[1], "equity_listener"):
+                    runtime[1].equity_listener = None
+                runtime[0]._lifecycle_callback = None
+                runtime[0]._candle_checkpoint = None
+                runtime[0]._pending_orders_checkpoint = None
+                try:
+                    runtime[0].stop("Trading Instance deleted")
+                except Exception as exc:
+                    self.ledger.log(level="warning", stage="instance",
+                                    message=f"Deleted instance worker cleanup failed: {type(exc).__name__}",
+                                    symbol=inst.symbol, instance_id=inst.id)
+                feed = getattr(runtime[0], "ws_feed", None)
+                if feed is not None:
+                    try:
+                        feed.stop()
+                    except Exception as exc:
+                        self.ledger.log(level="warning", stage="instance",
+                                        message=f"Deleted instance feed cleanup failed: {type(exc).__name__}",
+                                        symbol=inst.symbol, instance_id=inst.id)
             self._runtime.pop(instance_id, None)
             self._metric_fingerprints.pop(instance_id, None)
             del self._instances[instance_id]
@@ -945,27 +986,33 @@ class TradingInstanceManager:
             prior_state = inst.state
             had_runtime = instance_id in self._runtime
             candidate_capital = float(capital_allocation if capital_allocation is not None else inst.capital_allocation)
-            if candidate_capital <= 0:
-                raise ValueError("capital_allocation must be greater than zero")
+            if not math.isfinite(candidate_capital) or candidate_capital <= 0:
+                raise ValueError("capital_allocation must be a finite value greater than zero")
             if (capital_allocation is not None and trade_history
                     and abs(candidate_capital - inst.capital_allocation) > 0.0000001):
                 raise ValueError("Capital allocation is immutable after the first trade; create a new instance")
-            if risk_per_trade_pct is not None and not 0 < float(risk_per_trade_pct) <= 0.05:
-                raise ValueError("risk_per_trade_pct must be in (0, 0.05]")
+            if (risk_per_trade_pct is not None
+                    and (not math.isfinite(float(risk_per_trade_pct))
+                         or not 0 < float(risk_per_trade_pct) <= 0.05)):
+                raise ValueError("risk_per_trade_pct must be a finite value in (0, 0.05]")
             candidate_mode = normalize_sizing_mode(sizing_mode if sizing_mode is not None else inst.sizing_mode)
             if candidate_mode not in SIZING_MODES:
                 raise ValueError(f"sizing_mode must be one of {', '.join(SIZING_MODES)}")
             supplied_quantity = fixed_quantity if fixed_quantity is not None else fixed_position_size
             candidate_fixed = float(supplied_quantity if supplied_quantity is not None else inst.fixed_quantity)
-            if candidate_fixed < 0 or (candidate_mode == FIXED_QUANTITY and candidate_fixed <= 0):
-                raise ValueError("fixed_quantity must be greater than zero for fixed quantity sizing")
+            if (not math.isfinite(candidate_fixed) or candidate_fixed < 0
+                    or (candidate_mode == FIXED_QUANTITY and candidate_fixed <= 0)):
+                raise ValueError("fixed_quantity must be finite and greater than zero for fixed quantity sizing")
             candidate_reinvest = bool(profit_reinvestment if profit_reinvestment is not None else inst.profit_reinvestment)
             candidate_max_risk = maximum_risk_amount if maximum_risk_amount is not None else inst.maximum_risk_amount
             candidate_floor = minimum_equity if minimum_equity is not None else inst.minimum_equity
-            if candidate_max_risk is not None and float(candidate_max_risk) <= 0:
-                raise ValueError("maximum_risk_amount must be greater than zero")
-            if candidate_floor is not None and not 0 < float(candidate_floor) <= candidate_capital:
-                raise ValueError("minimum_equity must be greater than zero and no more than the allocation")
+            if (candidate_max_risk is not None
+                    and (not math.isfinite(float(candidate_max_risk)) or float(candidate_max_risk) <= 0)):
+                raise ValueError("maximum_risk_amount must be a finite value greater than zero")
+            if (candidate_floor is not None
+                    and (not math.isfinite(float(candidate_floor))
+                         or not 0 < float(candidate_floor) <= candidate_capital)):
+                raise ValueError("minimum_equity must be finite, greater than zero and no more than the allocation")
             candidate_entry = entry_mode if entry_mode is not None else inst.entry_mode
             if candidate_entry not in ("limit", "market"):
                 raise ValueError("entry_mode must be 'limit' or 'market'")

@@ -164,6 +164,27 @@ def test_instances_api_returns_platform_status_and_validates_slot_change(monkeyp
     assert updated["max_active_slots"] == 3
 
 
+def test_delete_api_returns_actionable_service_unavailable_for_persistence_failure(monkeypatch):
+    pytest.importorskip("fastapi")
+    from fastapi import HTTPException
+    from routers import instances as instance_api
+
+    class FailingManager:
+        store = type("Store", (), {"available": True})()
+
+        def delete(self, _instance_id):
+            raise RuntimeError("Supabase delete unavailable")
+
+    monkeypatch.setattr(instance_api._wa, "instance_manager", FailingManager())
+    monkeypatch.setattr(instance_api._wa, "_check_secret", lambda _secret: None)
+
+    with pytest.raises(HTTPException) as exc:
+        instance_api.delete_instance("instance-one")
+
+    assert exc.value.status_code == 503
+    assert exc.value.detail == "Supabase delete unavailable"
+
+
 def test_instance_status_exposes_only_its_scoped_last_decision_and_real_aggregate_fields():
     ledger = SqliteLedger(":memory:")
     decisions = DecisionStore(":memory:")
@@ -218,6 +239,40 @@ def test_active_duplicate_and_overallocation_are_rejected():
         manager.create(symbol="ETHUSDT", strategy_key="ema", strategy_label="EMA Crossover",
                        strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
                        capital_allocation=400)
+
+
+@pytest.mark.parametrize("field,value,message", [
+    ("capital_allocation", float("nan"), "capital_allocation must be a finite value"),
+    ("capital_allocation", float("inf"), "capital_allocation must be a finite value"),
+    ("risk_per_trade_pct", float("nan"), "risk_per_trade_pct must be a finite value"),
+    ("risk_per_trade_pct", float("inf"), "risk_per_trade_pct must be a finite value"),
+])
+def test_instance_create_rejects_non_finite_money_and_risk(field, value, message):
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
+    values = {"capital_allocation": 500, "risk_per_trade_pct": 0.005, field: value}
+
+    with pytest.raises(ValueError, match=message):
+        manager.create(symbol="BTCUSDT", strategy_key="supertrend", strategy_label="Supertrend",
+                       strategy_version="v1", timeframe="5m", **values)
+
+    assert manager.list() == []
+
+
+def test_instance_create_rejects_non_finite_optional_risk_controls():
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
+
+    with pytest.raises(ValueError, match="maximum_risk_amount must be a finite value"):
+        manager.create(symbol="BTCUSDT", strategy_key="supertrend", strategy_label="Supertrend",
+                       strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+                       capital_allocation=500, maximum_risk_amount=float("nan"))
+    with pytest.raises(ValueError, match="minimum_equity must be finite"):
+        manager.create(symbol="BTCUSDT", strategy_key="supertrend", strategy_label="Supertrend",
+                       strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+                       capital_allocation=500, minimum_equity=float("inf"))
+
+    assert manager.list() == []
 
 
 def test_worker_start_uses_persisted_instance_execution_not_legacy_runtime(monkeypatch):
@@ -569,6 +624,101 @@ def test_deleting_one_stopped_instance_does_not_affect_another():
     with ledger._lock:
         assert ledger._c.execute("SELECT COUNT(*) FROM instance_market_state WHERE instance_id=?", (first.id,)).fetchone()[0] == 0
         assert ledger._c.execute("SELECT COUNT(*) FROM instance_market_state WHERE instance_id=?", (second.id,)).fetchone()[0] == 1
+
+
+def test_deleting_errored_instance_closes_its_inactive_websocket_resource():
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
+    instance = manager.create(symbol="BTCUSDT", strategy_key="supertrend", strategy_label="Supertrend",
+                              strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+                              capital_allocation=500)
+
+    class InactiveEngine:
+        running = False
+
+        def __init__(self):
+            self.stop_reason = None
+            self.ws_feed = self
+            self.feed_stopped = False
+
+        def stop(self, reason=None):
+            if reason is None:
+                self.feed_stopped = True
+            else:
+                self.stop_reason = reason
+
+    engine = InactiveEngine()
+    paper = type("Paper", (), {"equity_listener": lambda _value: None})()
+    engine._lifecycle_callback = lambda _event: None
+    engine._candle_checkpoint = lambda _timestamp: None
+    engine._pending_orders_checkpoint = lambda _pending: None
+    manager._runtime[instance.id] = (engine, paper, object(), object())
+    instance.state = "error"
+    manager.store.save(instance)
+
+    assert manager.delete(instance.id) == instance.id
+    assert engine.stop_reason == "Trading Instance deleted"
+    assert engine.feed_stopped is True
+    assert engine._lifecycle_callback is None
+    assert engine._candle_checkpoint is None
+    assert engine._pending_orders_checkpoint is None
+    assert paper.equity_listener is None
+    assert instance.id not in manager._runtime
+    assert manager.list() == []
+
+
+def test_delete_refuses_open_position_and_preserves_instance_and_sibling():
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
+    first = manager.create(symbol="BTCUSDT", strategy_key="supertrend", strategy_label="Supertrend",
+                           strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+                           capital_allocation=500)
+    sibling = manager.create(symbol="ETHUSDT", strategy_key="brain", strategy_label="Decision Brain",
+                             strategy_version="v2", timeframe="15m", risk_per_trade_pct=0.005,
+                             capital_allocation=500)
+    InstanceLedger(ledger, first.id).open_position(
+        symbol="BTCUSDT", side="long", size=0.1, entry=100, stop=95,
+    )
+    manager.store.save_market_state(first.id, last_processed_candle_timestamp="2026-08-09T00:05:00+00:00")
+    manager.store.save_market_state(sibling.id, last_processed_candle_timestamp="2026-08-09T00:15:00+00:00")
+
+    with pytest.raises(ValueError, match="Close this instance's open positions"):
+        manager.delete(first.id)
+
+    assert {row["id"] for row in manager.list()} == {first.id, sibling.id}
+    assert len(InstanceLedger(ledger, first.id).get_positions("open")) == 1
+    assert manager.store.market_state(first.id)["last_processed_candle_timestamp"] == "2026-08-09T00:05:00+00:00"
+    assert manager.store.market_state(sibling.id)["last_processed_candle_timestamp"] == "2026-08-09T00:15:00+00:00"
+
+
+def test_persistence_failure_does_not_stop_or_remove_in_memory_instance(monkeypatch):
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory, live=False, live_poll_s=60)
+    instance = manager.create(symbol="BTCUSDT", strategy_key="supertrend", strategy_label="Supertrend",
+                              strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+                              capital_allocation=500)
+
+    class InactiveEngine:
+        running = False
+        stop_calls = 0
+        ws_feed = None
+
+        def stop(self, _reason=None):
+            self.stop_calls += 1
+
+    engine = InactiveEngine()
+    manager._runtime[instance.id] = (engine, object(), object(), object())
+
+    def reject_delete(_instance_id):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(manager.store, "delete", reject_delete)
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        manager.delete(instance.id)
+
+    assert engine.stop_calls == 0
+    assert instance.id in manager._runtime
+    assert list(manager._instances) == [instance.id]
 
 
 def test_two_real_forward_workers_are_alive_at_the_same_time():

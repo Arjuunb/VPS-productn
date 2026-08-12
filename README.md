@@ -142,8 +142,8 @@ overridden on construction.
 ## Quick start: backtest on synthetic data (no API keys)
 
 ```bash
-git clone https://github.com/Arjuunb/Tradexa-Trading-Bot.git
-cd Tradexa-Trading-Bot
+git clone https://github.com/Arjuunb/VPS-productn.git Tradexa-Production
+cd Tradexa-Production
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt   # ccxt/alpaca/oanda are optional
 python -m examples.run_backtest

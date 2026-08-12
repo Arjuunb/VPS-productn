@@ -40,12 +40,13 @@ COPY --from=landing /landing/dist /app/automation-hub/landing
 
 RUN mkdir -p /var/lib/tradexa && chown -R tradexa:tradexa /var/lib/tradexa /app
 
-# The autonomous engine starts streaming real paper trades on boot.
-ENV HUB_AUTO_ENGINE=1
+# Trading Instances are the authoritative paper runtime. Keep the retired
+# deployment-wide engine fail-safe OFF unless an operator explicitly opts in.
+ENV HUB_AUTO_ENGINE=0
 ENV HUB_DATA_DIR=/var/lib/tradexa
 WORKDIR /app/automation-hub
 EXPOSE 8000
 USER tradexa
 
-# Hosts (Render/Railway/Fly) inject $PORT; default to 8000 locally.
+# Honour an operator-provided port while remaining self-contained on a VPS.
 CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips=*"]
