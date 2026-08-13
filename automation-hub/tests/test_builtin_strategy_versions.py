@@ -10,6 +10,7 @@ from strategies.brain import TradeBrain
 from strategies.brain_strategy import DecisionBrain
 from strategies.builtin_versions import BUILTIN_STRATEGY_VERSIONS
 from strategies.custom import simulate_strategy
+from strategies.donchian_strategy import DonchianStrategy
 from strategies.supertrend_strategy import SupertrendStrategy
 
 
@@ -48,6 +49,13 @@ def test_supertrend_v1_0_0_causal_signal_baseline():
     assert (count, digest) == (version.fixture_signal_count, version.fixture_signal_sha256)
 
 
+def test_donchian_v1_0_0_causal_signal_baseline():
+    version = BUILTIN_STRATEGY_VERSIONS["donchian"]
+    count, digest = _fingerprint(DonchianStrategy("BTCUSDT"))
+    assert version.version == "1.0.0"
+    assert (count, digest) == (version.fixture_signal_count, version.fixture_signal_sha256)
+
+
 def test_supertrend_v1_0_0_gate_risk_and_execution_baseline():
     """A/B/C/D fixture comparison catches silent pipeline regressions.
 
@@ -78,8 +86,8 @@ def test_supertrend_v1_0_0_gate_risk_and_execution_baseline():
             result.get("missed_entries", 0),
         )
     assert observed == {
-        "A_strategy_only": (20, 6, 14, 30.0, 1.01, 0.22, 6.1, 0, 0),
-        "B_strategy_plus_decision_gate": (17, 5, 12, 29.4, 0.99, -0.15, 6.4, 4, 0),
-        "C_gate_plus_risk": (17, 5, 12, 29.4, 0.99, -0.15, 6.4, 4, 0),
-        "D_current_execution_proxy": (17, 5, 12, 29.4, 1.0, -0.01, 6.3, 4, 0),
+        "A_strategy_only": (20, 6, 14, 30.0, 1.09, 1.28, 5.8, 0, 0),
+        "B_strategy_plus_decision_gate": (15, 5, 10, 33.3, 1.25, 2.46, 4.4, 6, 0),
+        "C_gate_plus_risk": (15, 5, 10, 33.3, 1.25, 2.46, 4.4, 6, 0),
+        "D_current_execution_proxy": (15, 5, 10, 33.3, 1.26, 2.58, 4.3, 6, 0),
     }

@@ -64,6 +64,18 @@ BUILTIN_STRATEGY_VERSIONS: Mapping[str, BuiltinStrategyVersion] = MappingProxyTy
         fixture_signal_count=22,
         fixture_signal_sha256="f811f8fd7c7d67ce8bc7cbb3719760f12801566960c284dd4deaff7863c68b98",
     ),
+    "donchian": BuiltinStrategyVersion(
+        key="donchian",
+        version="1.0.0",
+        label="Donchian Breakout",
+        source_ref="v1.0.0-production (5d0782c)",
+        source_blob="6c95cb696986e4edaa4194db1dd6f864d2e58a88",
+        defaults=(("channel", 30), ("atr_period", 14),
+                  ("atr_mult", 1.5), ("rr_target", 2.5)),
+        fixture="BTCUSDT bundled 1h sample, 2,000 bars, causal signal stream",
+        fixture_signal_count=23,
+        fixture_signal_sha256="9370aedf34c90cc96a5f3de3cd5fbd6ac57927863178cace87e83e70ee57faad",
+    ),
     "adaptive_trend_pullback": BuiltinStrategyVersion(
         key="adaptive_trend_pullback",
         version="1.0.0",

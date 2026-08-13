@@ -40,7 +40,8 @@ class _RiskGate:
     off the losing trade's exit time.
     """
 
-    def __init__(self, max_per_day=0, cooldown_min=0, max_consec=0):
+    def __init__(self, max_per_day=0, cooldown_min=0, max_consec=0,
+                 max_daily_loss_r=0.0, max_drawdown_r=0.0):
         self.max_per_day = int(max_per_day or 0)
         self.cooldown_min = int(cooldown_min or 0)
         self.max_consec = int(max_consec or 0)
@@ -48,17 +49,33 @@ class _RiskGate:
         self.day_count = 0
         self.recent_losses = 0
         self.cooldown_until = None
+        self.max_daily_loss_r = float(max_daily_loss_r or 0.0)
+        self.max_drawdown_r = float(max_drawdown_r or 0.0)
+        self.daily_net_r = 0.0
+        self.equity_r = 0.0
+        self.peak_r = 0.0
+        self.halted = False
 
     def active(self) -> bool:
-        return bool(self.max_per_day or self.max_consec or self.cooldown_min)
+        return bool(self.max_per_day or self.max_consec or self.cooldown_min
+                    or self.max_daily_loss_r or self.max_drawdown_r)
 
     def _roll(self, ts) -> None:
         d = ts.date()
         if d != self.day:
-            self.day, self.day_count, self.recent_losses = d, 0, 0
+            # Only the daily entry counter resets at midnight. Production's
+            # consecutive-loss guard is based on the latest closed trades and
+            # therefore carries across UTC day boundaries until a win/manual
+            # resume. Resetting the streak here let research take trades that
+            # the deployed risk pipeline would have halted.
+            self.day, self.day_count, self.daily_net_r = d, 0, 0.0
 
     def blocked_reason(self, ts):
         self._roll(ts)
+        if self.halted:
+            return "max drawdown or consecutive-loss auto-halt"
+        if self.max_daily_loss_r and self.daily_net_r <= -self.max_daily_loss_r:
+            return "daily loss limit reached"
         if self.max_per_day and self.day_count >= self.max_per_day:
             return "max trades/day reached"
         if self.max_consec and self.recent_losses >= self.max_consec:
@@ -72,12 +89,21 @@ class _RiskGate:
         self.day_count += 1
 
     def on_exit(self, exit_ts, r: float) -> None:
+        self._roll(exit_ts)
+        self.daily_net_r += r
+        self.equity_r += r
+        self.peak_r = max(self.peak_r, self.equity_r)
         if r > 0:
             self.recent_losses, self.cooldown_until = 0, None
         else:
             self.recent_losses += 1
             if self.cooldown_min:
                 self.cooldown_until = exit_ts + timedelta(minutes=self.cooldown_min)
+        if self.max_consec and self.recent_losses >= self.max_consec:
+            self.halted = True
+        if (self.max_drawdown_r
+                and self.peak_r - self.equity_r >= self.max_drawdown_r):
+            self.halted = True
 
 
 # ----------------------------------------------------------------- indicators
@@ -674,8 +700,16 @@ def simulate_strategy(strat, bars, *, fee: float = 0.0004, slippage: float = 0.0
                       brain=None, min_score: int = 0, mtf_lookup=None, mtf_tfs=None,
                       max_trades_per_day: int = 0, cooldown_after_loss: int = 0,
                       max_consecutive_losses: int = 0, manage: bool = True,
+                      max_daily_loss_pct: float = 0.0,
+                      max_drawdown_pct: float = 0.0,
+                      apply_confidence_sizing: bool = False,
+                      apply_streak_sizing: bool = False,
+                      enforce_brain: bool = True,
+                      trade_start_at=None,
                       manager=None,
-                      entry_mode: str = "market", limit_ttl_bars: int = 3) -> dict:
+                      entry_mode: str = "market", limit_ttl_bars: int = 3,
+                      entry_delay_bars: int = 0,
+                      retain_all: bool = False) -> dict:
     """Run a built-in HubStrategy object over historical bars and return results
     in the SAME shape as ``simulate()`` (metrics, equity curve, trades).
 
@@ -701,25 +735,72 @@ def simulate_strategy(strat, bars, *, fee: float = 0.0004, slippage: float = 0.0
     missed = 0                          # limit entries that expired unfilled
     trades: list[dict] = []
     blocked: list[dict] = []
-    gate = _RiskGate(max_trades_per_day, cooldown_after_loss, max_consecutive_losses)
+    gate = _RiskGate(
+        max_trades_per_day, cooldown_after_loss, max_consecutive_losses,
+        (max_daily_loss_pct / risk_pct if risk_pct > 0 else 0.0),
+        (max_drawdown_pct / risk_pct if risk_pct > 0 else 0.0),
+    )
 
-    def _open(side, entry, stop, target, reason, bar, i, entry_cost):
+    def _open(side, entry, stop, target, reason, bar, i, entry_cost, meta=None):
         return {"side": side, "entry": entry, "risk": abs(entry - stop),
                 "reason": reason, "time": bar.timestamp, "idx": i, "partial": None,
-                "entry_cost": entry_cost,
+                "entry_cost": entry_cost, "meta": dict(meta or {}),
                 "mt": ManagedTrade(side=side, entry=entry, stop=stop,
                                    target=target, risk=abs(entry - stop))}
 
+    def _record_close(position, exit_px, exit_reason, bar, i):
+        mt = position["mt"]
+        cost_r = _cost_r(position["entry"], position["risk"],
+                         position.get("entry_cost", cost), cost)
+        if mgr is not None:
+            r = mgr.r_multiple(mt, exit_px, position.get("partial"), cost_r=cost_r)
+        else:
+            r = _net_r(position["entry"], exit_px, position["risk"],
+                       position["side"], cost_r)
+        sign = 1.0 if position["side"] == "long" else -1.0
+        mfe_r = (mt.mfe - position["entry"]) * sign / position["risk"]
+        mae_r = (position["entry"] - mt.mae) * sign / position["risk"]
+        risk_weight = 1.0
+        confidence = position.get("meta", {}).get("signal_confidence")
+        if apply_confidence_sizing:
+            confidence = float(confidence if confidence is not None else 1.0)
+            risk_weight *= 0.5 + 0.5 * max(0.0, min(1.0, confidence))
+        if apply_streak_sizing:
+            risk_weight *= 0.25 if gate.recent_losses >= 4 else 0.5 if gate.recent_losses >= 2 else 1.0
+        trade = {
+            "side": position["side"], "entry": round(position["entry"], 6),
+            "exit": round(exit_px, 6), "stop": round(mt.stop, 6),
+            "target": round(mt.target, 6), "gross_r": round(r + cost_r, 4),
+            "cost_r": round(cost_r, 4), "r": round(r, 3),
+            "result": "win" if r > 0 else "loss", "reason": position["reason"],
+            "exit_reason": exit_reason, "scaled": mt.scaled,
+            "entry_time": position["time"].isoformat(),
+            "exit_time": bar.timestamp.isoformat(), "bars_held": i - position["idx"],
+            "mfe_r": round(mfe_r, 3), "mae_r": round(mae_r, 3),
+            "risk_weight": round(risk_weight, 4),
+            "weighted_r": round(r * risk_weight, 4),
+            **position.get("meta", {}),
+        }
+        trades.append(trade)
+        gate.on_exit(bar.timestamp, r)
+
     for i, bar in enumerate(bars):
+        filled_this_bar = False
         if pending is not None and pos is None:
+            if pending.get("delay", 0) > 0:
+                pending["delay"] -= 1
+                fill = None
+                may_fill = False
+            else:
+                may_fill = True
             # resting maker order: fills only if price trades through it
             fill = None
-            if pending["side"] == "long":
+            if may_fill and pending["side"] == "long":
                 if bar.open <= pending["price"]:
                     fill = bar.open                    # gapped through: better fill
                 elif bar.low <= pending["price"]:
                     fill = pending["price"]
-            else:
+            elif may_fill:
                 if bar.open >= pending["price"]:
                     fill = bar.open
                 elif bar.high >= pending["price"]:
@@ -728,14 +809,30 @@ def simulate_strategy(strat, bars, *, fee: float = 0.0004, slippage: float = 0.0
                 sl, tp = pending["stop"], pending["target"]
                 if abs(fill - sl) > 0:
                     pos = _open(pending["side"], fill, sl, tp, pending["reason"],
-                                bar, i, entry_cost=fee)   # maker: fee only
+                                bar, i, entry_cost=fee, meta=pending.get("meta"))
                     gate.on_entry(bar.timestamp)
+                    filled_this_bar = True
                 pending = None
-            else:
+            elif may_fill:
                 pending["ttl"] -= 1
                 if pending["ttl"] <= 0:
                     pending = None
                     missed += 1
+        # Production's conservative OHLC ordering permits only an adverse stop
+        # on the candle where a resting limit fills. A favorable high/low may
+        # have happened before the fill and must never be credited. The old
+        # simulator skipped the whole candle, overstating results whenever a
+        # maker entry and its stop were both inside the same OHLC range.
+        if pos is not None and filled_this_bar:
+            mt = pos["mt"]
+            adverse = bar.low if mt.side == "long" else bar.high
+            stop_hit = adverse <= mt.stop if mt.side == "long" else adverse >= mt.stop
+            if stop_hit:
+                mt.mae = min(mt.mae, adverse) if mt.side == "long" else max(mt.mae, adverse)
+                gap = bar.open <= mt.stop if mt.side == "long" else bar.open >= mt.stop
+                exit_px = bar.open if gap else mt.stop
+                _record_close(pos, exit_px, "stop", bar, i)
+                pos = None
         if pos is not None and pos["idx"] != i:   # never exit on the entry bar
             exit_px = exit_reason = None
             mt = pos["mt"]
@@ -745,36 +842,38 @@ def simulate_strategy(strat, bars, *, fee: float = 0.0004, slippage: float = 0.0
                     pos["partial"] = act.partial_price
                 if act.exit_price is not None:
                     exit_px, exit_reason = act.exit_price, act.exit_reason
+                    if exit_reason == "stop":
+                        gap = bar.open <= mt.stop if mt.side == "long" else bar.open >= mt.stop
+                        if gap:
+                            exit_px = bar.open
             elif pos["side"] == "long":
                 if bar.low <= mt.stop:
-                    exit_px, exit_reason = mt.stop, "stop"
+                    exit_px = bar.open if bar.open <= mt.stop else mt.stop
+                    exit_reason = "stop"
                 elif bar.high >= mt.target:
                     exit_px, exit_reason = mt.target, "target"
             else:
                 if bar.high >= mt.stop:
-                    exit_px, exit_reason = mt.stop, "stop"
+                    exit_px = bar.open if bar.open >= mt.stop else mt.stop
+                    exit_reason = "stop"
                 elif bar.low <= mt.target:
                     exit_px, exit_reason = mt.target, "target"
             if exit_px is not None:
-                # per-side costs: maker entries pay fee only; exits cross the spread
-                cost_r = _cost_r(pos["entry"], pos["risk"], pos.get("entry_cost", cost), cost)
-                if mgr is not None:
-                    r = mgr.r_multiple(mt, exit_px, pos.get("partial"), cost_r=cost_r)
-                else:
-                    r = _net_r(pos["entry"], exit_px, pos["risk"], pos["side"], cost_r)
-                trades.append({
-                    "side": pos["side"], "entry": round(pos["entry"], 6), "exit": round(exit_px, 6),
-                    "stop": round(mt.stop, 6), "target": round(mt.target, 6),
-                    "r": round(r, 3), "result": "win" if r > 0 else "loss",
-                    "reason": pos["reason"], "exit_reason": exit_reason, "scaled": mt.scaled,
-                    "entry_time": pos["time"].isoformat(), "exit_time": bar.timestamp.isoformat(),
-                    "bars_held": i - pos["idx"],
-                })
-                gate.on_exit(bar.timestamp, r)
+                _record_close(pos, exit_px, exit_reason, bar, i)
                 pos = None
 
-        sig = strat.on_bar(bar)  # always feed (warm indicators); act only when flat
-        if pos is None and sig is not None:
+        sig = strat.on_bar(bar)  # always feed: runtime strategies see every closed bar
+        if pos is not None and sig is not None:
+            desired = "long" if sig.type == SignalType.LONG else "short"
+            if desired != pos["side"]:
+                # Production treats an opposite strategy signal as a CLOSE,
+                # not an instantaneous reversal. Preserve that lifecycle and
+                # the taker exit cost; a future signal may open the new side.
+                _record_close(pos, sig.entry, "opposite-signal", bar, i)
+                pos = None
+                sig = None
+        if (pos is None and sig is not None
+                and (trade_start_at is None or bar.timestamp >= trade_start_at)):
             entry, stop = sig.entry, sig.stop_loss
             risk = abs(entry - stop)
             if risk > 0:
@@ -785,9 +884,16 @@ def simulate_strategy(strat, bars, *, fee: float = 0.0004, slippage: float = 0.0
                                     "regime": "—", "htf_bias": rzn, "reason": rzn})
                     continue
                 if brain is not None:
-                    v = brain.evaluate(bars, i, side=side, entry=entry, stop=stop,
-                                       target=sig.take_profit)
-                    if not v.allowed or v.score < min_score:
+                    # The live engine scores the strategy's bounded causal
+                    # window (normally 600 bars), not the entire process-age
+                    # history. Using the full research array changed HTF bucket
+                    # alignment and made the two decision gates diverge.
+                    causal = list(getattr(strat, "bars", []) or bars[:i + 1])
+                    v = brain.evaluate(causal, len(causal) - 1,
+                                       side=side, entry=entry, stop=stop,
+                                       target=sig.take_profit,
+                                       recent_losses=gate.recent_losses)
+                    if enforce_brain and (not v.allowed or v.score < min_score):
                         blocked.append({"time": bar.timestamp.isoformat(), "side": side,
                                         "score": v.score, "regime": v.regime, "htf_bias": v.htf_bias,
                                         "reason": (v.blocks[0] if v.blocks else f"score {v.score} < {min_score}")})
@@ -800,23 +906,32 @@ def simulate_strategy(strat, bars, *, fee: float = 0.0004, slippage: float = 0.0
                                         "regime": "—", "htf_bias": mtf["reason"], "reason": mtf["reason"]})
                         continue
                 reason = getattr(sig, "reason", "") or f"{side} entry"
+                meta = {
+                    "signal_confidence": getattr(sig, "confidence", None),
+                    "signal_regime": getattr(sig, "regime", None),
+                    "quality_score": (v.score if brain is not None else None),
+                    "quality_regime": (v.regime if brain is not None else None),
+                }
                 if entry_mode == "limit":
                     pending = {"side": side, "price": entry, "stop": stop,
                                "target": sig.take_profit, "reason": reason,
-                               "ttl": max(1, int(limit_ttl_bars))}
+                               "ttl": max(1, int(limit_ttl_bars)),
+                               "delay": max(0, int(entry_delay_bars)), "meta": meta}
                 else:
                     pos = _open(side, entry, stop, sig.take_profit, reason,
-                                bar, i, entry_cost=cost)   # taker: fee + slippage
+                                bar, i, entry_cost=cost, meta=meta)
                     gate.on_entry(bar.timestamp)
 
-    out = _results(trades, starting_balance, risk_pct, bars, blocked=blocked)
+    out = _results(trades, starting_balance, risk_pct, bars, blocked=blocked,
+                   retain_all=retain_all)
     if entry_mode == "limit":
         out["entry_mode"] = "limit"
         out["missed_entries"] = missed
     return out
 
 
-def _results(trades: list, start: float, risk_pct: float, bars, blocked: list | None = None) -> dict:
+def _results(trades: list, start: float, risk_pct: float, bars,
+             blocked: list | None = None, *, retain_all: bool = False) -> dict:
     rs = [t["r"] for t in trades]
     n = len(rs)
     wins = [r for r in rs if r > 0]
@@ -889,8 +1004,8 @@ def _results(trades: list, start: float, risk_pct: float, bars, blocked: list | 
         "long_net_r": round(sum(longs), 2), "short_net_r": round(sum(shorts), 2),
         "blocked_count": len(blocked or []),
         "equity_curve": curve,
-        "trades": trades[-200:],
-        "blocked": (blocked or [])[-200:],
+        "trades": trades if retain_all else trades[-200:],
+        "blocked": (blocked or []) if retain_all else (blocked or [])[-200:],
     }
 
 
@@ -967,4 +1082,3 @@ def describe(spec: dict) -> str:
     return (f"This strategy enters {side} when {conds}. "
             f"It exits using {stop_txt} and {tgt_txt}, "
             f"risking {float(spec.get('risk_per_trade_pct',0.01))*100:.1f}% of equity per trade.")
-
