@@ -9,9 +9,10 @@ const money = (value: number | null): string => value === null
 type Props = {
   model: NexusPetViewModel;
   onClose: () => void;
+  onOpenSettings: () => void;
 };
 
-export default function NexusPetPopover({ model, onClose }: Props) {
+export default function NexusPetPopover({ model, onClose, onOpenSettings }: Props) {
   const app = useApp();
   const openPage = (page: string) => { onClose(); app.go(page); };
   const viewInstance = () => {
@@ -24,7 +25,10 @@ export default function NexusPetPopover({ model, onClose }: Props) {
     <section className="nexus-pet-popover" role="dialog" aria-label="Nexus Engine status">
       <div className="nexus-pet-popover-head">
         <b>Nexus Engine</b>
-        <span className={`nexus-pet-status nexus-pet-status-${model.state}`}>{model.statusLabel}</span>
+        <div className="nexus-pet-popover-actions">
+          <span className={`nexus-pet-status nexus-pet-status-${model.state}`}>{model.statusLabel}</span>
+          <button type="button" className="nexus-pet-settings-trigger" onClick={onOpenSettings} aria-label="Open pet settings" title="Pet settings">⚙</button>
+        </div>
       </div>
 
       {model.instance ? (

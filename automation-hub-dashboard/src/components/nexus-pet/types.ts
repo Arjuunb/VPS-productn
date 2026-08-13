@@ -10,6 +10,24 @@ export type NexusPetState =
   | "error"
   | "offline";
 
+export type NexusPetId =
+  | "codex"
+  | "dewey"
+  | "fireball"
+  | "hoots"
+  | "rocky"
+  | "seedy"
+  | "stacky"
+  | "bsod"
+  | "null-signal";
+
+export type NexusPetSize = "small" | "medium" | "large";
+
+export type NexusPetAppearance = {
+  pet: NexusPetId;
+  size: NexusPetSize;
+};
+
 export type NexusMarketData = {
   market_data_status?: string | null;
   last_market_data_timestamp?: string | null;
