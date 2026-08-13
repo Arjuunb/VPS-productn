@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { uptime, useLive } from "../../lib/api";
 import { useApp } from "../../app-context";
+import NexusBotPet from "../nexus-pet/NexusBotPet";
 
 type Snapshot = {
   active_slots: number; max_active_slots: number; total_open_positions: number;
@@ -39,5 +40,5 @@ export default function TickerBar() {
     ["Bot active time", activeSeconds === undefined ? "—" : uptime(activeSeconds)],
     ["Active", selected ? `${selected.symbol} · ${selected.strategy_label} · ${selected.timeframe}` : instances],
   ] : [["System", "backend not reachable"]];
-  return <footer className="ticker"><div className="ticker-items">{items.map(([k, v]) => <span className="ticker-item" key={k}><b>{k}</b><span className="ticker-price">{v}</span></span>)}</div><div className="ticker-meta"><span className={`dot ${active.length ? "online" : "offline"}`} /></div></footer>;
+  return <footer className="ticker"><div className="ticker-items">{items.map(([k, v]) => <span className="ticker-item" key={k}><b>{k}</b><span className="ticker-price">{v}</span></span>)}</div><div className="ticker-meta"><NexusBotPet /></div></footer>;
 }
