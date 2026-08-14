@@ -1,0 +1,129 @@
+{
+  "created_at": "2026-08-15T00:00:00+00:00",
+  "dataset_declared_before_open": {
+    "end": "2024-07-01T00:00:00+00:00",
+    "start": "2024-01-01T00:00:00+00:00",
+    "venue_futures": "Binance USD\u24c8-M Futures",
+    "venue_spot": "Binance Spot"
+  },
+  "fingerprints": {
+    "REP-H1-ETH-FUNDING-LOW": {
+      "configuration_hash": "5a715dae7eac64d2d700e948098fda3ad3537ac93fea61dae629431ee404c974",
+      "created_at": "2026-08-15T00:00:00+00:00",
+      "definition_hash": "44b6b241912f4c29831439fb3cfa59b935dc48af8f3fe300209a499aeeb970d7",
+      "hypothesis_id": "REP-H1-ETH-FUNDING-LOW",
+      "semantic_version": "1.0.0",
+      "source_code_hash": "a0598ec1fbf4a0031aeb5f530c2c4763c6762e8b534ae9c08090c0579161f457"
+    },
+    "REP-H2-SOL-FUNDING-LOW": {
+      "configuration_hash": "e6f8ae8721891965a2ae61acbd3bb238b0b141cc8a9c8510f7e3da0a783041bd",
+      "created_at": "2026-08-15T00:00:00+00:00",
+      "definition_hash": "5e3a1441d3a4bec74e44091920d77202aa9ef9ae84478be4bbf4f5e4a8599c21",
+      "hypothesis_id": "REP-H2-SOL-FUNDING-LOW",
+      "semantic_version": "1.0.0",
+      "source_code_hash": "a0598ec1fbf4a0031aeb5f530c2c4763c6762e8b534ae9c08090c0579161f457"
+    },
+    "REP-H3-ETH-REL-VOLUME-HIGH": {
+      "configuration_hash": "244cdcfe7156c9496e7fb5aaae3383d80dfb01b72cbbe61d54762ffecabbdcb9",
+      "created_at": "2026-08-15T00:00:00+00:00",
+      "definition_hash": "87c8b96516097a271d3d50d71a2dd99eaeed97eeeacb3ee629ba9053708b981e",
+      "hypothesis_id": "REP-H3-ETH-REL-VOLUME-HIGH",
+      "semantic_version": "1.0.0",
+      "source_code_hash": "a0598ec1fbf4a0031aeb5f530c2c4763c6762e8b534ae9c08090c0579161f457"
+    },
+    "REP-H4-ETH-1D-PERSISTENCE": {
+      "configuration_hash": "a19ecac70d7b9aa8df9c30c1388610ea8683094d9faceadbc2483c3c04569cfd",
+      "created_at": "2026-08-15T00:00:00+00:00",
+      "definition_hash": "49bbc3e8c4ed7a5a24d2b8a577fd2b5b1cda6fa303f44544603d27951f756026",
+      "hypothesis_id": "REP-H4-ETH-1D-PERSISTENCE",
+      "semantic_version": "1.0.0",
+      "source_code_hash": "a0598ec1fbf4a0031aeb5f530c2c4763c6762e8b534ae9c08090c0579161f457"
+    }
+  },
+  "hypotheses": {
+    "REP-H1-ETH-FUNDING-LOW": {
+      "alignment": "latest funding event at or before 15m event T; no future event",
+      "condition": "current known funding <= per-symbol empirical 10th percentile",
+      "direction": "long-context association (not an entry)",
+      "execution_hurdle_bps": 16.0,
+      "horizon_bars": 24,
+      "independence": "event indices separated by >24 bars",
+      "market_type": "perpetual",
+      "minimum_events": 100,
+      "minimum_independent_events": 30,
+      "minimum_positive_months": 4,
+      "quantile": 0.1,
+      "random_control": "deterministic matched-frequency timestamps with shuffled condition directions",
+      "source_field": "last_funding_rate",
+      "symbol": "ETHUSDT",
+      "timeframe": "15m",
+      "venue": "Binance USD\u24c8-M Futures",
+      "version": "1.0.0"
+    },
+    "REP-H2-SOL-FUNDING-LOW": {
+      "alignment": "latest funding event at or before 15m event T; no future event",
+      "condition": "current known funding <= per-symbol empirical 10th percentile",
+      "direction": "long-context association (not an entry)",
+      "execution_hurdle_bps": 16.0,
+      "horizon_bars": 24,
+      "independence": "event indices separated by >24 bars",
+      "market_type": "perpetual",
+      "minimum_events": 100,
+      "minimum_independent_events": 30,
+      "minimum_positive_months": 4,
+      "quantile": 0.1,
+      "random_control": "deterministic matched-frequency timestamps with shuffled condition directions",
+      "source_field": "last_funding_rate",
+      "symbol": "SOLUSDT",
+      "timeframe": "15m",
+      "venue": "Binance USD\u24c8-M Futures",
+      "version": "1.0.0"
+    },
+    "REP-H3-ETH-REL-VOLUME-HIGH": {
+      "alignment": "volume for completed event candle T only",
+      "condition": "current quote volume >= 1.5 \u00d7 causal trailing mean of prior 20 15m bars",
+      "direction": "sign of prior four-bar price change; zero is long",
+      "execution_hurdle_bps": 16.0,
+      "horizon_bars": 24,
+      "independence": "event indices separated by >24 bars",
+      "market_type": "perpetual",
+      "minimum_events": 100,
+      "minimum_independent_events": 30,
+      "minimum_positive_months": 4,
+      "random_control": "deterministic matched-frequency timestamps with shuffled condition directions",
+      "source_field": "quote_volume",
+      "symbol": "ETHUSDT",
+      "timeframe": "15m",
+      "venue": "Binance USD\u24c8-M Futures",
+      "version": "1.0.0"
+    },
+    "REP-H4-ETH-1D-PERSISTENCE": {
+      "alignment": "completed daily candle T only",
+      "condition": "close(T) compared with close(T-5 completed daily bars)",
+      "direction": "long if close(T)>close(T-5), otherwise short",
+      "execution_hurdle_bps": 14.0,
+      "horizon_bars": 10,
+      "independence": "event indices separated by >10 bars",
+      "market_type": "spot",
+      "minimum_events": 100,
+      "minimum_independent_events": 30,
+      "minimum_positive_months": 4,
+      "random_control": "deterministic matched-frequency timestamps with shuffled condition directions",
+      "source_field": "completed 5m OHLCV resampled to completed 1D",
+      "symbol": "ETHUSDT",
+      "timeframe": "1d",
+      "venue": "Binance Spot",
+      "version": "1.0.0"
+    }
+  },
+  "hypotheses_tested": 4,
+  "sealed": {
+    "discovery": [
+      "2025-01-01T00:00:00+00:00",
+      "2025-07-01T00:00:00+00:00"
+    ],
+    "existing_untouched_test_sealed_from": "2025-10-01T00:00:00+00:00",
+    "existing_validation_sealed_from": "2025-07-01T00:00:00+00:00"
+  },
+  "study_id": "independent-edge-replication-v1-2024h1"
+}

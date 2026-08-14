@@ -1,0 +1,2008 @@
+{
+  "inventory": {
+    "BTCUSDT": {
+      "archives": {
+        "BTCUSDT-5m-2025-01.zip": "4ed2edba26630a98b6ac6102b41dad00e1542640336f0d571c5a7394b39df983",
+        "BTCUSDT-5m-2025-02.zip": "a4859a5b4ad31f41f3ffad1d9a044154ff529c41983b76432ef3f10981b32415",
+        "BTCUSDT-5m-2025-03.zip": "1eb1fb0c76a0e8302abdec42d54b844bd3c3d6d7e6e69ae434aaa1dea445d54d",
+        "BTCUSDT-5m-2025-04.zip": "3ba9f1fd519bad5f190dfe0acda0dd57f904ad5eb848378be329b43cf69b5041",
+        "BTCUSDT-5m-2025-05.zip": "a1f4381240c422cda18464a054b34f75bb32bc5bb9137306e6c9d412e1b160aa",
+        "BTCUSDT-5m-2025-06.zip": "7c005bb32458cc9c797244c49d2be734f626561fb40031fba4b86831e95f06d9"
+      },
+      "candles": 52128,
+      "duplicates": 0,
+      "exchange": "Binance Spot",
+      "first": "2025-01-01T00:00:00+00:00",
+      "gaps": 0,
+      "invalid_ohlc": 0,
+      "last": "2025-06-30T23:55:00+00:00",
+      "provenance": "official Binance Vision monthly kline archives",
+      "symbol": "BTCUSDT",
+      "timeframe": "5m"
+    },
+    "ETHUSDT": {
+      "archives": {
+        "ETHUSDT-5m-2025-01.zip": "356e860d31d3bf5cc7e26c1601716052acaee1352bf7cf01492d4da7b2bdaeb6",
+        "ETHUSDT-5m-2025-02.zip": "c68b0d0e7c09715d072e4bb2fa0645db45fbe7fb864c4f5931856be1a9902e18",
+        "ETHUSDT-5m-2025-03.zip": "21d758ceba0dbb473adfa418dbd5e02b4b9a4acce9979e8b1d210a3d79866989",
+        "ETHUSDT-5m-2025-04.zip": "ed08375d54de44373626013aaaaab1de6bdb808591eef827ec82cd7b27dd6f73",
+        "ETHUSDT-5m-2025-05.zip": "dbc0115192fb99b2fe79c143e05caecbbb7cadaed071e582c7b80b32b7fdf234",
+        "ETHUSDT-5m-2025-06.zip": "596ef9b08a4f93bf0f4ac4a209227f3b4244d224003be0a78a75ce688d33360c"
+      },
+      "candles": 52128,
+      "duplicates": 0,
+      "exchange": "Binance Spot",
+      "first": "2025-01-01T00:00:00+00:00",
+      "gaps": 0,
+      "invalid_ohlc": 0,
+      "last": "2025-06-30T23:55:00+00:00",
+      "provenance": "official Binance Vision monthly kline archives",
+      "symbol": "ETHUSDT",
+      "timeframe": "5m"
+    },
+    "SOLUSDT": {
+      "archives": {
+        "SOLUSDT-5m-2025-01.zip": "5239b0db75b3ca28588e41f45be24360ca648820d654f270869e4679fbc57fd0",
+        "SOLUSDT-5m-2025-02.zip": "fc42b66d261f05b5c35ecfe66cf8ad7b42b349da555bd6c16b074227451fc51e",
+        "SOLUSDT-5m-2025-03.zip": "141acebb46fd7a30c6d47f1b251e5da88e37e54facc2b028ac5d5cfff4525cd3",
+        "SOLUSDT-5m-2025-04.zip": "ceb0d4ce30778bacbb7047ea7ae94e434971842d1caa9594400109557da6ef28",
+        "SOLUSDT-5m-2025-05.zip": "59bdebe9cdf9ffcaa892dfaff151bd3bb62207a133c69b575f054748e2ead328",
+        "SOLUSDT-5m-2025-06.zip": "6ea804afe3f51dd183babef54976defbeb8afca83e922881c46d31f39b0dcfce"
+      },
+      "candles": 52128,
+      "duplicates": 0,
+      "exchange": "Binance Spot",
+      "first": "2025-01-01T00:00:00+00:00",
+      "gaps": 0,
+      "invalid_ohlc": 0,
+      "last": "2025-06-30T23:55:00+00:00",
+      "provenance": "official Binance Vision monthly kline archives",
+      "symbol": "SOLUSDT",
+      "timeframe": "5m"
+    }
+  },
+  "protocol": "V3 market-behaviour discovery; train only; not a strategy backtest",
+  "sealed_boundaries": {
+    "test_data_opened": false,
+    "train": [
+      "2025-01-01T00:00:00+00:00",
+      "2025-07-01T00:00:00+00:00"
+    ],
+    "untouched_test_sealed_from": "2025-10-01T00:00:00+00:00",
+    "validation_sealed_from": "2025-07-01T00:00:00+00:00"
+  },
+  "study": {
+    "BTCUSDT": {
+      "15m": {
+        "bars": 17376,
+        "coverage": [
+          "2025-01-01T00:00:00+00:00",
+          "2025-06-30T23:45:00+00:00"
+        ],
+        "events": {
+          "breakout_follow_through_long": {
+            "mean_bps": 1.6029,
+            "median_bps": 0.4264,
+            "n": 961,
+            "positive_rate": 0.5026,
+            "positive_rate_wilson_lower_95": 0.471
+          },
+          "breakout_follow_through_short": {
+            "mean_bps": -1.4973,
+            "median_bps": -6.7389,
+            "n": 915,
+            "positive_rate": 0.4689,
+            "positive_rate_wilson_lower_95": 0.4367
+          },
+          "mean_reversion_from_high": {
+            "mean_bps": 0.2838,
+            "median_bps": 1.3508,
+            "n": 2860,
+            "positive_rate": 0.5213,
+            "positive_rate_wilson_lower_95": 0.503
+          },
+          "mean_reversion_from_low": {
+            "mean_bps": 0.839,
+            "median_bps": 2.1098,
+            "n": 2666,
+            "positive_rate": 0.5304,
+            "positive_rate_wilson_lower_95": 0.5114
+          },
+          "momentum_continuation_long": {
+            "mean_bps": -0.4578,
+            "median_bps": -1.3748,
+            "n": 790,
+            "positive_rate": 0.4835,
+            "positive_rate_wilson_lower_95": 0.4489
+          },
+          "momentum_continuation_short": {
+            "mean_bps": -1.6538,
+            "median_bps": -2.2203,
+            "n": 710,
+            "positive_rate": 0.4831,
+            "positive_rate_wilson_lower_95": 0.4465
+          },
+          "pullback_continuation_long": {
+            "mean_bps": 24.4868,
+            "median_bps": 41.0645,
+            "n": 23,
+            "positive_rate": 0.6522,
+            "positive_rate_wilson_lower_95": 0.4489
+          },
+          "pullback_continuation_short": {
+            "mean_bps": -21.601,
+            "median_bps": -9.1923,
+            "n": 32,
+            "positive_rate": 0.375,
+            "positive_rate_wilson_lower_95": 0.2293
+          },
+          "trend_persistence_long": {
+            "mean_bps": -2.8888,
+            "median_bps": 0.7927,
+            "n": 790,
+            "positive_rate": 0.5025,
+            "positive_rate_wilson_lower_95": 0.4677
+          },
+          "trend_persistence_short": {
+            "mean_bps": 3.5813,
+            "median_bps": -1.6927,
+            "n": 710,
+            "positive_rate": 0.493,
+            "positive_rate_wilson_lower_95": 0.4563
+          },
+          "volatility_contraction_abs_move": {
+            "mean_bps": 72.5905,
+            "median_bps": 47.713,
+            "n": 5583,
+            "positive_rate": 0.9998,
+            "positive_rate_wilson_lower_95": 0.999
+          },
+          "volatility_expansion_abs_move": {
+            "mean_bps": 104.2194,
+            "median_bps": 69.1287,
+            "n": 3816,
+            "positive_rate": 0.9997,
+            "positive_rate_wilson_lower_95": 0.9985
+          }
+        },
+        "false_breakout_frequency": {
+          "long": {
+            "n": 961,
+            "rate": 0.3788
+          },
+          "short": {
+            "n": 915,
+            "rate": 0.4055
+          }
+        },
+        "horizons": {
+          "one_hour_bars": 4,
+          "six_hour_bars": 24
+        },
+        "regime_persistence": {
+          "range_high_vol": {
+            "n": 3213,
+            "same_regime_rate": 0.1292
+          },
+          "range_low_vol": {
+            "n": 5313,
+            "same_regime_rate": 0.3032
+          },
+          "range_normal_vol": {
+            "n": 7266,
+            "same_regime_rate": 0.4286
+          },
+          "trend_high_vol": {
+            "n": 603,
+            "same_regime_rate": 0.0381
+          },
+          "trend_low_vol": {
+            "n": 270,
+            "same_regime_rate": 0.0481
+          },
+          "trend_normal_vol": {
+            "n": 627,
+            "same_regime_rate": 0.0112
+          }
+        },
+        "regimes": {
+          "range_high_vol": {
+            "mean_bps": -0.2688,
+            "median_bps": -8.0334,
+            "n": 3213,
+            "positive_rate": 0.4619,
+            "positive_rate_wilson_lower_95": 0.4447
+          },
+          "range_low_vol": {
+            "mean_bps": 4.4729,
+            "median_bps": 3.9367,
+            "n": 5313,
+            "positive_rate": 0.5193,
+            "positive_rate_wilson_lower_95": 0.5058
+          },
+          "range_normal_vol": {
+            "mean_bps": 1.1912,
+            "median_bps": 0.2664,
+            "n": 7266,
+            "positive_rate": 0.5019,
+            "positive_rate_wilson_lower_95": 0.4904
+          },
+          "trend_high_vol": {
+            "mean_bps": 4.5447,
+            "median_bps": 3.9615,
+            "n": 603,
+            "positive_rate": 0.5075,
+            "positive_rate_wilson_lower_95": 0.4676
+          },
+          "trend_low_vol": {
+            "mean_bps": 19.9814,
+            "median_bps": 12.547,
+            "n": 270,
+            "positive_rate": 0.5556,
+            "positive_rate_wilson_lower_95": 0.4959
+          },
+          "trend_normal_vol": {
+            "mean_bps": -12.5596,
+            "median_bps": -6.3629,
+            "n": 627,
+            "positive_rate": 0.4641,
+            "positive_rate_wilson_lower_95": 0.4254
+          }
+        },
+        "sessions": {
+          "Asia": {
+            "mean_bps": 4.3782,
+            "median_bps": 4.9595,
+            "n": 5760,
+            "positive_rate": 0.5271,
+            "positive_rate_wilson_lower_95": 0.5142
+          },
+          "Europe": {
+            "mean_bps": 0.4148,
+            "median_bps": -0.7393,
+            "n": 3600,
+            "positive_rate": 0.4967,
+            "positive_rate_wilson_lower_95": 0.4803
+          },
+          "Late UTC": {
+            "mean_bps": 4.5734,
+            "median_bps": -0.102,
+            "n": 2160,
+            "positive_rate": 0.4991,
+            "positive_rate_wilson_lower_95": 0.478
+          },
+          "US": {
+            "mean_bps": 1.1984,
+            "median_bps": -5.9597,
+            "n": 2884,
+            "positive_rate": 0.4716,
+            "positive_rate_wilson_lower_95": 0.4534
+          },
+          "US-Europe overlap": {
+            "mean_bps": -2.8495,
+            "median_bps": -4.0431,
+            "n": 2888,
+            "positive_rate": 0.4761,
+            "positive_rate_wilson_lower_95": 0.4579
+          }
+        }
+      },
+      "1h": {
+        "bars": 4344,
+        "coverage": [
+          "2025-01-01T00:00:00+00:00",
+          "2025-06-30T23:00:00+00:00"
+        ],
+        "events": {
+          "breakout_follow_through_long": {
+            "mean_bps": -11.904,
+            "median_bps": -14.4773,
+            "n": 218,
+            "positive_rate": 0.4404,
+            "positive_rate_wilson_lower_95": 0.3761
+          },
+          "breakout_follow_through_short": {
+            "mean_bps": 9.7728,
+            "median_bps": -1.8135,
+            "n": 215,
+            "positive_rate": 0.4884,
+            "positive_rate_wilson_lower_95": 0.4223
+          },
+          "mean_reversion_from_high": {
+            "mean_bps": -0.1187,
+            "median_bps": 1.9612,
+            "n": 712,
+            "positive_rate": 0.5211,
+            "positive_rate_wilson_lower_95": 0.4844
+          },
+          "mean_reversion_from_low": {
+            "mean_bps": 0.1546,
+            "median_bps": 4.9176,
+            "n": 631,
+            "positive_rate": 0.5372,
+            "positive_rate_wilson_lower_95": 0.4982
+          },
+          "momentum_continuation_long": {
+            "mean_bps": 0.3336,
+            "median_bps": -4.4013,
+            "n": 253,
+            "positive_rate": 0.4585,
+            "positive_rate_wilson_lower_95": 0.3982
+          },
+          "momentum_continuation_short": {
+            "mean_bps": -0.459,
+            "median_bps": -8.3149,
+            "n": 182,
+            "positive_rate": 0.456,
+            "positive_rate_wilson_lower_95": 0.3853
+          },
+          "pullback_continuation_long": {
+            "mean_bps": 1.1622,
+            "median_bps": 5.1207,
+            "n": 23,
+            "positive_rate": 0.5217,
+            "positive_rate_wilson_lower_95": 0.3296
+          },
+          "pullback_continuation_short": {
+            "mean_bps": 46.0052,
+            "median_bps": 48.4967,
+            "n": 4,
+            "positive_rate": 0.75,
+            "positive_rate_wilson_lower_95": 0.3006
+          },
+          "trend_persistence_long": {
+            "mean_bps": -4.6292,
+            "median_bps": -6.1225,
+            "n": 253,
+            "positive_rate": 0.4585,
+            "positive_rate_wilson_lower_95": 0.3982
+          },
+          "trend_persistence_short": {
+            "mean_bps": -2.2397,
+            "median_bps": -22.1112,
+            "n": 182,
+            "positive_rate": 0.4451,
+            "positive_rate_wilson_lower_95": 0.3747
+          },
+          "volatility_contraction_abs_move": {
+            "mean_bps": 73.4164,
+            "median_bps": 44.2639,
+            "n": 1427,
+            "positive_rate": 1.0,
+            "positive_rate_wilson_lower_95": 0.9973
+          },
+          "volatility_expansion_abs_move": {
+            "mean_bps": 105.9175,
+            "median_bps": 76.9694,
+            "n": 962,
+            "positive_rate": 1.0,
+            "positive_rate_wilson_lower_95": 0.996
+          }
+        },
+        "false_breakout_frequency": {
+          "long": {
+            "n": 218,
+            "rate": 0.3119
+          },
+          "short": {
+            "n": 215,
+            "rate": 0.2651
+          }
+        },
+        "horizons": {
+          "one_hour_bars": 1,
+          "six_hour_bars": 6
+        },
+        "regime_persistence": {
+          "range_high_vol": {
+            "n": 764,
+            "same_regime_rate": 0.4319
+          },
+          "range_low_vol": {
+            "n": 1364,
+            "same_regime_rate": 0.5799
+          },
+          "range_normal_vol": {
+            "n": 1715,
+            "same_regime_rate": 0.4845
+          },
+          "trend_high_vol": {
+            "n": 198,
+            "same_regime_rate": 0.3687
+          },
+          "trend_low_vol": {
+            "n": 63,
+            "same_regime_rate": 0.0
+          },
+          "trend_normal_vol": {
+            "n": 174,
+            "same_regime_rate": 0.1264
+          }
+        },
+        "regimes": {
+          "range_high_vol": {
+            "mean_bps": -16.5449,
+            "median_bps": -8.9318,
+            "n": 764,
+            "positive_rate": 0.4542,
+            "positive_rate_wilson_lower_95": 0.4192
+          },
+          "range_low_vol": {
+            "mean_bps": -3.3803,
+            "median_bps": -6.2145,
+            "n": 1364,
+            "positive_rate": 0.4501,
+            "positive_rate_wilson_lower_95": 0.4239
+          },
+          "range_normal_vol": {
+            "mean_bps": -1.6376,
+            "median_bps": -5.3497,
+            "n": 1715,
+            "positive_rate": 0.4735,
+            "positive_rate_wilson_lower_95": 0.4499
+          },
+          "trend_high_vol": {
+            "mean_bps": 0.1579,
+            "median_bps": -0.7888,
+            "n": 198,
+            "positive_rate": 0.4949,
+            "positive_rate_wilson_lower_95": 0.4261
+          },
+          "trend_low_vol": {
+            "mean_bps": -11.7569,
+            "median_bps": -16.8737,
+            "n": 63,
+            "positive_rate": 0.3651,
+            "positive_rate_wilson_lower_95": 0.2572
+          },
+          "trend_normal_vol": {
+            "mean_bps": -4.9966,
+            "median_bps": -10.3441,
+            "n": 174,
+            "positive_rate": 0.4368,
+            "positive_rate_wilson_lower_95": 0.3652
+          }
+        },
+        "sessions": {
+          "Asia": {
+            "mean_bps": -7.1814,
+            "median_bps": -4.5429,
+            "n": 1424,
+            "positive_rate": 0.467,
+            "positive_rate_wilson_lower_95": 0.4412
+          },
+          "Europe": {
+            "mean_bps": -9.1977,
+            "median_bps": -6.343,
+            "n": 891,
+            "positive_rate": 0.468,
+            "positive_rate_wilson_lower_95": 0.4355
+          },
+          "Late UTC": {
+            "mean_bps": -2.409,
+            "median_bps": -12.0082,
+            "n": 534,
+            "positive_rate": 0.4326,
+            "positive_rate_wilson_lower_95": 0.3912
+          },
+          "US": {
+            "mean_bps": -8.5036,
+            "median_bps": -11.2576,
+            "n": 713,
+            "positive_rate": 0.4278,
+            "positive_rate_wilson_lower_95": 0.3919
+          },
+          "US-Europe overlap": {
+            "mean_bps": 5.7716,
+            "median_bps": -1.267,
+            "n": 716,
+            "positive_rate": 0.4916,
+            "positive_rate_wilson_lower_95": 0.4551
+          }
+        }
+      },
+      "5m": {
+        "bars": 52128,
+        "coverage": [
+          "2025-01-01T00:00:00+00:00",
+          "2025-06-30T23:55:00+00:00"
+        ],
+        "events": {
+          "breakout_follow_through_long": {
+            "mean_bps": 0.4515,
+            "median_bps": -0.6975,
+            "n": 3180,
+            "positive_rate": 0.495,
+            "positive_rate_wilson_lower_95": 0.4776
+          },
+          "breakout_follow_through_short": {
+            "mean_bps": -4.7726,
+            "median_bps": -5.9354,
+            "n": 3082,
+            "positive_rate": 0.4669,
+            "positive_rate_wilson_lower_95": 0.4493
+          },
+          "mean_reversion_from_high": {
+            "mean_bps": -0.819,
+            "median_bps": 0.7779,
+            "n": 9582,
+            "positive_rate": 0.5123,
+            "positive_rate_wilson_lower_95": 0.5023
+          },
+          "mean_reversion_from_low": {
+            "mean_bps": 0.8049,
+            "median_bps": 1.6706,
+            "n": 9070,
+            "positive_rate": 0.5244,
+            "positive_rate_wilson_lower_95": 0.5141
+          },
+          "momentum_continuation_long": {
+            "mean_bps": 1.8465,
+            "median_bps": 0.4784,
+            "n": 2238,
+            "positive_rate": 0.5054,
+            "positive_rate_wilson_lower_95": 0.4847
+          },
+          "momentum_continuation_short": {
+            "mean_bps": -3.1129,
+            "median_bps": -3.0536,
+            "n": 2049,
+            "positive_rate": 0.4578,
+            "positive_rate_wilson_lower_95": 0.4363
+          },
+          "pullback_continuation_long": {
+            "mean_bps": -6.2137,
+            "median_bps": 3.7468,
+            "n": 109,
+            "positive_rate": 0.5413,
+            "positive_rate_wilson_lower_95": 0.4479
+          },
+          "pullback_continuation_short": {
+            "mean_bps": 20.6837,
+            "median_bps": 8.4402,
+            "n": 92,
+            "positive_rate": 0.5543,
+            "positive_rate_wilson_lower_95": 0.4526
+          },
+          "trend_persistence_long": {
+            "mean_bps": -3.3518,
+            "median_bps": 0.0855,
+            "n": 2238,
+            "positive_rate": 0.5004,
+            "positive_rate_wilson_lower_95": 0.4797
+          },
+          "trend_persistence_short": {
+            "mean_bps": 7.0199,
+            "median_bps": -0.1152,
+            "n": 2049,
+            "positive_rate": 0.4993,
+            "positive_rate_wilson_lower_95": 0.4776
+          },
+          "volatility_contraction_abs_move": {
+            "mean_bps": 80.365,
+            "median_bps": 53.2909,
+            "n": 14001,
+            "positive_rate": 1.0,
+            "positive_rate_wilson_lower_95": 0.9997
+          },
+          "volatility_expansion_abs_move": {
+            "mean_bps": 100.758,
+            "median_bps": 64.0355,
+            "n": 9388,
+            "positive_rate": 1.0,
+            "positive_rate_wilson_lower_95": 0.9996
+          }
+        },
+        "false_breakout_frequency": {
+          "long": {
+            "n": 3180,
+            "rate": 0.4292
+          },
+          "short": {
+            "n": 3082,
+            "rate": 0.451
+          }
+        },
+        "horizons": {
+          "one_hour_bars": 12,
+          "six_hour_bars": 72
+        },
+        "regime_persistence": {
+          "range_high_vol": {
+            "n": 7794,
+            "same_regime_rate": 0.1572
+          },
+          "range_low_vol": {
+            "n": 13342,
+            "same_regime_rate": 0.2693
+          },
+          "range_normal_vol": {
+            "n": 26573,
+            "same_regime_rate": 0.5119
+          },
+          "trend_high_vol": {
+            "n": 1594,
+            "same_regime_rate": 0.0257
+          },
+          "trend_low_vol": {
+            "n": 659,
+            "same_regime_rate": 0.0121
+          },
+          "trend_normal_vol": {
+            "n": 2034,
+            "same_regime_rate": 0.028
+          }
+        },
+        "regimes": {
+          "range_high_vol": {
+            "mean_bps": -3.1381,
+            "median_bps": -4.8207,
+            "n": 7794,
+            "positive_rate": 0.4754,
+            "positive_rate_wilson_lower_95": 0.4643
+          },
+          "range_low_vol": {
+            "mean_bps": 3.9547,
+            "median_bps": 1.7762,
+            "n": 13342,
+            "positive_rate": 0.5109,
+            "positive_rate_wilson_lower_95": 0.5025
+          },
+          "range_normal_vol": {
+            "mean_bps": -1.3117,
+            "median_bps": -0.2204,
+            "n": 26573,
+            "positive_rate": 0.4988,
+            "positive_rate_wilson_lower_95": 0.4928
+          },
+          "trend_high_vol": {
+            "mean_bps": 0.4752,
+            "median_bps": -5.8259,
+            "n": 1594,
+            "positive_rate": 0.4749,
+            "positive_rate_wilson_lower_95": 0.4505
+          },
+          "trend_low_vol": {
+            "mean_bps": 8.2834,
+            "median_bps": 4.688,
+            "n": 659,
+            "positive_rate": 0.5311,
+            "positive_rate_wilson_lower_95": 0.4929
+          },
+          "trend_normal_vol": {
+            "mean_bps": 0.3276,
+            "median_bps": 1.04,
+            "n": 2034,
+            "positive_rate": 0.5093,
+            "positive_rate_wilson_lower_95": 0.4876
+          }
+        },
+        "sessions": {
+          "Asia": {
+            "mean_bps": 2.4297,
+            "median_bps": 2.6708,
+            "n": 17316,
+            "positive_rate": 0.5172,
+            "positive_rate_wilson_lower_95": 0.5097
+          },
+          "Europe": {
+            "mean_bps": -0.468,
+            "median_bps": 0.4496,
+            "n": 10860,
+            "positive_rate": 0.5025,
+            "positive_rate_wilson_lower_95": 0.4931
+          },
+          "Late UTC": {
+            "mean_bps": -2.5421,
+            "median_bps": -2.5523,
+            "n": 6480,
+            "positive_rate": 0.4869,
+            "positive_rate_wilson_lower_95": 0.4747
+          },
+          "US": {
+            "mean_bps": 0.835,
+            "median_bps": -3.7172,
+            "n": 8652,
+            "positive_rate": 0.4817,
+            "positive_rate_wilson_lower_95": 0.4712
+          },
+          "US-Europe overlap": {
+            "mean_bps": -3.1549,
+            "median_bps": -2.8798,
+            "n": 8688,
+            "positive_rate": 0.4816,
+            "positive_rate_wilson_lower_95": 0.4711
+          }
+        }
+      }
+    },
+    "ETHUSDT": {
+      "15m": {
+        "bars": 17376,
+        "coverage": [
+          "2025-01-01T00:00:00+00:00",
+          "2025-06-30T23:45:00+00:00"
+        ],
+        "events": {
+          "breakout_follow_through_long": {
+            "mean_bps": 10.3895,
+            "median_bps": 7.0611,
+            "n": 771,
+            "positive_rate": 0.5149,
+            "positive_rate_wilson_lower_95": 0.4797
+          },
+          "breakout_follow_through_short": {
+            "mean_bps": 24.8012,
+            "median_bps": -4.6762,
+            "n": 756,
+            "positive_rate": 0.4907,
+            "positive_rate_wilson_lower_95": 0.4552
+          },
+          "mean_reversion_from_high": {
+            "mean_bps": -3.9185,
+            "median_bps": 1.0218,
+            "n": 2542,
+            "positive_rate": 0.5067,
+            "positive_rate_wilson_lower_95": 0.4873
+          },
+          "mean_reversion_from_low": {
+            "mean_bps": -5.5905,
+            "median_bps": 2.3844,
+            "n": 2587,
+            "positive_rate": 0.5157,
+            "positive_rate_wilson_lower_95": 0.4964
+          },
+          "momentum_continuation_long": {
+            "mean_bps": 6.4204,
+            "median_bps": -1.4646,
+            "n": 909,
+            "positive_rate": 0.4895,
+            "positive_rate_wilson_lower_95": 0.4572
+          },
+          "momentum_continuation_short": {
+            "mean_bps": 2.596,
+            "median_bps": -5.0527,
+            "n": 903,
+            "positive_rate": 0.4751,
+            "positive_rate_wilson_lower_95": 0.4427
+          },
+          "pullback_continuation_long": {
+            "mean_bps": 36.9306,
+            "median_bps": 40.8538,
+            "n": 57,
+            "positive_rate": 0.6316,
+            "positive_rate_wilson_lower_95": 0.5018
+          },
+          "pullback_continuation_short": {
+            "mean_bps": 34.3013,
+            "median_bps": 26.0823,
+            "n": 48,
+            "positive_rate": 0.5833,
+            "positive_rate_wilson_lower_95": 0.4428
+          },
+          "trend_persistence_long": {
+            "mean_bps": 33.0015,
+            "median_bps": 10.8456,
+            "n": 909,
+            "positive_rate": 0.5193,
+            "positive_rate_wilson_lower_95": 0.4868
+          },
+          "trend_persistence_short": {
+            "mean_bps": 29.3106,
+            "median_bps": 20.5109,
+            "n": 903,
+            "positive_rate": 0.5393,
+            "positive_rate_wilson_lower_95": 0.5067
+          },
+          "volatility_contraction_abs_move": {
+            "mean_bps": 123.8206,
+            "median_bps": 89.9757,
+            "n": 4781,
+            "positive_rate": 1.0,
+            "positive_rate_wilson_lower_95": 0.9992
+          },
+          "volatility_expansion_abs_move": {
+            "mean_bps": 177.7301,
+            "median_bps": 115.1878,
+            "n": 3402,
+            "positive_rate": 1.0,
+            "positive_rate_wilson_lower_95": 0.9989
+          }
+        },
+        "false_breakout_frequency": {
+          "long": {
+            "n": 771,
+            "rate": 0.3619
+          },
+          "short": {
+            "n": 756,
+            "rate": 0.3704
+          }
+        },
+        "horizons": {
+          "one_hour_bars": 4,
+          "six_hour_bars": 24
+        },
+        "regime_persistence": {
+          "range_high_vol": {
+            "n": 2609,
+            "same_regime_rate": 0.1023
+          },
+          "range_low_vol": {
+            "n": 4584,
+            "same_regime_rate": 0.2485
+          },
+          "range_normal_vol": {
+            "n": 8287,
+            "same_regime_rate": 0.483
+          },
+          "trend_high_vol": {
+            "n": 793,
+            "same_regime_rate": 0.0479
+          },
+          "trend_low_vol": {
+            "n": 197,
+            "same_regime_rate": 0.0254
+          },
+          "trend_normal_vol": {
+            "n": 822,
+            "same_regime_rate": 0.0547
+          }
+        },
+        "regimes": {
+          "range_high_vol": {
+            "mean_bps": 10.5145,
+            "median_bps": -13.5119,
+            "n": 2609,
+            "positive_rate": 0.4573,
+            "positive_rate_wilson_lower_95": 0.4382
+          },
+          "range_low_vol": {
+            "mean_bps": 15.8972,
+            "median_bps": 16.4602,
+            "n": 4584,
+            "positive_rate": 0.5432,
+            "positive_rate_wilson_lower_95": 0.5287
+          },
+          "range_normal_vol": {
+            "mean_bps": 9.8068,
+            "median_bps": 4.0532,
+            "n": 8287,
+            "positive_rate": 0.5126,
+            "positive_rate_wilson_lower_95": 0.5018
+          },
+          "trend_high_vol": {
+            "mean_bps": 47.9544,
+            "median_bps": 35.3095,
+            "n": 793,
+            "positive_rate": 0.5687,
+            "positive_rate_wilson_lower_95": 0.534
+          },
+          "trend_low_vol": {
+            "mean_bps": 10.4873,
+            "median_bps": 27.2404,
+            "n": 197,
+            "positive_rate": 0.5787,
+            "positive_rate_wilson_lower_95": 0.5089
+          },
+          "trend_normal_vol": {
+            "mean_bps": 19.9173,
+            "median_bps": -11.0424,
+            "n": 822,
+            "positive_rate": 0.4793,
+            "positive_rate_wilson_lower_95": 0.4453
+          }
+        },
+        "sessions": {
+          "Asia": {
+            "mean_bps": 11.7121,
+            "median_bps": 11.9145,
+            "n": 5760,
+            "positive_rate": 0.5378,
+            "positive_rate_wilson_lower_95": 0.525
+          },
+          "Europe": {
+            "mean_bps": 11.8099,
+            "median_bps": 4.0864,
+            "n": 3600,
+            "positive_rate": 0.5075,
+            "positive_rate_wilson_lower_95": 0.4912
+          },
+          "Late UTC": {
+            "mean_bps": 12.8248,
+            "median_bps": -0.7522,
+            "n": 2160,
+            "positive_rate": 0.4963,
+            "positive_rate_wilson_lower_95": 0.4752
+          },
+          "US": {
+            "mean_bps": 16.8078,
+            "median_bps": -5.6892,
+            "n": 2884,
+            "positive_rate": 0.4827,
+            "positive_rate_wilson_lower_95": 0.4645
+          },
+          "US-Europe overlap": {
+            "mean_bps": 17.9664,
+            "median_bps": 6.8049,
+            "n": 2888,
+            "positive_rate": 0.5197,
+            "positive_rate_wilson_lower_95": 0.5015
+          }
+        }
+      },
+      "1h": {
+        "bars": 4344,
+        "coverage": [
+          "2025-01-01T00:00:00+00:00",
+          "2025-06-30T23:00:00+00:00"
+        ],
+        "events": {
+          "breakout_follow_through_long": {
+            "mean_bps": 13.8799,
+            "median_bps": -8.8196,
+            "n": 193,
+            "positive_rate": 0.4767,
+            "positive_rate_wilson_lower_95": 0.4074
+          },
+          "breakout_follow_through_short": {
+            "mean_bps": 47.1274,
+            "median_bps": -6.9927,
+            "n": 179,
+            "positive_rate": 0.4804,
+            "positive_rate_wilson_lower_95": 0.4084
+          },
+          "mean_reversion_from_high": {
+            "mean_bps": -2.5116,
+            "median_bps": 2.4649,
+            "n": 642,
+            "positive_rate": 0.5218,
+            "positive_rate_wilson_lower_95": 0.4832
+          },
+          "mean_reversion_from_low": {
+            "mean_bps": -3.8253,
+            "median_bps": 9.079,
+            "n": 680,
+            "positive_rate": 0.5485,
+            "positive_rate_wilson_lower_95": 0.511
+          },
+          "momentum_continuation_long": {
+            "mean_bps": 2.4023,
+            "median_bps": -4.4082,
+            "n": 301,
+            "positive_rate": 0.4684,
+            "positive_rate_wilson_lower_95": 0.4128
+          },
+          "momentum_continuation_short": {
+            "mean_bps": 8.2991,
+            "median_bps": -3.5797,
+            "n": 277,
+            "positive_rate": 0.4946,
+            "positive_rate_wilson_lower_95": 0.4362
+          },
+          "pullback_continuation_long": {
+            "mean_bps": -28.479,
+            "median_bps": -34.5229,
+            "n": 30,
+            "positive_rate": 0.3,
+            "positive_rate_wilson_lower_95": 0.1666
+          },
+          "pullback_continuation_short": {
+            "mean_bps": -38.8032,
+            "median_bps": -41.9591,
+            "n": 24,
+            "positive_rate": 0.4167,
+            "positive_rate_wilson_lower_95": 0.2447
+          },
+          "trend_persistence_long": {
+            "mean_bps": -7.7811,
+            "median_bps": -38.2615,
+            "n": 301,
+            "positive_rate": 0.3654,
+            "positive_rate_wilson_lower_95": 0.3131
+          },
+          "trend_persistence_short": {
+            "mean_bps": 32.0655,
+            "median_bps": -10.9104,
+            "n": 277,
+            "positive_rate": 0.4874,
+            "positive_rate_wilson_lower_95": 0.4291
+          },
+          "volatility_contraction_abs_move": {
+            "mean_bps": 122.5001,
+            "median_bps": 82.0036,
+            "n": 1237,
+            "positive_rate": 0.9992,
+            "positive_rate_wilson_lower_95": 0.9954
+          },
+          "volatility_expansion_abs_move": {
+            "mean_bps": 185.2444,
+            "median_bps": 130.3655,
+            "n": 805,
+            "positive_rate": 1.0,
+            "positive_rate_wilson_lower_95": 0.9953
+          }
+        },
+        "false_breakout_frequency": {
+          "long": {
+            "n": 193,
+            "rate": 0.1969
+          },
+          "short": {
+            "n": 179,
+            "rate": 0.2737
+          }
+        },
+        "horizons": {
+          "one_hour_bars": 1,
+          "six_hour_bars": 6
+        },
+        "regime_persistence": {
+          "range_high_vol": {
+            "n": 536,
+            "same_regime_rate": 0.3563
+          },
+          "range_low_vol": {
+            "n": 1185,
+            "same_regime_rate": 0.5342
+          },
+          "range_normal_vol": {
+            "n": 1979,
+            "same_regime_rate": 0.5705
+          },
+          "trend_high_vol": {
+            "n": 269,
+            "same_regime_rate": 0.4052
+          },
+          "trend_low_vol": {
+            "n": 52,
+            "same_regime_rate": 0.0
+          },
+          "trend_normal_vol": {
+            "n": 257,
+            "same_regime_rate": 0.2101
+          }
+        },
+        "regimes": {
+          "range_high_vol": {
+            "mean_bps": -4.9675,
+            "median_bps": -16.3018,
+            "n": 536,
+            "positive_rate": 0.4478,
+            "positive_rate_wilson_lower_95": 0.4062
+          },
+          "range_low_vol": {
+            "mean_bps": -9.4751,
+            "median_bps": -18.1865,
+            "n": 1185,
+            "positive_rate": 0.4371,
+            "positive_rate_wilson_lower_95": 0.4091
+          },
+          "range_normal_vol": {
+            "mean_bps": -17.718,
+            "median_bps": -22.783,
+            "n": 1979,
+            "positive_rate": 0.4295,
+            "positive_rate_wilson_lower_95": 0.4079
+          },
+          "trend_high_vol": {
+            "mean_bps": 50.0678,
+            "median_bps": 11.8796,
+            "n": 269,
+            "positive_rate": 0.513,
+            "positive_rate_wilson_lower_95": 0.4535
+          },
+          "trend_low_vol": {
+            "mean_bps": -41.7259,
+            "median_bps": -20.3005,
+            "n": 52,
+            "positive_rate": 0.4615,
+            "positive_rate_wilson_lower_95": 0.3334
+          },
+          "trend_normal_vol": {
+            "mean_bps": -18.5154,
+            "median_bps": -51.858,
+            "n": 257,
+            "positive_rate": 0.323,
+            "positive_rate_wilson_lower_95": 0.2688
+          }
+        },
+        "sessions": {
+          "Asia": {
+            "mean_bps": -15.4049,
+            "median_bps": -21.1914,
+            "n": 1424,
+            "positive_rate": 0.4361,
+            "positive_rate_wilson_lower_95": 0.4105
+          },
+          "Europe": {
+            "mean_bps": -19.368,
+            "median_bps": -23.114,
+            "n": 891,
+            "positive_rate": 0.4366,
+            "positive_rate_wilson_lower_95": 0.4044
+          },
+          "Late UTC": {
+            "mean_bps": -16.0618,
+            "median_bps": -27.9916,
+            "n": 534,
+            "positive_rate": 0.3876,
+            "positive_rate_wilson_lower_95": 0.3473
+          },
+          "US": {
+            "mean_bps": -7.3171,
+            "median_bps": -24.0431,
+            "n": 713,
+            "positive_rate": 0.4081,
+            "positive_rate_wilson_lower_95": 0.3726
+          },
+          "US-Europe overlap": {
+            "mean_bps": 14.767,
+            "median_bps": -8.1655,
+            "n": 716,
+            "positive_rate": 0.4818,
+            "positive_rate_wilson_lower_95": 0.4454
+          }
+        }
+      },
+      "5m": {
+        "bars": 52128,
+        "coverage": [
+          "2025-01-01T00:00:00+00:00",
+          "2025-06-30T23:55:00+00:00"
+        ],
+        "events": {
+          "breakout_follow_through_long": {
+            "mean_bps": 2.8105,
+            "median_bps": 2.3295,
+            "n": 2540,
+            "positive_rate": 0.5083,
+            "positive_rate_wilson_lower_95": 0.4888
+          },
+          "breakout_follow_through_short": {
+            "mean_bps": 11.1031,
+            "median_bps": 1.1442,
+            "n": 2507,
+            "positive_rate": 0.5042,
+            "positive_rate_wilson_lower_95": 0.4846
+          },
+          "mean_reversion_from_high": {
+            "mean_bps": -2.3093,
+            "median_bps": 1.5234,
+            "n": 7933,
+            "positive_rate": 0.5124,
+            "positive_rate_wilson_lower_95": 0.5014
+          },
+          "mean_reversion_from_low": {
+            "mean_bps": -2.3934,
+            "median_bps": 3.2335,
+            "n": 8035,
+            "positive_rate": 0.5226,
+            "positive_rate_wilson_lower_95": 0.5117
+          },
+          "momentum_continuation_long": {
+            "mean_bps": 6.5594,
+            "median_bps": 0.9341,
+            "n": 2195,
+            "positive_rate": 0.5057,
+            "positive_rate_wilson_lower_95": 0.4848
+          },
+          "momentum_continuation_short": {
+            "mean_bps": 3.8984,
+            "median_bps": -5.055,
+            "n": 2206,
+            "positive_rate": 0.4692,
+            "positive_rate_wilson_lower_95": 0.4484
+          },
+          "pullback_continuation_long": {
+            "mean_bps": 9.7644,
+            "median_bps": 8.9358,
+            "n": 102,
+            "positive_rate": 0.5196,
+            "positive_rate_wilson_lower_95": 0.4237
+          },
+          "pullback_continuation_short": {
+            "mean_bps": 37.2618,
+            "median_bps": 23.6459,
+            "n": 119,
+            "positive_rate": 0.521,
+            "positive_rate_wilson_lower_95": 0.432
+          },
+          "trend_persistence_long": {
+            "mean_bps": 20.8861,
+            "median_bps": 14.2952,
+            "n": 2195,
+            "positive_rate": 0.5431,
+            "positive_rate_wilson_lower_95": 0.5222
+          },
+          "trend_persistence_short": {
+            "mean_bps": 42.2965,
+            "median_bps": 19.3521,
+            "n": 2206,
+            "positive_rate": 0.5449,
+            "positive_rate_wilson_lower_95": 0.524
+          },
+          "volatility_contraction_abs_move": {
+            "mean_bps": 142.4574,
+            "median_bps": 97.5907,
+            "n": 12670,
+            "positive_rate": 0.9998,
+            "positive_rate_wilson_lower_95": 0.9993
+          },
+          "volatility_expansion_abs_move": {
+            "mean_bps": 164.5653,
+            "median_bps": 108.1794,
+            "n": 8796,
+            "positive_rate": 0.9997,
+            "positive_rate_wilson_lower_95": 0.999
+          }
+        },
+        "false_breakout_frequency": {
+          "long": {
+            "n": 2540,
+            "rate": 0.4354
+          },
+          "short": {
+            "n": 2507,
+            "rate": 0.4392
+          }
+        },
+        "horizons": {
+          "one_hour_bars": 12,
+          "six_hour_bars": 72
+        },
+        "regime_persistence": {
+          "range_high_vol": {
+            "n": 6825,
+            "same_regime_rate": 0.1291
+          },
+          "range_low_vol": {
+            "n": 12212,
+            "same_regime_rate": 0.2541
+          },
+          "range_normal_vol": {
+            "n": 28558,
+            "same_regime_rate": 0.5663
+          },
+          "trend_high_vol": {
+            "n": 1971,
+            "same_regime_rate": 0.0416
+          },
+          "trend_low_vol": {
+            "n": 458,
+            "same_regime_rate": 0.0022
+          },
+          "trend_normal_vol": {
+            "n": 1972,
+            "same_regime_rate": 0.0304
+          }
+        },
+        "regimes": {
+          "range_high_vol": {
+            "mean_bps": 11.0017,
+            "median_bps": -3.5015,
+            "n": 6825,
+            "positive_rate": 0.4904,
+            "positive_rate_wilson_lower_95": 0.4786
+          },
+          "range_low_vol": {
+            "mean_bps": 5.1344,
+            "median_bps": 8.8863,
+            "n": 12212,
+            "positive_rate": 0.5255,
+            "positive_rate_wilson_lower_95": 0.5166
+          },
+          "range_normal_vol": {
+            "mean_bps": 4.0792,
+            "median_bps": 1.1133,
+            "n": 28558,
+            "positive_rate": 0.5035,
+            "positive_rate_wilson_lower_95": 0.4977
+          },
+          "trend_high_vol": {
+            "mean_bps": 38.5275,
+            "median_bps": 20.2431,
+            "n": 1971,
+            "positive_rate": 0.5398,
+            "positive_rate_wilson_lower_95": 0.5178
+          },
+          "trend_low_vol": {
+            "mean_bps": 19.6764,
+            "median_bps": 23.0307,
+            "n": 458,
+            "positive_rate": 0.5699,
+            "positive_rate_wilson_lower_95": 0.5241
+          },
+          "trend_normal_vol": {
+            "mean_bps": 27.4856,
+            "median_bps": 12.8754,
+            "n": 1972,
+            "positive_rate": 0.5421,
+            "positive_rate_wilson_lower_95": 0.52
+          }
+        },
+        "sessions": {
+          "Asia": {
+            "mean_bps": 9.89,
+            "median_bps": 9.6401,
+            "n": 17316,
+            "positive_rate": 0.5319,
+            "positive_rate_wilson_lower_95": 0.5245
+          },
+          "Europe": {
+            "mean_bps": 1.6578,
+            "median_bps": 3.9029,
+            "n": 10860,
+            "positive_rate": 0.5089,
+            "positive_rate_wilson_lower_95": 0.4995
+          },
+          "Late UTC": {
+            "mean_bps": 0.861,
+            "median_bps": -5.1928,
+            "n": 6480,
+            "positive_rate": 0.4827,
+            "positive_rate_wilson_lower_95": 0.4706
+          },
+          "US": {
+            "mean_bps": 10.6889,
+            "median_bps": 2.2346,
+            "n": 8652,
+            "positive_rate": 0.5086,
+            "positive_rate_wilson_lower_95": 0.498
+          },
+          "US-Europe overlap": {
+            "mean_bps": 12.2139,
+            "median_bps": -3.1009,
+            "n": 8688,
+            "positive_rate": 0.4917,
+            "positive_rate_wilson_lower_95": 0.4812
+          }
+        }
+      }
+    },
+    "SOLUSDT": {
+      "15m": {
+        "bars": 17376,
+        "coverage": [
+          "2025-01-01T00:00:00+00:00",
+          "2025-06-30T23:45:00+00:00"
+        ],
+        "events": {
+          "breakout_follow_through_long": {
+            "mean_bps": 0.7618,
+            "median_bps": 2.3721,
+            "n": 933,
+            "positive_rate": 0.5027,
+            "positive_rate_wilson_lower_95": 0.4707
+          },
+          "breakout_follow_through_short": {
+            "mean_bps": 12.4302,
+            "median_bps": 15.8065,
+            "n": 987,
+            "positive_rate": 0.5339,
+            "positive_rate_wilson_lower_95": 0.5027
+          },
+          "mean_reversion_from_high": {
+            "mean_bps": 1.7977,
+            "median_bps": 2.9681,
+            "n": 2718,
+            "positive_rate": 0.5155,
+            "positive_rate_wilson_lower_95": 0.4967
+          },
+          "mean_reversion_from_low": {
+            "mean_bps": 1.3882,
+            "median_bps": 3.4434,
+            "n": 2854,
+            "positive_rate": 0.5154,
+            "positive_rate_wilson_lower_95": 0.4971
+          },
+          "momentum_continuation_long": {
+            "mean_bps": -1.2917,
+            "median_bps": -6.2068,
+            "n": 845,
+            "positive_rate": 0.4604,
+            "positive_rate_wilson_lower_95": 0.427
+          },
+          "momentum_continuation_short": {
+            "mean_bps": -6.5681,
+            "median_bps": -10.9861,
+            "n": 857,
+            "positive_rate": 0.4527,
+            "positive_rate_wilson_lower_95": 0.4197
+          },
+          "pullback_continuation_long": {
+            "mean_bps": 90.5832,
+            "median_bps": 68.199,
+            "n": 44,
+            "positive_rate": 0.6591,
+            "positive_rate_wilson_lower_95": 0.5114
+          },
+          "pullback_continuation_short": {
+            "mean_bps": 16.6411,
+            "median_bps": 33.5113,
+            "n": 48,
+            "positive_rate": 0.5625,
+            "positive_rate_wilson_lower_95": 0.4227
+          },
+          "trend_persistence_long": {
+            "mean_bps": 8.0519,
+            "median_bps": 17.7117,
+            "n": 845,
+            "positive_rate": 0.5349,
+            "positive_rate_wilson_lower_95": 0.5012
+          },
+          "trend_persistence_short": {
+            "mean_bps": 19.9153,
+            "median_bps": 18.3765,
+            "n": 857,
+            "positive_rate": 0.5286,
+            "positive_rate_wilson_lower_95": 0.4951
+          },
+          "volatility_contraction_abs_move": {
+            "mean_bps": 156.6911,
+            "median_bps": 114.7151,
+            "n": 4198,
+            "positive_rate": 0.9976,
+            "positive_rate_wilson_lower_95": 0.9956
+          },
+          "volatility_expansion_abs_move": {
+            "mean_bps": 207.7327,
+            "median_bps": 155.2017,
+            "n": 3038,
+            "positive_rate": 0.9984,
+            "positive_rate_wilson_lower_95": 0.9962
+          }
+        },
+        "false_breakout_frequency": {
+          "long": {
+            "n": 933,
+            "rate": 0.3891
+          },
+          "short": {
+            "n": 987,
+            "rate": 0.381
+          }
+        },
+        "horizons": {
+          "one_hour_bars": 4,
+          "six_hour_bars": 24
+        },
+        "regime_persistence": {
+          "range_high_vol": {
+            "n": 2406,
+            "same_regime_rate": 0.1068
+          },
+          "range_low_vol": {
+            "n": 3989,
+            "same_regime_rate": 0.2046
+          },
+          "range_normal_vol": {
+            "n": 9195,
+            "same_regime_rate": 0.5358
+          },
+          "trend_high_vol": {
+            "n": 632,
+            "same_regime_rate": 0.0253
+          },
+          "trend_low_vol": {
+            "n": 209,
+            "same_regime_rate": 0.0239
+          },
+          "trend_normal_vol": {
+            "n": 861,
+            "same_regime_rate": 0.0581
+          }
+        },
+        "regimes": {
+          "range_high_vol": {
+            "mean_bps": 16.0493,
+            "median_bps": 9.5232,
+            "n": 2406,
+            "positive_rate": 0.5158,
+            "positive_rate_wilson_lower_95": 0.4958
+          },
+          "range_low_vol": {
+            "mean_bps": 18.0964,
+            "median_bps": 23.6538,
+            "n": 3989,
+            "positive_rate": 0.5568,
+            "positive_rate_wilson_lower_95": 0.5413
+          },
+          "range_normal_vol": {
+            "mean_bps": 3.7977,
+            "median_bps": 6.0885,
+            "n": 9195,
+            "positive_rate": 0.5129,
+            "positive_rate_wilson_lower_95": 0.5027
+          },
+          "trend_high_vol": {
+            "mean_bps": 31.0818,
+            "median_bps": 14.198,
+            "n": 632,
+            "positive_rate": 0.5301,
+            "positive_rate_wilson_lower_95": 0.4911
+          },
+          "trend_low_vol": {
+            "mean_bps": -4.2827,
+            "median_bps": 25.731,
+            "n": 209,
+            "positive_rate": 0.5885,
+            "positive_rate_wilson_lower_95": 0.5208
+          },
+          "trend_normal_vol": {
+            "mean_bps": 5.9497,
+            "median_bps": 15.6813,
+            "n": 861,
+            "positive_rate": 0.5192,
+            "positive_rate_wilson_lower_95": 0.4858
+          }
+        },
+        "sessions": {
+          "Asia": {
+            "mean_bps": 13.1373,
+            "median_bps": 20.1368,
+            "n": 5760,
+            "positive_rate": 0.5503,
+            "positive_rate_wilson_lower_95": 0.5375
+          },
+          "Europe": {
+            "mean_bps": 0.6733,
+            "median_bps": 9.0506,
+            "n": 3600,
+            "positive_rate": 0.5169,
+            "positive_rate_wilson_lower_95": 0.5006
+          },
+          "Late UTC": {
+            "mean_bps": 10.9004,
+            "median_bps": 2.6999,
+            "n": 2160,
+            "positive_rate": 0.5051,
+            "positive_rate_wilson_lower_95": 0.484
+          },
+          "US": {
+            "mean_bps": 19.849,
+            "median_bps": 8.9531,
+            "n": 2884,
+            "positive_rate": 0.5191,
+            "positive_rate_wilson_lower_95": 0.5008
+          },
+          "US-Europe overlap": {
+            "mean_bps": 3.7077,
+            "median_bps": 4.6654,
+            "n": 2888,
+            "positive_rate": 0.5069,
+            "positive_rate_wilson_lower_95": 0.4887
+          }
+        }
+      },
+      "1h": {
+        "bars": 4344,
+        "coverage": [
+          "2025-01-01T00:00:00+00:00",
+          "2025-06-30T23:00:00+00:00"
+        ],
+        "events": {
+          "breakout_follow_through_long": {
+            "mean_bps": -3.7326,
+            "median_bps": 2.8969,
+            "n": 218,
+            "positive_rate": 0.5046,
+            "positive_rate_wilson_lower_95": 0.4387
+          },
+          "breakout_follow_through_short": {
+            "mean_bps": 21.57,
+            "median_bps": 0.7618,
+            "n": 252,
+            "positive_rate": 0.504,
+            "positive_rate_wilson_lower_95": 0.4426
+          },
+          "mean_reversion_from_high": {
+            "mean_bps": -0.1869,
+            "median_bps": 3.867,
+            "n": 675,
+            "positive_rate": 0.5141,
+            "positive_rate_wilson_lower_95": 0.4764
+          },
+          "mean_reversion_from_low": {
+            "mean_bps": -2.2729,
+            "median_bps": 6.4002,
+            "n": 779,
+            "positive_rate": 0.5315,
+            "positive_rate_wilson_lower_95": 0.4963
+          },
+          "momentum_continuation_long": {
+            "mean_bps": -3.1558,
+            "median_bps": -11.4837,
+            "n": 237,
+            "positive_rate": 0.4557,
+            "positive_rate_wilson_lower_95": 0.3935
+          },
+          "momentum_continuation_short": {
+            "mean_bps": 6.4149,
+            "median_bps": 4.3253,
+            "n": 249,
+            "positive_rate": 0.5221,
+            "positive_rate_wilson_lower_95": 0.4602
+          },
+          "pullback_continuation_long": {
+            "mean_bps": -162.1881,
+            "median_bps": -117.1158,
+            "n": 12,
+            "positive_rate": 0.25,
+            "positive_rate_wilson_lower_95": 0.0889
+          },
+          "pullback_continuation_short": {
+            "mean_bps": -25.1078,
+            "median_bps": 52.2051,
+            "n": 7,
+            "positive_rate": 0.5714,
+            "positive_rate_wilson_lower_95": 0.2505
+          },
+          "trend_persistence_long": {
+            "mean_bps": -20.0623,
+            "median_bps": -30.1356,
+            "n": 237,
+            "positive_rate": 0.4304,
+            "positive_rate_wilson_lower_95": 0.3689
+          },
+          "trend_persistence_short": {
+            "mean_bps": 24.121,
+            "median_bps": 16.9526,
+            "n": 249,
+            "positive_rate": 0.5301,
+            "positive_rate_wilson_lower_95": 0.4681
+          },
+          "volatility_contraction_abs_move": {
+            "mean_bps": 160.8575,
+            "median_bps": 113.8621,
+            "n": 1135,
+            "positive_rate": 0.9965,
+            "positive_rate_wilson_lower_95": 0.991
+          },
+          "volatility_expansion_abs_move": {
+            "mean_bps": 219.8494,
+            "median_bps": 158.0649,
+            "n": 768,
+            "positive_rate": 1.0,
+            "positive_rate_wilson_lower_95": 0.995
+          }
+        },
+        "false_breakout_frequency": {
+          "long": {
+            "n": 218,
+            "rate": 0.3073
+          },
+          "short": {
+            "n": 252,
+            "rate": 0.2976
+          }
+        },
+        "horizons": {
+          "one_hour_bars": 1,
+          "six_hour_bars": 6
+        },
+        "regime_persistence": {
+          "range_high_vol": {
+            "n": 580,
+            "same_regime_rate": 0.4241
+          },
+          "range_low_vol": {
+            "n": 1065,
+            "same_regime_rate": 0.5155
+          },
+          "range_normal_vol": {
+            "n": 2147,
+            "same_regime_rate": 0.5994
+          },
+          "trend_high_vol": {
+            "n": 188,
+            "same_regime_rate": 0.3245
+          },
+          "trend_low_vol": {
+            "n": 70,
+            "same_regime_rate": 0.0143
+          },
+          "trend_normal_vol": {
+            "n": 228,
+            "same_regime_rate": 0.2018
+          }
+        },
+        "regimes": {
+          "range_high_vol": {
+            "mean_bps": 10.5573,
+            "median_bps": -12.0675,
+            "n": 580,
+            "positive_rate": 0.4828,
+            "positive_rate_wilson_lower_95": 0.4423
+          },
+          "range_low_vol": {
+            "mean_bps": -3.3338,
+            "median_bps": -9.3928,
+            "n": 1065,
+            "positive_rate": 0.4732,
+            "positive_rate_wilson_lower_95": 0.4434
+          },
+          "range_normal_vol": {
+            "mean_bps": -4.1285,
+            "median_bps": -17.5997,
+            "n": 2147,
+            "positive_rate": 0.4611,
+            "positive_rate_wilson_lower_95": 0.4401
+          },
+          "trend_high_vol": {
+            "mean_bps": 24.0489,
+            "median_bps": 3.1998,
+            "n": 188,
+            "positive_rate": 0.5,
+            "positive_rate_wilson_lower_95": 0.4292
+          },
+          "trend_low_vol": {
+            "mean_bps": -25.9567,
+            "median_bps": -12.7115,
+            "n": 70,
+            "positive_rate": 0.4714,
+            "positive_rate_wilson_lower_95": 0.359
+          },
+          "trend_normal_vol": {
+            "mean_bps": -6.3722,
+            "median_bps": -13.574,
+            "n": 228,
+            "positive_rate": 0.4693,
+            "positive_rate_wilson_lower_95": 0.4056
+          }
+        },
+        "sessions": {
+          "Asia": {
+            "mean_bps": 10.9347,
+            "median_bps": 9.5041,
+            "n": 1424,
+            "positive_rate": 0.5239,
+            "positive_rate_wilson_lower_95": 0.4979
+          },
+          "Europe": {
+            "mean_bps": -0.67,
+            "median_bps": -14.1611,
+            "n": 891,
+            "positive_rate": 0.4792,
+            "positive_rate_wilson_lower_95": 0.4466
+          },
+          "Late UTC": {
+            "mean_bps": -23.0286,
+            "median_bps": -59.5765,
+            "n": 534,
+            "positive_rate": 0.3895,
+            "positive_rate_wilson_lower_95": 0.3491
+          },
+          "US": {
+            "mean_bps": -20.8719,
+            "median_bps": -30.3549,
+            "n": 713,
+            "positive_rate": 0.425,
+            "positive_rate_wilson_lower_95": 0.3892
+          },
+          "US-Europe overlap": {
+            "mean_bps": 10.0073,
+            "median_bps": -17.6241,
+            "n": 716,
+            "positive_rate": 0.4525,
+            "positive_rate_wilson_lower_95": 0.4164
+          }
+        }
+      },
+      "5m": {
+        "bars": 52128,
+        "coverage": [
+          "2025-01-01T00:00:00+00:00",
+          "2025-06-30T23:55:00+00:00"
+        ],
+        "events": {
+          "breakout_follow_through_long": {
+            "mean_bps": -5.3945,
+            "median_bps": -7.396,
+            "n": 3089,
+            "positive_rate": 0.484,
+            "positive_rate_wilson_lower_95": 0.4664
+          },
+          "breakout_follow_through_short": {
+            "mean_bps": -5.068,
+            "median_bps": 5.3511,
+            "n": 3080,
+            "positive_rate": 0.5094,
+            "positive_rate_wilson_lower_95": 0.4918
+          },
+          "mean_reversion_from_high": {
+            "mean_bps": 0.6843,
+            "median_bps": 2.304,
+            "n": 8575,
+            "positive_rate": 0.5142,
+            "positive_rate_wilson_lower_95": 0.5036
+          },
+          "mean_reversion_from_low": {
+            "mean_bps": -1.3485,
+            "median_bps": 0.501,
+            "n": 8758,
+            "positive_rate": 0.5003,
+            "positive_rate_wilson_lower_95": 0.4899
+          },
+          "momentum_continuation_long": {
+            "mean_bps": -5.7464,
+            "median_bps": -4.4799,
+            "n": 2247,
+            "positive_rate": 0.4731,
+            "positive_rate_wilson_lower_95": 0.4525
+          },
+          "momentum_continuation_short": {
+            "mean_bps": 9.414,
+            "median_bps": 2.9963,
+            "n": 2442,
+            "positive_rate": 0.5143,
+            "positive_rate_wilson_lower_95": 0.4945
+          },
+          "pullback_continuation_long": {
+            "mean_bps": 26.1483,
+            "median_bps": 30.3552,
+            "n": 96,
+            "positive_rate": 0.5625,
+            "positive_rate_wilson_lower_95": 0.4628
+          },
+          "pullback_continuation_short": {
+            "mean_bps": 1.5689,
+            "median_bps": -14.6153,
+            "n": 110,
+            "positive_rate": 0.4818,
+            "positive_rate_wilson_lower_95": 0.3906
+          },
+          "trend_persistence_long": {
+            "mean_bps": -6.3725,
+            "median_bps": 7.1446,
+            "n": 2247,
+            "positive_rate": 0.5127,
+            "positive_rate_wilson_lower_95": 0.492
+          },
+          "trend_persistence_short": {
+            "mean_bps": 10.0515,
+            "median_bps": -3.2894,
+            "n": 2442,
+            "positive_rate": 0.4922,
+            "positive_rate_wilson_lower_95": 0.4724
+          },
+          "volatility_contraction_abs_move": {
+            "mean_bps": 177.249,
+            "median_bps": 129.6639,
+            "n": 10363,
+            "positive_rate": 0.9989,
+            "positive_rate_wilson_lower_95": 0.9981
+          },
+          "volatility_expansion_abs_move": {
+            "mean_bps": 197.0692,
+            "median_bps": 138.9004,
+            "n": 7415,
+            "positive_rate": 0.9985,
+            "positive_rate_wilson_lower_95": 0.9973
+          }
+        },
+        "false_breakout_frequency": {
+          "long": {
+            "n": 3089,
+            "rate": 0.4412
+          },
+          "short": {
+            "n": 3080,
+            "rate": 0.4425
+          }
+        },
+        "horizons": {
+          "one_hour_bars": 12,
+          "six_hour_bars": 72
+        },
+        "regime_persistence": {
+          "range_high_vol": {
+            "n": 5873,
+            "same_regime_rate": 0.1223
+          },
+          "range_low_vol": {
+            "n": 9860,
+            "same_regime_rate": 0.2042
+          },
+          "range_normal_vol": {
+            "n": 31574,
+            "same_regime_rate": 0.611
+          },
+          "trend_high_vol": {
+            "n": 1542,
+            "same_regime_rate": 0.0298
+          },
+          "trend_low_vol": {
+            "n": 503,
+            "same_regime_rate": 0.0199
+          },
+          "trend_normal_vol": {
+            "n": 2644,
+            "same_regime_rate": 0.0431
+          }
+        },
+        "regimes": {
+          "range_high_vol": {
+            "mean_bps": 15.2786,
+            "median_bps": 8.4357,
+            "n": 5873,
+            "positive_rate": 0.519,
+            "positive_rate_wilson_lower_95": 0.5062
+          },
+          "range_low_vol": {
+            "mean_bps": 11.8648,
+            "median_bps": 11.3206,
+            "n": 9860,
+            "positive_rate": 0.5218,
+            "positive_rate_wilson_lower_95": 0.5119
+          },
+          "range_normal_vol": {
+            "mean_bps": 0.9522,
+            "median_bps": 5.589,
+            "n": 31574,
+            "positive_rate": 0.5108,
+            "positive_rate_wilson_lower_95": 0.5053
+          },
+          "trend_high_vol": {
+            "mean_bps": 6.9426,
+            "median_bps": 0.711,
+            "n": 1542,
+            "positive_rate": 0.5006,
+            "positive_rate_wilson_lower_95": 0.4757
+          },
+          "trend_low_vol": {
+            "mean_bps": -0.7002,
+            "median_bps": 13.3262,
+            "n": 503,
+            "positive_rate": 0.5348,
+            "positive_rate_wilson_lower_95": 0.4911
+          },
+          "trend_normal_vol": {
+            "mean_bps": -0.0479,
+            "median_bps": -0.9502,
+            "n": 2644,
+            "positive_rate": 0.4966,
+            "positive_rate_wilson_lower_95": 0.4776
+          }
+        },
+        "sessions": {
+          "Asia": {
+            "mean_bps": 5.1601,
+            "median_bps": 10.9932,
+            "n": 17316,
+            "positive_rate": 0.5251,
+            "positive_rate_wilson_lower_95": 0.5176
+          },
+          "Europe": {
+            "mean_bps": 3.4497,
+            "median_bps": 8.6013,
+            "n": 10860,
+            "positive_rate": 0.5166,
+            "positive_rate_wilson_lower_95": 0.5072
+          },
+          "Late UTC": {
+            "mean_bps": 10.0089,
+            "median_bps": -3.5524,
+            "n": 6480,
+            "positive_rate": 0.4935,
+            "positive_rate_wilson_lower_95": 0.4814
+          },
+          "US": {
+            "mean_bps": 3.6181,
+            "median_bps": 5.3195,
+            "n": 8652,
+            "positive_rate": 0.5106,
+            "positive_rate_wilson_lower_95": 0.5001
+          },
+          "US-Europe overlap": {
+            "mean_bps": 2.7661,
+            "median_bps": 0.9779,
+            "n": 8688,
+            "positive_rate": 0.5014,
+            "positive_rate_wilson_lower_95": 0.4909
+          }
+        }
+      }
+    }
+  }
+}

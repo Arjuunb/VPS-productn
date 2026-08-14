@@ -1215,6 +1215,7 @@ import routers.ai  # noqa: E402
 import routers.grid  # noqa: E402
 import routers.market_data  # noqa: E402
 import routers.instances  # noqa: E402
+import routers.forward_validation  # noqa: E402
 router.include_router(routers.analytics.router)
 router.include_router(routers.bots.router)
 router.include_router(routers.engine.router)
@@ -1229,6 +1230,7 @@ router.include_router(routers.ai.router)
 router.include_router(routers.grid.router)
 router.include_router(routers.market_data.router)
 router.include_router(routers.instances.router)
+router.include_router(routers.forward_validation.router)
 
 
 # ───────────────────────────── server-side grid (paper, 24/7) ─────────────────
