@@ -34,6 +34,8 @@ interface Props {
   state: NativeSMCChartState;
   /** The user-selected chart timeframe. Used only for display-range scaling. */
   timeframe?: string;
+  /** Empty chart slots after the latest candle, for live-chart positioning. */
+  rightOffsetBars?: number;
   filters: NativeSMCOverlayFilters;
   selectedObjectId?: string;
   onCandleSelect: (timestamp: string) => void;
@@ -52,6 +54,11 @@ const timestamp = (value: string) => value.replace("T", " ").replace("+00:00", "
 const DISPLAY_RANGE_BARS: Record<string, number> = {
   "1m": 180, "3m": 160, "5m": 144, "30m": 96,
   "1h": 72, "4h": 60, "1d": 60, "1w": 52,
+};
+
+const TIMEFRAME_MS: Record<string, number> = {
+  "1m": 60_000, "3m": 3 * 60_000, "5m": 5 * 60_000, "30m": 30 * 60_000,
+  "1h": 60 * 60_000, "4h": 4 * 60 * 60_000, "1d": 24 * 60 * 60_000, "1w": 7 * 24 * 60 * 60_000,
 };
 
 export interface DisplayDealingRange {
@@ -78,17 +85,26 @@ export function timeframeDisplayRange(candles: NativeCandle[], timeframe = "5m",
   return { high, low, equilibrium: (high + low) / 2, start: rangeCandles[0].timestamp, end: rangeCandles[rangeCandles.length - 1].timestamp, bars: rangeCandles.length };
 }
 
-function chartOption(state: NativeSMCChartState, timeframe: string, filters: NativeSMCOverlayFilters, selectedObjectId?: string, lightMode = false): EChartsOption {
+function futureChartSlots(lastTimestamp: string | undefined, timeframe: string, count: number): string[] {
+  const start = lastTimestamp ? Date.parse(lastTimestamp) : Number.NaN;
+  const step = TIMEFRAME_MS[timeframe] ?? TIMEFRAME_MS["5m"];
+  if (!Number.isFinite(start) || count <= 0) return [];
+  return Array.from({ length: count }, (_, index) => new Date(start + step * (index + 1)).toISOString());
+}
+
+function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetBars: number, filters: NativeSMCOverlayFilters, selectedObjectId?: string, lightMode = false): EChartsOption {
   const closedCandles = state.candles;
   // The display candle intentionally remains outside the native model's
   // snapshots. It makes the chart feel live without turning an unclosed bar
   // into market-structure evidence.
   const hasFormingCandle = Boolean(state.forming_candle);
   const candles = hasFormingCandle ? [...closedCandles, state.forming_candle!] : closedCandles;
-  const labels = candles.map((row) => row.timestamp);
-  const labelSet = new Set(labels);
-  const first = labels[0];
-  const last = labels[labels.length - 1];
+  const candleLabels = candles.map((row) => row.timestamp);
+  const futureSlots = futureChartSlots(candleLabels[candleLabels.length - 1], timeframe, rightOffsetBars);
+  const labels = [...candleLabels, ...futureSlots];
+  const labelSet = new Set(candleLabels);
+  const first = candleLabels[0];
+  const last = candleLabels[candleLabels.length - 1];
   const selectedSnapshot = state.selected_snapshot ?? state.snapshot;
   // Do not reuse snapshot.dealing_range here: it is intentionally calculated
   // from the full engine history for native-state evidence. The chart overlay
@@ -186,19 +202,19 @@ function chartOption(state: NativeSMCChartState, timeframe: string, filters: Nat
       { id: "smc-volume-y", gridIndex: 1, position: "right", axisLabel: { color: text, fontSize: 10 }, splitLine: { show: false } },
     ],
     dataZoom: [
-      // TradingView-like interaction: wheel zooms, but simply moving the
-      // pointer never pans or shifts the visible window.
-      { id: "smc-inside-zoom", type: "inside", xAxisIndex: [0, 1], zoomOnMouseWheel: true, moveOnMouseMove: false, moveOnMouseWheel: false },
+      // Drag-pan only activates while the pointer is pressed; ordinary hover
+      // continues to be a stable crosshair inspection action.
+      { id: "smc-inside-zoom", type: "inside", xAxisIndex: [0, 1], zoomOnMouseWheel: true, moveOnMouseMove: true, moveOnMouseWheel: false, preventDefaultMouseMove: true, cursorGrab: "grab", cursorGrabbing: "grabbing" },
       { id: "smc-slider-zoom", type: "slider", xAxisIndex: [0, 1], bottom: "2%", height: 16, borderColor: axis, fillerColor: "rgba(105,185,255,.14)", handleStyle: { color: "#69b9ff" }, textStyle: { color: text } },
     ],
     series: [
       {
         id: "smc-candles", type: "candlestick", name: "Market candles", xAxisIndex: 0, yAxisIndex: 0,
-        data: candles.map((row, index) => ({
+        data: [...candles.map((row, index) => ({
           value: [row.open, row.close, row.low, row.high],
           forming: hasFormingCandle && index === candles.length - 1,
           itemStyle: hasFormingCandle && index === candles.length - 1 ? { opacity: 0.78, borderWidth: 2 } : undefined,
-        })), barMaxWidth: 18,
+        })), ...futureSlots.map(() => "-")], barMaxWidth: 18,
         itemStyle: { color: "#089981", color0: "#f23645", borderColor: "#089981", borderColor0: "#f23645" },
         markArea: { silent: true, label: { color: "#bac4d5", fontSize: 10 }, data: [...rangeAreas, ...fvgAreas, ...obAreas] },
         markLine: { silent: true, symbol: "none", label: { color: "#cfd6e4", fontSize: 10 }, data: [
@@ -211,15 +227,15 @@ function chartOption(state: NativeSMCChartState, timeframe: string, filters: Nat
           ...proposalLines,
         ] },
       },
-      { id: "smc-volume", type: "bar", name: "Volume", xAxisIndex: 1, yAxisIndex: 1, data: candles.map((row, index) => ({ value: row.volume, itemStyle: { color: row.close >= row.open ? "rgba(8,153,129,.70)" : "rgba(242,54,69,.70)", opacity: hasFormingCandle && index === candles.length - 1 ? 0.72 : 1 } })), barMaxWidth: 18 },
+      { id: "smc-volume", type: "bar", name: "Volume", xAxisIndex: 1, yAxisIndex: 1, data: [...candles.map((row, index) => ({ value: row.volume, itemStyle: { color: row.close >= row.open ? "rgba(8,153,129,.70)" : "rgba(242,54,69,.70)", opacity: hasFormingCandle && index === candles.length - 1 ? 0.72 : 1 } })), ...futureSlots.map(() => "-")], barMaxWidth: 18 },
       { id: "smc-pivots", type: "scatter", name: "Native pivots", xAxisIndex: 0, yAxisIndex: 0, data: pivotData as any[], symbolSize: 8, label: { show: filters.labels, formatter: (row: any) => row.data.name, color: "#d7deea", fontSize: 9, position: "top" }, z: 8 },
       { id: "smc-structure", type: "scatter", name: "Native structure", xAxisIndex: 0, yAxisIndex: 0, data: structureData as any[], symbol: "diamond", symbolSize: 11, label: { show: filters.labels, formatter: (row: any) => row.data.name, color: "#d7deea", fontSize: 9, position: "bottom" }, z: 9 },
     ],
   } as EChartsOption;
 }
 
-export default function NativeSMCChartOverlay({ state, timeframe = "5m", filters, selectedObjectId, onCandleSelect, fitContentSignal, lightMode = false, height = 700 }: Props) {
-  const option = useMemo(() => chartOption(state, timeframe, filters, selectedObjectId, lightMode), [state, timeframe, filters, selectedObjectId, lightMode]);
+export default function NativeSMCChartOverlay({ state, timeframe = "5m", rightOffsetBars = 12, filters, selectedObjectId, onCandleSelect, fitContentSignal, lightMode = false, height = 700 }: Props) {
+  const option = useMemo(() => chartOption(state, timeframe, rightOffsetBars, filters, selectedObjectId, lightMode), [state, timeframe, rightOffsetBars, filters, selectedObjectId, lightMode]);
   const events = useMemo(() => ({
     click: (event: any) => {
       if (event?.seriesName !== "Market candles" || typeof event.dataIndex !== "number") return;
