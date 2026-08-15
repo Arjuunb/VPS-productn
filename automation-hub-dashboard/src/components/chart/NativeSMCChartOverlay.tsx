@@ -34,6 +34,7 @@ interface Props {
   onCandleSelect: (timestamp: string) => void;
   fitContentSignal: number;
   lightMode?: boolean;
+  height?: number | string;
 }
 
 const shortId = (id: string) => `${id.slice(0, 10)}…`;
@@ -151,7 +152,7 @@ function chartOption(state: NativeSMCChartState, filters: NativeSMCOverlayFilter
   } as EChartsOption;
 }
 
-export default function NativeSMCChartOverlay({ state, filters, selectedObjectId, onCandleSelect, fitContentSignal, lightMode = false }: Props) {
+export default function NativeSMCChartOverlay({ state, filters, selectedObjectId, onCandleSelect, fitContentSignal, lightMode = false, height = 700 }: Props) {
   const option = useMemo(() => chartOption(state, filters, selectedObjectId, lightMode), [state, filters, selectedObjectId, lightMode]);
   const events = useMemo(() => ({
     click: (event: any) => {
@@ -160,5 +161,5 @@ export default function NativeSMCChartOverlay({ state, filters, selectedObjectId
       if (candle) onCandleSelect(candle.timestamp);
     },
   }), [onCandleSelect, state.candles]);
-  return <EChart option={option} height={700} onEvents={events} preserveInteraction fitContentSignal={fitContentSignal} style={{ borderRadius: 8 }} />;
+  return <EChart option={option} height={height} onEvents={events} preserveInteraction fitContentSignal={fitContentSignal} style={{ borderRadius: 8 }} />;
 }

@@ -2,6 +2,7 @@
 import hashlib
 from dataclasses import asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException
@@ -11,6 +12,7 @@ from services.native_smc_visual_verification import deterministic_review_sample
 
 router = APIRouter(prefix="/research/smc", tags=["research-smc"])
 reviews = VisualReviewLedger()
+_REFERENCE_PINE_PATH = Path(__file__).resolve().parents[1] / "research_references" / "smc_pro_v2_reference.pine"
 
 
 class VisualReviewInput(BaseModel):
@@ -45,6 +47,28 @@ def state(symbol: str = "BTCUSDT", timeframe: str = "5m", at: str | None = None,
 def chart(symbol: str = "BTCUSDT", timeframe: str = "5m", at: str | None = None, window: int = 400):
     """Chart contract made only from native engine objects and raw candles."""
     return research_engine(symbol, timeframe).visual_state(candle_at=_at_timestamp(at), candle_window=window)
+
+
+@router.get("/pine-reference")
+def pine_reference():
+    """Return the immutable reference source for visual comparison only.
+
+    The reference is deliberately not compiled, evaluated, or wired into the
+    native model.  Its status remains a parity-audit artefact, never execution
+    authority.
+    """
+    if not _REFERENCE_PINE_PATH.is_file():
+        raise HTTPException(503, "Native SMC Pine reference is unavailable in this deployment")
+    content = _REFERENCE_PINE_PATH.read_text(encoding="utf-8")
+    return {
+        "reference_id": "SMC_PRO_V2_REFERENCE",
+        "status": "PARITY_AUDIT",
+        "language": "pine",
+        "sha256": hashlib.sha256(content.encode()).hexdigest(),
+        "execution_allowed": False,
+        "notice": "Reference source only. It is not executed by TradeLogX and native SMC parity is not yet claimed.",
+        "content": content,
+    }
 
 
 @router.get("/review-sample")

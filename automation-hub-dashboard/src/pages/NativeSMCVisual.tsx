@@ -14,6 +14,7 @@ interface ReviewSampleItem { object_id: string; category: string; timestamp: str
 interface ReviewSampleResponse { sample: ReviewSampleItem[] }
 interface Review { id: string; object_id: string; component: string; classification: ReviewClassification; reason?: string | null; notes?: string | null; selected_candle_timestamp?: string | null }
 interface ReviewsResponse { reviews: Review[] }
+interface PineReference { reference_id: string; status: string; language: string; sha256: string; execution_allowed: false; notice: string; content: string }
 
 const defaultFilters: NativeSMCOverlayFilters = { pivots: true, internal: true, swing: true, structure: true, liquidity: true, fvg: true, orderBlocks: true, mitigated: true, labels: true };
 const shortId = (id?: string | null) => id ? `${id.slice(0, 10)}…` : "—";
@@ -67,6 +68,15 @@ function CandleInspector({ candle, snapshot, data }: { candle?: NativeCandle; sn
   </Card>;
 }
 
+function PineReferencePanel({ reference, error }: { reference: PineReference | null; error: string | null }) {
+  if (error) return <div className="instance-risk-notice red">{error}</div>;
+  if (!reference) return <EmptyState text="Loading the immutable Pine reference…" />;
+  return <Card title="Pine reference source" subtitle={`${reference.reference_id} · ${reference.status} · SHA-256 ${reference.sha256.slice(0, 12)}…`}>
+    <div className="instance-risk-notice amber"><b>Reference only — not executed.</b> {reference.notice}</div>
+    <pre aria-label="Read-only Pine reference source" style={{ margin: "12px 0 0", maxHeight: "calc(100vh - 300px)", minHeight: 560, overflow: "auto", padding: 16, borderRadius: 8, background: "#0a0c10", border: "1px solid var(--border)", color: "#d8deea", fontSize: 12, lineHeight: 1.55, whiteSpace: "pre" }}>{reference.content}</pre>
+  </Card>;
+}
+
 export default function NativeSMCVisualPage() {
   const [symbol, setSymbol] = useState("BTCUSDT");
   const [timeframe, setTimeframe] = useState("5m");
@@ -75,6 +85,7 @@ export default function NativeSMCVisualPage() {
   const [jumpValue, setJumpValue] = useState("");
   const [filters, setFilters] = useState(defaultFilters);
   const [lightChart, setLightChart] = useState(false);
+  const [workspace, setWorkspace] = useState<"chart" | "pine">("chart");
   const [fitSignal, setFitSignal] = useState(0);
   const [classification, setClassification] = useState<ReviewClassification>("CORRECT");
   const [reason, setReason] = useState("");
@@ -88,6 +99,7 @@ export default function NativeSMCVisualPage() {
   const focusedAt = selectedCandle || selectedSample?.timestamp || "";
   const state = useLive<NativeState>(`/research/smc/chart?symbol=${symbol}&timeframe=${timeframe}&window=800${focusedAt ? `&at=${encodeURIComponent(focusedAt)}` : ""}`, 5_000);
   const reviews = useLive<ReviewsResponse>(`/research/smc/reviews?symbol=${symbol}&timeframe=${timeframe}`, 15_000);
+  const pineReference = useLive<PineReference>("/research/smc/pine-reference", 600_000);
   const data = state.data;
   const reviewItems = sample.data?.sample ?? [];
   const reviewIndex = Math.max(0, reviewItems.findIndex((row) => row.object_id === (selectedId || selectedSample?.object_id)));
@@ -131,7 +143,13 @@ export default function NativeSMCVisualPage() {
     <PageHeader title="Native SMC Visual Lab" subtitle="TradingView-style native structure verification · closed exchange candles only"
       actions={<><Badge text="SMC_NATIVE_V1_RESEARCH" tone="purple" /> <Badge text="EXECUTION DISABLED" tone="red" /></>} />
     <div className="instance-risk-notice amber" role="status"><b>Research visualisation only.</b> The browser renders backend objects; it cannot calculate SMC, create signals, or place paper/live orders.</div>
-    <Card title="Compare mode" subtitle="jump, inspect, pan and zoom without changing native state">
+    <Card title="Research workspace" subtitle="native chart objects and the immutable Pine reference are deliberately separate">
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
+        <button className={`btn ${workspace === "chart" ? "btn-primary" : "btn-soft"}`} type="button" onClick={() => setWorkspace("chart")}>Chart workspace</button>
+        <button className={`btn ${workspace === "pine" ? "btn-primary" : "btn-soft"}`} type="button" onClick={() => setWorkspace("pine")}>Pine reference</button>
+        <span className="dim" style={{ padding: "7px 2px", fontSize: 11 }}>The chart renders native closed-candle state; Pine is shown read-only for side-by-side review.</span>
+      </div>
+      {workspace === "chart" ? <>
       <div className="form-grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", alignItems: "end" }}>
         <Field label="Symbol"><select value={symbol} onChange={(event) => switchDataset(event.target.value)}><option>BTCUSDT</option><option>ETHUSDT</option><option>SOLUSDT</option></select></Field>
         <Field label="Timeframe"><select value={timeframe} onChange={(event) => switchDataset(symbol, event.target.value)}><option>5m</option><option>15m</option><option>1h</option></select></Field>
@@ -145,11 +163,12 @@ export default function NativeSMCVisualPage() {
         {([ ["Pivots", "pivots"], ["Internal", "internal"], ["Swing", "swing"], ["Structure", "structure"], ["Liquidity", "liquidity"], ["FVG", "fvg"], ["Order blocks", "orderBlocks"], ["Mitigated", "mitigated"], ["Labels", "labels"] ] as [string, keyof NativeSMCOverlayFilters][]).map(([label, key]) => <Toggle key={key} label={label} enabled={filters[key]} onClick={() => setFilter(key)} />)}
         <Toggle label="Light chart" enabled={lightChart} onClick={() => setLightChart((value) => !value)} />
       </div>
+      </> : <PineReferencePanel reference={pineReference.data} error={pineReference.error} />}
     </Card>
-    {state.error ? <div className="instance-risk-notice red">{state.error}</div> : !data?.candles.length ? <EmptyState text="No verified closed-candle checkpoint is attached. Configure HUB_SMC_VISUAL_CHECKPOINT_PATH before reviewing native SMC." /> : <>
+    {workspace === "chart" && (state.error ? <div className="instance-risk-notice red">{state.error}</div> : !data?.candles.length ? <EmptyState text="No verified closed-candle checkpoint is attached. Configure HUB_SMC_VISUAL_CHECKPOINT_PATH before reviewing native SMC." /> : <>
       <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(300px, 360px)", gap: 14, alignItems: "start" }}>
-        <Card title="Native SMC chart" subtitle={`closed OHLCV · ${data.candles.length} loaded candles · mouse wheel zoom · drag to pan`}>
-          <NativeSMCChartOverlay state={data} filters={filters} selectedObjectId={selectedObjectId} onCandleSelect={onSelectCandle} fitContentSignal={fitSignal} lightMode={lightChart} />
+        <Card title="Nexus SMC chart" subtitle={`native closed OHLCV · ${data.candles.length} candles · crosshair · wheel zoom · drag pan`}>
+          <NativeSMCChartOverlay state={data} filters={filters} selectedObjectId={selectedObjectId} onCandleSelect={onSelectCandle} fitContentSignal={fitSignal} lightMode={lightChart} height="min(76vh, 860px)" />
           <div className="risk-list terminal" style={{ marginTop: 8 }}><div className="risk-item"><span>Selected OHLC</span><b>{selectedRow ? `O ${selectedRow.open} · H ${selectedRow.high} · L ${selectedRow.low} · C ${selectedRow.close} · V ${selectedRow.volume}` : "Click a candle"}</b></div></div>
         </Card>
         <div style={{ display: "grid", gap: 14 }}>
@@ -176,6 +195,6 @@ export default function NativeSMCVisualPage() {
         {reviewError ? <div className="instance-risk-notice red" role="alert" style={{ marginTop: 10 }}>{reviewError}</div> : null}
         <div className="tablewrap" style={{ marginTop: 14 }}><table className="data-table"><thead><tr><th>Object</th><th>Classification</th><th>Selected candle</th><th>Reason</th></tr></thead><tbody>{(reviews.data?.reviews ?? []).map((row) => <tr key={row.id}><td><code>{shortId(row.object_id)}</code></td><td><Badge text={row.classification} tone={row.classification === "CORRECT" ? "green" : row.classification === "INCORRECT" ? "red" : "amber"} /></td><td>{at(row.selected_candle_timestamp)}</td><td className="dim">{row.reason ?? row.notes ?? "—"}</td></tr>)}{!reviews.data?.reviews.length ? <tr><td colSpan={4} className="dim ta-center">No human classifications recorded.</td></tr> : null}</tbody></table></div>
       </Card>
-    </>}
+    </>)}
   </>;
 }
