@@ -1,0 +1,13 @@
+{
+  "id": "SMC_NATIVE_V1_RESEARCH",
+  "status": "NATIVE_ENGINE_BUILD",
+  "execution_allowed": false,
+  "source_of_truth": "services/native_smc.py",
+  "pine_reference": "research_references/smc_pro_v2_reference.pine",
+  "default_config": {"timeframe": "5m", "htf_minutes": 240, "internal_pivot_length": 5, "swing_pivot_length": 50, "sweep_lookback": 10, "atr_length": 14, "atr_multiplier": 1.5, "rr_ratio": 2.5, "wick_multiplier": 2.0, "structure_break_atr_mult": 0.3, "poi_atr_buffer_mult": 0.8, "setup_expiry_bars": 10, "require_volume_surge": true},
+  "data_contract": "closed provider candles only; data.forward_market_data.valid_closed_bars",
+  "endpoints": ["GET /research/smc/state", "GET /research/smc/chart", "GET /research/smc/setups", "GET /research/smc/setups/{id}", "GET /research/smc/events", "GET /research/smc/reviews", "POST /research/smc/reviews"],
+  "roadmap": ["NATIVE_ENGINE_BUILD", "VISUAL_STATE_VERIFICATION", "HUMAN_BOT_PARITY", "TRAIN_RESEARCH", "VALIDATION", "UNTOUCHED_TEST", "FORWARD_PAPER", "LIVE_READINESS"],
+  "known_differences_from_pine": ["No TradingView/webhook dependency", "UI display toggles never alter native state", "Native FVG baseline does not use Pine's chart-history-dependent auto-threshold", "Ordered setup state machine rejects unrelated recent-event combinations"],
+  "performance_research": "NOT_RUN"
+}

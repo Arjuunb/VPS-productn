@@ -1,0 +1,13 @@
+{
+  "research_family": "SMC_PRO_V1_RESEARCH",
+  "status": "PARITY_AUDIT",
+  "execution_allowed": false,
+  "pine_reference": {"path": "automation-hub/research_references/smc_pro_v2_reference.pine", "version": "6", "strategy_name": "Smart Money Concepts Master [PRO STRATEGY v2]", "sha256": "95ec2874dd52abba0d26088d1fbce6208f73ed747a885b0dc0ca89fc0fb33e8c"},
+  "python_reference": {"path": "automation-hub/strategies/research_smc_pro.py", "sha256": "a18a2dd4ff1ea23c46009a39984e98526964fe472008119929d7c96ab7a953a3"},
+  "instrumentation_reference": {"path": "automation-hub/research_references/instrumentation/smc_pro_v2_parity_export_only.pine", "sha256": "0390fab58121d75a0b80443243499c5723d2ef65ee05162915f37bb366dc1943", "trade_webhooks_disabled": true, "parity_alerts_confirmed_realtime_only": true},
+  "variants": ["SMC_PRO_CORE_V1", "SMC_PRO_GATED_V1"],
+  "frozen_baseline_parameters": {"internal_length": 5, "swing_length": 50, "atr_length": 14, "stop_atr_mult": 1.5, "rr_ratio": 2.5, "sweep_lookback": 10, "choch_lookback": 8, "fvg_lookback": 5, "poi_atr_buffer_mult": 0.8, "wick_multiplier": 2.0, "killzone": "0700-1100,1300-1600 Europe/London", "htf": "240 / close[1] and EMA(50)[1]"},
+  "parity": {"status": "BLOCKED", "reason": "A trustworthy TradingView closed-bar event export has not been supplied. No synthetic fixture may establish Pine parity.", "required_fields": ["timestamp", "htf_bias", "swing_bias", "internal_bias", "sweep_high", "sweep_low", "bos", "choch", "bullish_fvg", "bearish_fvg", "near_bull_ob", "near_bear_ob", "bullish_rejection", "bearish_rejection", "longCondition", "shortCondition", "tradeReadyCondition"]},
+  "datasets": {"train": "SEALED_PENDING_PROTOCOL", "validation": "SEALED", "untouched_test": "SEALED"},
+  "performance": "NOT_RUN"
+}

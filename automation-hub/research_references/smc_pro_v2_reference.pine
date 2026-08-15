@@ -1,0 +1,997 @@
+//@version=6
+//KYROS dashboard
+// REFINED v2.1 - Applied critical fixes: #1 dead arrays, #2 pool sizing, #3 sweep logic,
+//                #6 OB storage/display decoupling, #8 no-repaint structure gate, #11 ATR na guard
+strategy("Smart Money Concepts Master [PRO STRATEGY v2]", "SMC PRO v2", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, max_labels_count=500, max_lines_count=500, max_boxes_count=500, calc_on_every_tick=false, process_orders_on_close=true, margin_long=0, margin_short=0)
+
+// ========================================================================= //
+// CONSTANTS & INPUTS
+// ========================================================================= //
+BULLISH_LEG = 1
+BEARISH_LEG = 0
+BULLISH = 1
+BEARISH = -1
+
+GREEN = #089981
+RED = #F23645
+GRAY = #878b94
+ALL = "All"
+BOS = "BOS"
+CHOCH = "CHoCH"
+TINY = size.tiny
+SMALL = size.small
+NORMAL = size.normal
+ATR = "Atr"
+RANGE = "Cumulative Mean Range"
+CLOSE = "Close"
+HIGHLOW = "High/Low"
+
+STRAT_GROUP = "PRO Strategy & Automation"
+stratAtrLen = input.int(14, title="ATR Length for SL", group=STRAT_GROUP)
+stratSlMult = input.float(1.5, title="Stop Loss ATR Multiplier", group=STRAT_GROUP, step=0.1)
+stratRrRatio = input.float(2.5, title="Risk/Reward Ratio (TP)", group=STRAT_GROUP, step=0.1)
+killzoneSession = input.session("0700-1100,1300-1600", title="Killzone Session", group=STRAT_GROUP)
+killzoneTz = input.string("Europe/London", title="Killzone Timezone", group=STRAT_GROUP, options=["Europe/London", "America/New_York", "UTC", "exchange"])
+sweepLookback = input.int(10, title="Liquidity Sweep 'Memory' (Bars)", group=STRAT_GROUP)
+chochLookback = input.int(8, title="CHoCH 'Memory' (Bars)", group=STRAT_GROUP)
+fvgLookback = input.int(5, title="FVG Entry Window (Bars)", group=STRAT_GROUP)
+confirmBarsOnly = input.bool(true, title="Only Execute on Confirmed Bars", group=STRAT_GROUP, tooltip="Strongly recommended. Prevents intrabar repaint of entries.")
+structureBreakAtrMult = input.float(0.3, "Structure Break ATR Filter", group=STRAT_GROUP, step=0.1, minval=0.0, tooltip="Close must exceed the structure level by ATR * this multiplier. Filters out micro-breaks.")
+
+PA_GROUP = "Price Action Filters"
+useRejection = input.bool(true, title="Require Rejection Candle Entry?", group=PA_GROUP)
+wickMultiplier = input.float(2.0, title="Wick-to-Body Ratio", group=PA_GROUP, step=0.5)
+
+SMART_GROUP = "Smart Money Concepts"
+INTERNAL_GROUP = "Real Time Internal Structure"
+SWING_GROUP = "Real Time Swing Structure"
+BLOCKS_GROUP = "Order Blocks"
+EQUAL_GROUP = "EQH/EQL"
+GAPS_GROUP = "Fair Value Gaps"
+ZONES_GROUP = "Premium & Discount Zones"
+DASH_GROUP = "Dashboard Settings"
+DRAW_GROUP = "Drawing & Anchoring"
+
+showTrendInput = input(false, "Color Candles", group=SMART_GROUP)
+showInternalsInput = input(true, "Show Internal Structure", group=INTERNAL_GROUP)
+internalLengthInput = input.int(5, "Internal Pivot Length", group=INTERNAL_GROUP, minval=3, maxval=25)
+showInternalBullInput = input.string(ALL, "Bullish Structure", group=INTERNAL_GROUP, inline="ibull", options=[ALL, BOS, CHOCH])
+internalBullColorInput = input(GREEN, "", group=INTERNAL_GROUP, inline="ibull")
+showInternalBearInput = input.string(ALL, "Bearish Structure", group=INTERNAL_GROUP, inline="ibear", options=[ALL, BOS, CHOCH])
+internalBearColorInput = input(RED, "", group=INTERNAL_GROUP, inline="ibear")
+internalFilterConfluenceInput = input(false, "Confluence Filter", group=INTERNAL_GROUP)
+internalStructureSize = input.string(TINY, "Internal Label Size", group=INTERNAL_GROUP, options=[TINY, SMALL, NORMAL])
+
+showStructureInput = input(true, "Show Swing Structure", group=SWING_GROUP)
+showSwingBullInput = input.string(ALL, "Bullish Structure", group=SWING_GROUP, inline="bull", options=[ALL, BOS, CHOCH])
+swingBullColorInput = input(GREEN, "", group=SWING_GROUP, inline="bull")
+showSwingBearInput = input.string(ALL, "Bearish Structure", group=SWING_GROUP, inline="bear", options=[ALL, BOS, CHOCH])
+swingBearColorInput = input(RED, "", group=SWING_GROUP, inline="bear")
+swingStructureSize = input.string(SMALL, "Swing Label Size", group=SWING_GROUP, options=[TINY, SMALL, NORMAL])
+showSwingsInput = input(false, "Show Swings Points", group=SWING_GROUP, inline="swings")
+swingsLengthInput = input.int(50, "", group=SWING_GROUP, minval=10, inline="swings")
+showHighLowSwingsInput = input(true, "Show Strong/Weak High/Low", group=SWING_GROUP)
+
+showInternalOrderBlocksInput = input(true, "Internal Order Blocks", group=BLOCKS_GROUP, inline="iob")
+internalOrderBlocksSizeInput = input.int(5, "", group=BLOCKS_GROUP, minval=1, maxval=20, inline="iob")
+showSwingOrderBlocksInput = input(false, "Swing Order Blocks", group=BLOCKS_GROUP, inline="ob")
+swingOrderBlocksSizeInput = input.int(5, "", group=BLOCKS_GROUP, minval=1, maxval=20, inline="ob")
+orderBlockFilterInput = input.string("Atr", "Order Block Filter", group=BLOCKS_GROUP, options=[ATR, RANGE])
+orderBlockMitigationInput = input.string(HIGHLOW, "Order Block Mitigation", group=BLOCKS_GROUP, options=[CLOSE, HIGHLOW])
+internalBullishOrderBlockColor = input.color(color.new(#3179f5, 80), "Internal Bullish OB", group=BLOCKS_GROUP)
+internalBearishOrderBlockColor = input.color(color.new(#f77c80, 80), "Internal Bearish OB", group=BLOCKS_GROUP)
+swingBullishOrderBlockColor = input.color(color.new(#1848cc, 80), "Bullish OB", group=BLOCKS_GROUP)
+swingBearishOrderBlockColor = input.color(color.new(#b22833, 80), "Bearish OB", group=BLOCKS_GROUP)
+
+showEqualHighsLowsInput = input(true, "Equal High/Low", group=EQUAL_GROUP)
+equalHighsLowsLengthInput = input.int(3, "Bars Confirmation", group=EQUAL_GROUP, minval=1)
+equalHighsLowsThresholdInput = input.float(0.1, "Threshold", group=EQUAL_GROUP, minval=0, maxval=0.5, step=0.1)
+equalHighsLowsSizeInput = input.string(TINY, "Label Size", group=EQUAL_GROUP, options=[TINY, SMALL, NORMAL])
+
+showFairValueGapsInput = input(true, "Fair Value Gaps", group=GAPS_GROUP)
+fairValueGapsThresholdInput = input(true, "Auto Threshold", group=GAPS_GROUP)
+fvgVolumeFilter = input.bool(true, "Filter FVG by Volume Surge", group=GAPS_GROUP)
+fairValueGapsTimeframeInput = input.timeframe("", "Timeframe", group=GAPS_GROUP)
+fairValueGapsBullColorInput = input.color(color.new(#00ff68, 70), "Bullish FVG", group=GAPS_GROUP)
+fairValueGapsBearColorInput = input.color(color.new(#ff0008, 70), "Bearish FVG", group=GAPS_GROUP)
+fairValueGapsExtendInput = input.int(1, "Extend FVG", group=GAPS_GROUP, minval=0)
+
+showPremiumDiscountZonesInput = input(true, "Premium/Discount Zones", group=ZONES_GROUP)
+premiumZoneColorInput = input.color(RED, "Premium Zone", group=ZONES_GROUP)
+equilibriumZoneColorInput = input.color(GRAY, "Equilibrium Zone", group=ZONES_GROUP)
+discountZoneColorInput = input.color(GREEN, "Discount Zone", group=ZONES_GROUP)
+
+showDashboard = input.bool(true, "Show Dashboard", group=DASH_GROUP)
+dashPosStr = input.string("Top Right", "Dashboard Position", group=DASH_GROUP, options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"])
+htfAlertTimeframe = input.timeframe("240", "HTF Bias Filter (e.g. 4H)", group=DASH_GROUP)
+poiAtrBufferMult = input.float(0.8, "POI Proximity ATR Buffer", group=DASH_GROUP, step=0.05, minval=0.05, tooltip="How close price must be to an OB/FVG to count as an active POI. 0.8 = within 80% of ATR.")
+
+zoneRightOffset = input.int(2, "Zone Right Offset (bars past current candle)", group=DRAW_GROUP, minval=0, maxval=20, tooltip="How many bars past the current candle the Premium/Discount/Equilibrium zones extend.")
+zoneLookbackBars = input.int(80, "Zone Lookback (bars)", group=DRAW_GROUP, minval=10, maxval=500, tooltip="Maximum length of the Premium/Discount/Equilibrium zones to the left.")
+labelRightOffset = input.int(2, "Label Right Offset (bars)", group=DRAW_GROUP, minval=0, maxval=20, tooltip="How many bars past the current candle Strong/Weak High/Low labels sit.")
+
+WEBHOOK_GROUP = "Tradexa Webhook"
+sendTradexaAlerts = input.bool(true, "Send Tradexa Alerts", group=WEBHOOK_GROUP)
+tradexaSecret = input.string("CHANGE_ME_SECRET", "Tradexa Webhook Secret", group=WEBHOOK_GROUP)
+
+// ========================================================================= //
+// DATA STRUCTURES & VARIABLES
+// ========================================================================= //
+type alerts
+    bool internalBullishBOS = false
+    bool internalBearishBOS = false
+    bool internalBullishCHoCH = false
+    bool internalBearishCHoCH = false
+    bool swingBullishBOS = false
+    bool swingBearishBOS = false
+    bool swingBullishCHoCH = false
+    bool swingBearishCHoCH = false
+    bool equalHighs = false
+    bool equalLows = false
+    bool bullishFairValueGap = false
+    bool bearishFairValueGap = false
+
+type trailingExtremes
+    float top = na
+    float bottom = na
+    int barTime = na
+    int barIndex = na
+    int lastTopTime = na
+    int lastBottomTime = na
+    int lastTopIndex = na
+    int lastBottomIndex = na
+
+type fairValueGap
+    float top
+    float bottom
+    int bias
+    box topBox
+    box bottomBox
+
+type trend
+    int bias = 0
+
+type smcState
+    int bias = 0
+    float protectedHigh = na
+    float protectedLow = na
+    int protectedHighIndex = na
+    int protectedLowIndex = na
+    float confirmedHigh = na
+    float confirmedLow = na
+    int confirmedHighIndex = na
+    int confirmedLowIndex = na
+    bool brokeHigh = false
+    bool brokeLow = false
+    float prevConfirmedHigh = na
+    float prevConfirmedLow = na
+    int prevConfirmedHighIndex = na
+    int prevConfirmedLowIndex = na
+
+type equalDisplay
+    line l_ine = na
+    label l_abel = na
+
+type pivot
+    float currentLevel = na
+    float lastLevel = na
+    bool crossed = false
+    int barTime = na
+    int barIndex = na
+
+type orderBlock
+    float barHigh
+    float barLow
+    int barIndex
+    int bias
+
+var pivot swingHigh = pivot.new()
+var pivot swingLow = pivot.new()
+var pivot internalHigh = pivot.new()
+var pivot internalLow = pivot.new()
+var pivot equalHigh = pivot.new()
+var pivot equalLow = pivot.new()
+var trend swingTrend = trend.new()
+var trend internalTrend = trend.new()
+var smcState swingSmc = smcState.new()
+var smcState internalSmc = smcState.new()
+var equalDisplay equalHighDisplay = equalDisplay.new()
+var equalDisplay equalLowDisplay = equalDisplay.new()
+
+var array<fairValueGap> fairValueGaps = array.new<fairValueGap>()
+var array<float> parsedHighs = array.new<float>()
+var array<float> parsedLows = array.new<float>()
+// FIX #1: Removed dead arrays `highs`, `lows`, `times` (never read)
+var trExt = trailingExtremes.new()
+
+var array<orderBlock> swingOrderBlocks = array.new<orderBlock>()
+var array<orderBlock> internalOrderBlocks = array.new<orderBlock>()
+var array<box> swingOrderBlocksBoxes = array.new<box>()
+var array<box> internalOrderBlocksBoxes = array.new<box>()
+
+swingBullishColor = swingBullColorInput
+swingBearishColor = swingBearColorInput
+fairValueGapBullishColor = fairValueGapsBullColorInput
+fairValueGapBearishColor = fairValueGapsBearColorInput
+premiumZoneColor = premiumZoneColorInput
+discountZoneColor = discountZoneColorInput
+
+alerts currentAlerts = alerts.new()
+
+// FIX #2: Always create both pools (so display toggles work after first bar)
+if barstate.isfirst
+    for _ = 1 to math.max(swingOrderBlocksSizeInput, 1)
+        swingOrderBlocksBoxes.push(box.new(na, na, na, na, xloc=xloc.bar_index, extend=extend.right))
+    for _ = 1 to math.max(internalOrderBlocksSizeInput, 1)
+        internalOrderBlocksBoxes.push(box.new(na, na, na, na, xloc=xloc.bar_index, extend=extend.right))
+
+bearishOrderBlockMitigationSource = orderBlockMitigationInput == CLOSE ? close : high
+bullishOrderBlockMitigationSource = orderBlockMitigationInput == CLOSE ? close : low
+atrMeasure = ta.atr(200)
+volatilityMeasure = orderBlockFilterInput == ATR ? atrMeasure : ta.cum(ta.tr) / math.max(bar_index, 1)
+highVolatilityBar = high - low >= 2 * volatilityMeasure
+parsedHigh = highVolatilityBar ? low : high
+parsedLow = highVolatilityBar ? high : low
+
+// FIX #1: Only push the arrays that are actually consumed
+parsedHighs.push(parsedHigh)
+parsedLows.push(parsedLow)
+
+stratAtr = ta.atr(stratAtrLen)
+
+htfClose = request.security(syminfo.tickerid, htfAlertTimeframe, close[1], lookahead=barmerge.lookahead_off)
+htfEma = request.security(syminfo.tickerid, htfAlertTimeframe, ta.ema(close, 50)[1], lookahead=barmerge.lookahead_off)
+htfBias = htfClose > htfEma ? 1 : -1
+volSma = ta.sma(volume, 20)
+volSurge = fvgVolumeFilter ? nz(volume[1]) > nz(volSma[1]) * 1.2 : true
+
+// ========================================================================= //
+// CORE SMC FUNCTIONS
+// ========================================================================= //
+leg(int size) =>
+    var int l = 0
+    newLegHigh = high[size] > ta.highest(size)
+    newLegLow = low[size] < ta.lowest(size)
+    if newLegHigh
+        l := BEARISH_LEG
+    else if newLegLow
+        l := BULLISH_LEG
+    l
+
+startOfNewLeg(int l) => ta.change(l) != 0
+startOfBearishLeg(int l) => ta.change(l) == -1
+startOfBullishLeg(int l) => ta.change(l) == 1
+
+drawLabel(int labelIndex, float labelPrice, string tag, color labelColor, string labelStyle) =>
+    label.new(labelIndex, labelPrice, tag, xloc=xloc.bar_index, color=na, textcolor=labelColor, style=labelStyle, size=size.small)
+
+drawEqualHighLow(pivot p_ivot, float level, int size, bool isEqualHigh) =>
+    equalDisplay e_qualDisplay = isEqualHigh ? equalHighDisplay : equalLowDisplay
+    string tag = isEqualHigh ? "EQH" : "EQL"
+    color equalColor = isEqualHigh ? swingBearishColor : swingBullishColor
+    string labelStyle = isEqualHigh ? label.style_label_down : label.style_label_up
+    equalBarIndex = bar_index - size
+    e_qualDisplay.l_ine := line.new(p_ivot.barIndex, p_ivot.currentLevel, equalBarIndex, level, xloc=xloc.bar_index, color=equalColor, style=line.style_dotted)
+    e_qualDisplay.l_abel := label.new(equalBarIndex, level, tag, xloc=xloc.bar_index, color=na, textcolor=equalColor, style=labelStyle, size=equalHighsLowsSizeInput)
+
+getCurrentStructure(int size, bool equalHighLow = false, bool internal = false) =>
+    currentLeg = leg(size)
+    newPivot = startOfNewLeg(currentLeg)
+    pivotLow = startOfBullishLeg(currentLeg)
+    if newPivot
+        if pivotLow
+            pivot p_ivot = equalHighLow ? equalLow : internal ? internalLow : swingLow
+            if equalHighLow and not na(p_ivot.currentLevel) and math.abs(p_ivot.currentLevel - low[size]) < equalHighsLowsThresholdInput * atrMeasure
+                drawEqualHighLow(p_ivot, low[size], size, false)
+                currentAlerts.equalLows := true
+            p_ivot.lastLevel := p_ivot.currentLevel
+            p_ivot.currentLevel := low[size]
+            p_ivot.crossed := false
+            p_ivot.barTime := time[size]
+            p_ivot.barIndex := bar_index[size]
+            if not equalHighLow
+                smcState s_mc = internal ? internalSmc : swingSmc
+                s_mc.prevConfirmedLow := s_mc.confirmedLow
+                s_mc.prevConfirmedLowIndex := s_mc.confirmedLowIndex
+                s_mc.confirmedLow := p_ivot.currentLevel
+                s_mc.confirmedLowIndex := p_ivot.barIndex
+                if na(s_mc.protectedLow)
+                    s_mc.protectedLow := p_ivot.currentLevel
+                    s_mc.protectedLowIndex := p_ivot.barIndex
+            if not equalHighLow and not internal
+                trExt.bottom := p_ivot.currentLevel
+                trExt.barTime := p_ivot.barTime
+                trExt.barIndex := p_ivot.barIndex
+                trExt.lastBottomTime := p_ivot.barTime
+            if showSwingsInput and not internal and not equalHighLow
+                drawLabel(bar_index[size], p_ivot.currentLevel, p_ivot.currentLevel < p_ivot.lastLevel ? "LL" : "HL", swingBullishColor, label.style_label_up)
+        else
+            pivot p_ivot = equalHighLow ? equalHigh : internal ? internalHigh : swingHigh
+            if equalHighLow and not na(p_ivot.currentLevel) and math.abs(p_ivot.currentLevel - high[size]) < equalHighsLowsThresholdInput * atrMeasure
+                drawEqualHighLow(p_ivot, high[size], size, true)
+                currentAlerts.equalHighs := true
+            p_ivot.lastLevel := p_ivot.currentLevel
+            p_ivot.currentLevel := high[size]
+            p_ivot.crossed := false
+            p_ivot.barTime := time[size]
+            p_ivot.barIndex := bar_index[size]
+            if not equalHighLow
+                smcState s_mc = internal ? internalSmc : swingSmc
+                s_mc.prevConfirmedHigh := s_mc.confirmedHigh
+                s_mc.prevConfirmedHighIndex := s_mc.confirmedHighIndex
+                s_mc.confirmedHigh := p_ivot.currentLevel
+                s_mc.confirmedHighIndex := p_ivot.barIndex
+                if na(s_mc.protectedHigh)
+                    s_mc.protectedHigh := p_ivot.currentLevel
+                    s_mc.protectedHighIndex := p_ivot.barIndex
+            if not equalHighLow and not internal
+                trExt.top := p_ivot.currentLevel
+                trExt.barTime := p_ivot.barTime
+                trExt.barIndex := p_ivot.barIndex
+                trExt.lastTopTime := p_ivot.barTime
+            if showSwingsInput and not internal and not equalHighLow
+                drawLabel(bar_index[size], p_ivot.currentLevel, p_ivot.currentLevel > p_ivot.lastLevel ? "HH" : "LH", swingBearishColor, label.style_label_down)
+
+var array<line> lastInternalBullLine = array.new<line>(1, na)
+var array<line> lastInternalBearLine = array.new<line>(1, na)
+var array<line> lastSwingBullLine = array.new<line>(1, na)
+var array<line> lastSwingBearLine = array.new<line>(1, na)
+
+drawStructure(pivot p_ivot, string tag, color structureColor, string lineStyle, string labelStyle, string labelSize) =>
+    newLine = line.new(p_ivot.barIndex, p_ivot.currentLevel, bar_index, p_ivot.currentLevel, xloc=xloc.bar_index, color=structureColor, style=lineStyle, extend=extend.none)
+    labelY = labelStyle == label.style_label_down ? high : low
+    label.new(bar_index, labelY, tag, xloc=xloc.bar_index, color=na, textcolor=structureColor, style=labelStyle, size=labelSize)
+    newLine
+
+deleteOrderBlocks(bool internal = false) =>
+    array<orderBlock> orderBlocks = internal ? internalOrderBlocks : swingOrderBlocks
+    int i = orderBlocks.size() - 1
+    while i >= 0
+        eachOrderBlock = orderBlocks.get(i)
+        crossedOrderBlock = false
+        if bearishOrderBlockMitigationSource > eachOrderBlock.barHigh and eachOrderBlock.bias == BEARISH
+            crossedOrderBlock := true
+        else if bullishOrderBlockMitigationSource < eachOrderBlock.barLow and eachOrderBlock.bias == BULLISH
+            crossedOrderBlock := true
+        if crossedOrderBlock
+            orderBlocks.remove(i)
+        i -= 1
+
+// FIX #6: storage no longer gated by display toggle (POI proximity needs OBs even when hidden)
+storeOrderBlock(pivot p_ivot, bool internal = false, int bias) =>
+    if p_ivot.barIndex >= 0 and bar_index > p_ivot.barIndex
+        array<float> a_rray = na
+        int parsedIndex = na
+        if bias == BEARISH
+            a_rray := parsedHighs.slice(p_ivot.barIndex, bar_index)
+            parsedIndex := p_ivot.barIndex + a_rray.indexof(a_rray.max())
+        else
+            a_rray := parsedLows.slice(p_ivot.barIndex, bar_index)
+            parsedIndex := p_ivot.barIndex + a_rray.indexof(a_rray.min())
+        orderBlock o_rderBlock = orderBlock.new(parsedHighs.get(parsedIndex), parsedLows.get(parsedIndex), parsedIndex, bias)
+        array<orderBlock> orderBlocks = internal ? internalOrderBlocks : swingOrderBlocks
+        if orderBlocks.size() >= 100
+            orderBlocks.pop()
+        orderBlocks.unshift(o_rderBlock)
+
+drawOrderBlocks(bool internal = false) =>
+    array<orderBlock> orderBlocks = internal ? internalOrderBlocks : swingOrderBlocks
+    orderBlocksSize = orderBlocks.size()
+    if orderBlocksSize > 0
+        maxOrderBlocks = internal ? internalOrderBlocksSizeInput : swingOrderBlocksSizeInput
+        array<orderBlock> parsedOrderBlocks = orderBlocks.slice(0, math.min(maxOrderBlocks, orderBlocksSize))
+        array<box> b_oxes = internal ? internalOrderBlocksBoxes : swingOrderBlocksBoxes
+        poolSize = b_oxes.size()
+        for [index, eachOrderBlock] in parsedOrderBlocks
+            if index >= poolSize
+                break
+            orderBlockColor = internal ? (eachOrderBlock.bias == BEARISH ? internalBearishOrderBlockColor : internalBullishOrderBlockColor) : (eachOrderBlock.bias == BEARISH ? swingBearishOrderBlockColor : swingBullishOrderBlockColor)
+            box b_ox = b_oxes.get(index)
+            b_ox.set_lefttop(eachOrderBlock.barIndex, eachOrderBlock.barHigh)
+            b_ox.set_rightbottom(bar_index, eachOrderBlock.barLow)
+            b_ox.set_border_color(internal ? na : orderBlockColor)
+            b_ox.set_bgcolor(orderBlockColor)
+
+// ========================================================================= //
+// SMC STRUCTURE ENGINE
+// ========================================================================= //
+displayStructure(bool internal = false) =>
+    bullishBar = true
+    bearishBar = true
+    if internalFilterConfluenceInput
+        bullishBar := high - math.max(close, open) > (math.min(close, open) - low)
+        bearishBar := high - math.max(close, open) < (math.min(close, open) - low)
+
+    pivot highPivot = internal ? internalHigh : swingHigh
+    pivot lowPivot  = internal ? internalLow  : swingLow
+    smcState s_mc   = internal ? internalSmc  : swingSmc
+    trend t_rend    = internal ? internalTrend : swingTrend
+    lineStyle       = internal ? line.style_dashed : line.style_solid
+    labelSize       = internal ? internalStructureSize : swingStructureSize
+    bullishColor    = internal ? internalBullColorInput : swingBullColorInput
+    bearishColor    = internal ? internalBearColorInput : swingBearColorInput
+
+    atrFilter = nz(stratAtr, 0.0) * structureBreakAtrMult
+
+    bullExtra = internal ? (internalHigh.currentLevel != swingHigh.currentLevel and bullishBar) : true
+    bearExtra = internal ? (internalLow.currentLevel  != swingLow.currentLevel  and bearishBar) : true
+
+    // FIX #8: gate intrabar structure detection behind confirmBarsOnly
+    fireBar = (not confirmBarsOnly) or barstate.isconfirmed
+
+    // ---------- BULLISH SIDE ----------
+    cHochUpLevel = s_mc.protectedHigh
+    bosUpLevel   = highPivot.currentLevel
+    bullChochFire = s_mc.bias != BULLISH and not na(cHochUpLevel) and close > cHochUpLevel + atrFilter and bullExtra
+    bullBosFire   = s_mc.bias == BULLISH and not na(bosUpLevel)   and close > bosUpLevel   + atrFilter and not highPivot.crossed and bullExtra
+    if (bullChochFire or bullBosFire) and fireBar
+        isChoch = bullChochFire
+        tag = isChoch ? CHOCH : BOS
+        if internal
+            currentAlerts.internalBullishCHoCH := isChoch
+            currentAlerts.internalBullishBOS   := not isChoch
+        else
+            currentAlerts.swingBullishCHoCH := isChoch
+            currentAlerts.swingBullishBOS   := not isChoch
+        highPivot.crossed := true
+        s_mc.bias := BULLISH
+        s_mc.brokeHigh := true
+        if not na(s_mc.confirmedLow)
+            s_mc.protectedLow := s_mc.confirmedLow
+            s_mc.protectedLowIndex := s_mc.confirmedLowIndex
+        t_rend.bias := BULLISH
+        displayCondition = internal ? (showInternalsInput and (showInternalBullInput == ALL or (showInternalBullInput == BOS and not isChoch) or (showInternalBullInput == CHOCH and isChoch))) : (showStructureInput and (showSwingBullInput == ALL or (showSwingBullInput == BOS and not isChoch) or (showSwingBullInput == CHOCH and isChoch)))
+        if displayCondition
+            newBullLine = drawStructure(highPivot, tag, bullishColor, lineStyle, label.style_label_down, labelSize)
+            tracker = internal ? lastInternalBullLine : lastSwingBullLine
+            prevLine = tracker.get(0)
+            if not na(prevLine)
+                prevLine.set_extend(extend.none)
+                prevLine.set_x2(bar_index)
+            tracker.set(0, newBullLine)
+        // FIX #6: always store OB so POI proximity logic sees it
+        storeOrderBlock(highPivot, internal, BULLISH)
+
+    // ---------- BEARISH SIDE ----------
+    cHochDnLevel = s_mc.protectedLow
+    bosDnLevel   = lowPivot.currentLevel
+    bearChochFire = s_mc.bias != BEARISH and not na(cHochDnLevel) and close < cHochDnLevel - atrFilter and bearExtra
+    bearBosFire   = s_mc.bias == BEARISH and not na(bosDnLevel)   and close < bosDnLevel   - atrFilter and not lowPivot.crossed and bearExtra
+    if (bearChochFire or bearBosFire) and fireBar
+        isChoch = bearChochFire
+        tag = isChoch ? CHOCH : BOS
+        if internal
+            currentAlerts.internalBearishCHoCH := isChoch
+            currentAlerts.internalBearishBOS   := not isChoch
+        else
+            currentAlerts.swingBearishCHoCH := isChoch
+            currentAlerts.swingBearishBOS   := not isChoch
+        lowPivot.crossed := true
+        s_mc.bias := BEARISH
+        s_mc.brokeLow := true
+        if not na(s_mc.confirmedHigh)
+            s_mc.protectedHigh := s_mc.confirmedHigh
+            s_mc.protectedHighIndex := s_mc.confirmedHighIndex
+        t_rend.bias := BEARISH
+        displayCondition = internal ? (showInternalsInput and (showInternalBearInput == ALL or (showInternalBearInput == BOS and not isChoch) or (showInternalBearInput == CHOCH and isChoch))) : (showStructureInput and (showSwingBearInput == ALL or (showSwingBearInput == BOS and not isChoch) or (showSwingBearInput == CHOCH and isChoch)))
+        if displayCondition
+            newBearLine = drawStructure(lowPivot, tag, bearishColor, lineStyle, label.style_label_up, labelSize)
+            tracker = internal ? lastInternalBearLine : lastSwingBearLine
+            prevLine = tracker.get(0)
+            if not na(prevLine)
+                prevLine.set_extend(extend.none)
+                prevLine.set_x2(bar_index)
+            tracker.set(0, newBearLine)
+        // FIX #6: always store OB so POI proximity logic sees it
+        storeOrderBlock(lowPivot, internal, BEARISH)
+
+fairValueGapBox(leftIndex, rightIndex, topPrice, bottomPrice, boxColor) =>
+    box.new(leftIndex, topPrice, rightIndex, bottomPrice, xloc=xloc.bar_index, border_color=boxColor, bgcolor=boxColor)
+
+deleteFairValueGaps() =>
+    int i = fairValueGaps.size() - 1
+    while i >= 0
+        eachFairValueGap = fairValueGaps.get(i)
+        removeGap = (low < eachFairValueGap.bottom and eachFairValueGap.bias == BULLISH) or (high > eachFairValueGap.top and eachFairValueGap.bias == BEARISH)
+        if removeGap
+            eachFairValueGap.topBox.delete()
+            eachFairValueGap.bottomBox.delete()
+            fairValueGaps.remove(i)
+        i -= 1
+
+drawFairValueGaps() =>
+    tf = fairValueGapsTimeframeInput == "" ? timeframe.period : fairValueGapsTimeframeInput
+    [lastClose, lastOpen, lastTime, currentHigh, currentLow, currentTime, last2High, last2Low] = request.security(syminfo.tickerid, tf, [close[1], open[1], time[1], high, low, time, high[2], low[2]], lookahead=barmerge.lookahead_off)
+    barDeltaPercent = lastOpen != 0 ? (lastClose - lastOpen) / lastOpen * 100 : 0.0
+    newTimeframe = timeframe.change(tf)
+    threshold = fairValueGapsThresholdInput ? ta.cum(math.abs(newTimeframe ? barDeltaPercent : 0)) / math.max(bar_index, 1) * 2 : 0
+    bullishFairValueGap = currentLow > last2High and lastClose > last2High and barDeltaPercent > threshold and newTimeframe and volSurge
+    bearishFairValueGap = currentHigh < last2Low and lastClose < last2Low and -barDeltaPercent > threshold and newTimeframe and volSurge
+    if bullishFairValueGap
+        currentAlerts.bullishFairValueGap := true
+        fvgLeftIndex = math.max(bar_index - 2, 0)
+        fvgRightIndex = bar_index + fairValueGapsExtendInput
+        fairValueGaps.unshift(fairValueGap.new(currentLow, last2High, BULLISH, fairValueGapBox(fvgLeftIndex, fvgRightIndex, currentLow, math.avg(currentLow, last2High), fairValueGapBullishColor), fairValueGapBox(fvgLeftIndex, fvgRightIndex, math.avg(currentLow, last2High), last2High, fairValueGapBullishColor)))
+    if bearishFairValueGap
+        currentAlerts.bearishFairValueGap := true
+        fvgLeftIndex = math.max(bar_index - 2, 0)
+        fvgRightIndex = bar_index + fairValueGapsExtendInput
+        fairValueGaps.unshift(fairValueGap.new(currentHigh, last2Low, BEARISH, fairValueGapBox(fvgLeftIndex, fvgRightIndex, currentHigh, math.avg(currentHigh, last2Low), fairValueGapBearishColor), fairValueGapBox(fvgLeftIndex, fvgRightIndex, math.avg(currentHigh, last2Low), last2Low, fairValueGapBearishColor)))
+
+updateTrailingExtremes() =>
+    if na(trExt.top)
+        trExt.top := high
+        trExt.bottom := low
+        trExt.lastTopTime := time
+        trExt.lastBottomTime := time
+        trExt.lastTopIndex := bar_index
+        trExt.lastBottomIndex := bar_index
+        trExt.barTime := time
+        trExt.barIndex := bar_index
+    trExt.top := math.max(trExt.top, high)
+    if trExt.top == high
+        trExt.lastTopTime := time
+        trExt.lastTopIndex := bar_index
+    trExt.bottom := math.min(trExt.bottom, low)
+    if trExt.bottom == low
+        trExt.lastBottomTime := time
+        trExt.lastBottomIndex := bar_index
+
+drawHighLowSwings() =>
+    var line topLine = line.new(na, na, na, na, color=swingBearishColor, xloc=xloc.bar_index)
+    var line bottomLine = line.new(na, na, na, na, color=swingBullishColor, xloc=xloc.bar_index)
+    var label topLabel = label.new(na, na, color=na, textcolor=swingBearishColor, xloc=xloc.bar_index, style=label.style_label_down, size=size.tiny)
+    var label bottomLabel = label.new(na, na, color=na, textcolor=swingBullishColor, xloc=xloc.bar_index, style=label.style_label_up, size=size.tiny)
+    rightIndex = bar_index + labelRightOffset
+    topLine.set_xy1(nz(trExt.lastTopIndex, bar_index), trExt.top)
+    topLine.set_xy2(rightIndex, trExt.top)
+    topLabel.set_x(rightIndex)
+    topLabel.set_y(trExt.top)
+    topLabel.set_text(swingTrend.bias == BEARISH ? "Strong High" : "Weak High")
+    bottomLine.set_xy1(nz(trExt.lastBottomIndex, bar_index), trExt.bottom)
+    bottomLine.set_xy2(rightIndex, trExt.bottom)
+    bottomLabel.set_x(rightIndex)
+    bottomLabel.set_y(trExt.bottom)
+    bottomLabel.set_text(swingTrend.bias == BULLISH ? "Strong Low" : "Weak Low")
+
+drawZone(float labelLevel, int labelIndex, float top, float bottom, string tag, color zoneColor, string style) =>
+    var label l_abel = label.new(na, na, text=tag, color=na, textcolor=zoneColor, xloc=xloc.bar_index, style=style, size=size.small)
+    var box b_ox = box.new(na, na, na, na, bgcolor=color.new(zoneColor, 80), border_color=na, xloc=xloc.bar_index)
+    rightIndex = bar_index + zoneRightOffset
+    leftIndex = math.max(nz(trExt.barIndex, bar_index), bar_index - zoneLookbackBars)
+    b_ox.set_lefttop(leftIndex, top)
+    b_ox.set_rightbottom(rightIndex, bottom)
+    l_abel.set_x(math.round((leftIndex + rightIndex) / 2))
+    l_abel.set_y(labelLevel)
+
+drawPremiumDiscountZones() =>
+    rightAnchor = bar_index + zoneRightOffset
+    midAnchor = math.round(0.5 * (math.max(nz(trExt.barIndex, bar_index), bar_index - zoneLookbackBars) + rightAnchor))
+    drawZone(trExt.top, midAnchor, trExt.top, 0.95 * trExt.top + 0.05 * trExt.bottom, "Premium", premiumZoneColor, label.style_label_down)
+    equilibriumLevel = math.avg(trExt.top, trExt.bottom)
+    drawZone(equilibriumLevel, rightAnchor, 0.525 * trExt.top + 0.475 * trExt.bottom, 0.525 * trExt.bottom + 0.475 * trExt.top, "Equilibrium", equilibriumZoneColorInput, label.style_label_left)
+    drawZone(trExt.bottom, midAnchor, 0.95 * trExt.bottom + 0.05 * trExt.top, trExt.bottom, "Discount", discountZoneColor, label.style_label_up)
+
+// ========================================================================= //
+// EXECUTION ENGINE
+// ========================================================================= //
+candleColor = internalTrend.bias == BULLISH ? swingBullishColor : swingBearishColor
+plotcandle(showTrendInput ? open : na, showTrendInput ? high : na, showTrendInput ? low : na, showTrendInput ? close : na, color=candleColor, wickcolor=candleColor, bordercolor=candleColor)
+
+if showHighLowSwingsInput or showPremiumDiscountZonesInput
+    updateTrailingExtremes()
+
+if showHighLowSwingsInput
+    drawHighLowSwings()
+if showPremiumDiscountZonesInput
+    drawPremiumDiscountZones()
+
+if showFairValueGapsInput
+    deleteFairValueGaps()
+
+getCurrentStructure(swingsLengthInput, false)
+getCurrentStructure(internalLengthInput, false, true)
+
+if showEqualHighsLowsInput
+    getCurrentStructure(equalHighsLowsLengthInput, true)
+
+// FIX #6: structure engine runs unconditionally so SMC state and OBs stay live for the strategy
+displayStructure(true)
+displayStructure()
+
+if showInternalOrderBlocksInput
+    deleteOrderBlocks(true)
+if showSwingOrderBlocksInput
+    deleteOrderBlocks()
+
+if showFairValueGapsInput
+    drawFairValueGaps()
+
+if showInternalOrderBlocksInput
+    drawOrderBlocks(true)
+if showSwingOrderBlocksInput
+    drawOrderBlocks()
+
+// ========================================================================= //
+// PRO UPGRADE: PRICE ACTION + SMC + KILLZONE LOGIC
+// ========================================================================= //
+var float tradeSl = na
+var float tradeTp = na
+
+inKillzone = killzoneTz == "exchange" ? not na(time(timeframe.period, killzoneSession)) : not na(time(timeframe.period, killzoneSession, killzoneTz))
+
+bodySize = math.abs(close - open)
+lowerWick = math.min(close, open) - low
+upperWick = high - math.max(close, open)
+
+bullishPinBar = lowerWick >= bodySize * wickMultiplier and upperWick <= bodySize
+bearishPinBar = upperWick >= bodySize * wickMultiplier and lowerWick <= bodySize
+
+liqHigh = ta.highest(high, sweepLookback)[1]
+liqLow = ta.lowest(low, sweepLookback)[1]
+// FIX #3: real sweep — wick beyond, close back inside
+sweepHigh = high > liqHigh and close < liqHigh
+sweepLow  = low  < liqLow  and close > liqLow
+
+bullChoch = currentAlerts.internalBullishCHoCH or currentAlerts.swingBullishCHoCH
+bearChoch = currentAlerts.internalBearishCHoCH or currentAlerts.swingBearishCHoCH
+
+recentSweepLow = nz(ta.barssince(sweepLow), 9999) <= sweepLookback
+recentSweepHigh = nz(ta.barssince(sweepHigh), 9999) <= sweepLookback
+recentBullChoch = nz(ta.barssince(bullChoch), 9999) <= chochLookback
+recentBearChoch = nz(ta.barssince(bearChoch), 9999) <= chochLookback
+recentBullFVG = nz(ta.barssince(currentAlerts.bullishFairValueGap), 9999) <= fvgLookback
+recentBearFVG = nz(ta.barssince(currentAlerts.bearishFairValueGap), 9999) <= fvgLookback
+
+poiBuffer = stratAtr * poiAtrBufferMult
+activeBullOB = false
+activeBearOB = false
+nearBullOB = false
+nearBearOB = false
+if internalOrderBlocks.size() > 0
+    for [iIdx, iOB] in internalOrderBlocks
+        if iOB.bias == BULLISH
+            activeBullOB := true
+            if close >= iOB.barLow - poiBuffer and close <= iOB.barHigh + poiBuffer
+                nearBullOB := true
+        else
+            activeBearOB := true
+            if close >= iOB.barLow - poiBuffer and close <= iOB.barHigh + poiBuffer
+                nearBearOB := true
+if swingOrderBlocks.size() > 0
+    for [sIdx, sOB] in swingOrderBlocks
+        if sOB.bias == BULLISH
+            activeBullOB := true
+            if close >= sOB.barLow - poiBuffer and close <= sOB.barHigh + poiBuffer
+                nearBullOB := true
+        else
+            activeBearOB := true
+            if close >= sOB.barLow - poiBuffer and close <= sOB.barHigh + poiBuffer
+                nearBearOB := true
+
+signalBarLow = bullishPinBar ? low : na
+signalBarHigh = bearishPinBar ? high : na
+
+// ========================================================================= //
+// TRADEXA WEBHOOK ALERT DATA
+// ========================================================================= //
+txHtfBiasText = htfBias == BULLISH ? "Bullish" : "Bearish"
+txSetupType = "Sweep + CHoCH + FVG"
+
+txHasRange = not na(trExt.top) and not na(trExt.bottom) and trExt.top != trExt.bottom
+txEqLevel = txHasRange ? math.avg(trExt.top, trExt.bottom) : close
+txEqBand = txHasRange ? math.abs(trExt.top - trExt.bottom) * 0.10 : 0.0
+txInEquilibrium = txHasRange and math.abs(close - txEqLevel) <= txEqBand
+txInPremium = txHasRange and close > txEqLevel and not txInEquilibrium
+txInDiscount = txHasRange and close < txEqLevel and not txInEquilibrium
+txCurrentArea = txInPremium ? "Premium" : txInDiscount ? "Discount" : "Equilibrium"
+
+txPoiText = htfBias == BULLISH ? (recentBullFVG ? "Bull FVG" : nearBullOB ? "Near Bull OB" : "No Bull POI") : (recentBearFVG ? "Bear FVG" : nearBearOB ? "Near Bear OB" : "No Bear POI")
+
+txSessionText = inKillzone ? "Killzone" : "Outside Session"
+
+txSweepOK = htfBias == BULLISH ? recentSweepLow : recentSweepHigh
+txChochOK = htfBias == BULLISH ? recentBullChoch : recentBearChoch
+txFvgOK = htfBias == BULLISH ? recentBullFVG : recentBearFVG
+txPoiOK = htfBias == BULLISH ? (recentBullFVG or nearBullOB) : (recentBearFVG or nearBearOB)
+txRejectionOK = useRejection ? (htfBias == BULLISH ? bullishPinBar : bearishPinBar) : true
+
+txSetupQuality = 0
+txSetupQuality += txSweepOK ? 20 : 0
+txSetupQuality += txChochOK ? 20 : 0
+txSetupQuality += txFvgOK ? 20 : 0
+txSetupQuality += txPoiOK ? 15 : 0
+txSetupQuality += inKillzone ? 10 : 0
+txSetupQuality += txRejectionOK ? 15 : 0
+
+txTradeIdLong = syminfo.ticker + "-" + timeframe.period + "-long-" + str.tostring(time)
+txTradeIdShort = syminfo.ticker + "-" + timeframe.period + "-short-" + str.tostring(time)
+
+barOK = confirmBarsOnly ? barstate.isconfirmed : true
+
+longCondition = barOK and recentSweepLow and recentBullChoch and recentBullFVG and htfBias == 1 and inKillzone and (useRejection ? bullishPinBar : true) and nearBullOB
+shortCondition = barOK and recentSweepHigh and recentBearChoch and recentBearFVG and htfBias == -1 and inKillzone and (useRejection ? bearishPinBar : true) and nearBearOB
+
+// FIX #11: guard entries against na ATR so SL/TP can't be na
+if longCondition and strategy.position_size == 0 and not na(stratAtr)
+    slRef = nz(signalBarLow, low)
+    tradeSl := slRef - stratAtr * stratSlMult
+    tradeTp := close + (close - tradeSl) * stratRrRatio
+    strategy.entry("PRO Long", strategy.long)
+    strategy.exit("Exit Long", "PRO Long", stop=tradeSl, limit=tradeTp)
+    if sendTradexaAlerts
+        alert('{"secret":"' + tradexaSecret + '","event":"entry_long","source":"tradingview_paper","external_trade_id":"' + txTradeIdLong + '","symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","direction":"long","setup_type":"' + txSetupType + '","htf_bias":"' + txHtfBiasText + '","current_area":"' + txCurrentArea + '","poi":"' + txPoiText + '","session":"' + txSessionText + '","setup_quality":' + str.tostring(txSetupQuality) + ',"entry_price":' + str.tostring(close) + ',"stop_loss":' + str.tostring(tradeSl) + ',"take_profit":' + str.tostring(tradeTp) + '}', alert.freq_once_per_bar_close)
+
+if shortCondition and strategy.position_size == 0 and not na(stratAtr)
+    slRef = nz(signalBarHigh, high)
+    tradeSl := slRef + stratAtr * stratSlMult
+    tradeTp := close - (tradeSl - close) * stratRrRatio
+    strategy.entry("PRO Short", strategy.short)
+    strategy.exit("Exit Short", "PRO Short", stop=tradeSl, limit=tradeTp)
+    if sendTradexaAlerts
+        alert('{"secret":"' + tradexaSecret + '","event":"entry_short","source":"tradingview_paper","external_trade_id":"' + txTradeIdShort + '","symbol":"' + syminfo.ticker + '","timeframe":"' + timeframe.period + '","direction":"short","setup_type":"' + txSetupType + '","htf_bias":"' + txHtfBiasText + '","current_area":"' + txCurrentArea + '","poi":"' + txPoiText + '","session":"' + txSessionText + '","setup_quality":' + str.tostring(txSetupQuality) + ',"entry_price":' + str.tostring(close) + ',"stop_loss":' + str.tostring(tradeSl) + ',"take_profit":' + str.tostring(tradeTp) + '}', alert.freq_once_per_bar_close)
+
+if strategy.position_size > 0
+    strategy.exit("Exit Long", "PRO Long", stop=tradeSl, limit=tradeTp)
+if strategy.position_size < 0
+    strategy.exit("Exit Short", "PRO Short", stop=tradeSl, limit=tradeTp)
+
+plot(strategy.position_size != 0 ? tradeSl : na, "SL", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size != 0 ? tradeTp : na, "TP", color=color.green, style=plot.style_linebr, linewidth=2)
+
+// ========================================================================= //
+// KYROS DASHBOARD - REDESIGNED + WATCHLIST LOGIC FIX
+// ========================================================================= //
+tablePosition = dashPosStr == "Top Left" ? position.top_left : dashPosStr == "Bottom Right" ? position.bottom_right : dashPosStr == "Bottom Left" ? position.bottom_left : position.top_right
+var table dash = table.new(tablePosition, 3, 19, border_width=1, border_color=color.new(#30384A, 0), frame_color=color.new(#30384A, 0), frame_width=1)
+
+hasRange = not na(trExt.top) and not na(trExt.bottom) and trExt.top != trExt.bottom
+eq_level = hasRange ? (trExt.top + trExt.bottom) / 2 : close
+eqBand = hasRange ? math.abs(trExt.top - trExt.bottom) * 0.10 : 0.0
+inEquilibrium = hasRange and math.abs(close - eq_level) <= eqBand
+inPremium = hasRange and close > eq_level and not inEquilibrium
+inDiscount = hasRange and close < eq_level and not inEquilibrium
+currentArea = inPremium ? "Premium" : inDiscount ? "Discount" : "Equilibrium / Wait"
+
+htfBiasStr = htfBias == BULLISH ? "Bullish" : "Bearish"
+swingBiasStr = swingTrend.bias == BULLISH ? "Bullish" : "Bearish"
+internalBiasStr = internalTrend.bias == BULLISH ? "Bullish" : "Bearish"
+
+bullAligned = htfBias == BULLISH and swingTrend.bias == BULLISH and internalTrend.bias == BULLISH
+bearAligned = htfBias == BEARISH and swingTrend.bias == BEARISH and internalTrend.bias == BEARISH
+trendConflict = swingTrend.bias != htfBias or internalTrend.bias != htfBias
+trendAlignment = bullAligned ? "Bull Aligned" : bearAligned ? "Bear Aligned" : "Conflict / Wait"
+biasDirection = bullAligned ? "Bullish" : bearAligned ? "Bearish" : htfBias == BULLISH ? "Bullish Lean" : "Bearish Lean"
+
+biasScore = 0
+biasScore += (htfBias == BULLISH or htfBias == BEARISH) ? 20 : 0
+biasScore += swingTrend.bias == htfBias ? 25 : 0
+biasScore += internalTrend.bias == htfBias ? 25 : 0
+biasScore += bullAligned or bearAligned ? 10 : 0
+biasConfidence = math.min(biasScore, 100)
+
+sweepOK = htfBias == BULLISH ? recentSweepLow : recentSweepHigh
+chochOK = htfBias == BULLISH ? recentBullChoch : recentBearChoch
+fvgOK = htfBias == BULLISH ? recentBullFVG : recentBearFVG
+rejectionOK = useRejection ? (htfBias == BULLISH ? bullishPinBar : bearishPinBar) : true
+
+areaOK = (htfBias == BULLISH and inDiscount) or (htfBias == BEARISH and inPremium)
+areaMismatch = (htfBias == BULLISH and inPremium) or (htfBias == BEARISH and inDiscount)
+locationOK = areaOK
+locationText = locationOK ? "Location OK" : areaMismatch ? "Counter-Bias Zone" : "Equilibrium / Wait"
+
+poiValid = htfBias == BULLISH ? (recentBullFVG or nearBullOB) : (recentBearFVG or nearBearOB)
+poiText = poiValid ? (htfBias == BULLISH ? (recentBullFVG ? "Valid Bull FVG" : "Near Bull OB") : (recentBearFVG ? "Valid Bear FVG" : "Near Bear OB")) : locationOK ? "Location OK, POI not confirmed" : "No valid POI"
+activePoiValid = poiValid
+
+nearEqZone = hasRange and math.abs(close - eq_level) <= eqBand * 1.5
+weakPoi = not activePoiValid and (locationOK or nearEqZone or not areaMismatch)
+activePoiText = activePoiValid ? poiText : weakPoi ? "Weak POI / Wait" : nearEqZone ? "Near Equilibrium" : "No Valid POI"
+
+liquidityText = sweepOK ? "Confirmed" : "Not Confirmed"
+
+anyChochSignal = bullChoch or bearChoch
+anyBosSignal = currentAlerts.internalBullishBOS or currentAlerts.internalBearishBOS or currentAlerts.swingBullishBOS or currentAlerts.swingBearishBOS
+barsSinceAnyChoch = nz(ta.barssince(anyChochSignal), 9999)
+barsSinceAnyBos = nz(ta.barssince(anyBosSignal), 9999)
+barsSinceAnyStructure = math.min(barsSinceAnyChoch, barsSinceAnyBos)
+
+structureFresh = barsSinceAnyStructure <= 3
+structureRecent = barsSinceAnyStructure <= 12
+structureOld = barsSinceAnyStructure <= 30
+structureText = structureFresh ? "Fresh Structure" : structureRecent ? "Recent Structure" : structureOld ? "Old Structure" : "No Structure"
+
+volumeState = volSurge ? "Supported" : "Low Volume"
+outsideSession = not inKillzone
+
+inLondon = killzoneTz == "exchange" ? not na(time(timeframe.period, "0700-1100")) : not na(time(timeframe.period, "0700-1100", killzoneTz))
+inNewYork = killzoneTz == "exchange" ? not na(time(timeframe.period, "1300-1600")) : not na(time(timeframe.period, "1300-1600", killzoneTz))
+sessionStatus = inLondon ? "London" : inNewYork ? "New York" : inKillzone ? "Good Session" : "Dead Zone"
+
+atrNow = ta.atr(14)
+atrAvg = ta.sma(atrNow, 50)
+rangePct = (ta.highest(high, 20) - ta.lowest(low, 20)) / close
+isLowVol = not volSurge
+isRange = rangePct < 0.01
+isExpansion = atrNow > atrAvg * 1.2
+marketState = isExpansion ? "Expansion" : trendConflict ? "Choppy" : isRange ? "Range" : isLowVol ? "Low Volume" : "Trending"
+marketHealthy = not isLowVol and not isRange and not trendConflict
+rrOK = stratRrRatio >= 2.5
+
+setupRaw = 0
+setupRaw += locationOK ? 10 : 0
+setupRaw += activePoiValid ? 20 : weakPoi ? 10 : 0
+setupRaw += sweepOK ? 15 : 0
+setupRaw += chochOK ? 15 : 0
+setupRaw += fvgOK ? 10 : 0
+setupRaw += rejectionOK ? 10 : 0
+setupRaw += volSurge ? 10 : 0
+setupRaw += inKillzone ? 5 : 0
+setupRaw += marketHealthy ? 5 : 0
+
+// Split the dashboard into CONTEXT and EXECUTION so good market structure is not scored as trash just because timing is weak.
+contextScore = 0
+contextScore += bullAligned or bearAligned ? 30 : biasConfidence >= 70 ? 22 : biasConfidence >= 50 ? 15 : 5
+contextScore += locationOK ? 15 : areaMismatch ? 5 : 10
+contextScore += activePoiValid ? 20 : weakPoi ? 10 : nearEqZone ? 8 : 0
+contextScore += sweepOK ? 15 : 0
+contextScore += structureFresh ? 15 : structureRecent ? 10 : structureOld ? 5 : 0
+contextScore += marketState == "Trending" or marketState == "Expansion" ? 10 : marketState == "Range" ? 5 : isLowVol ? 3 : 5
+contextScore := math.max(0, math.min(contextScore, 100))
+
+executionScore = 0
+executionScore += activePoiValid ? 25 : weakPoi ? 10 : nearEqZone ? 8 : 0
+executionScore += structureFresh ? 25 : structureRecent ? 15 : structureOld ? 5 : 0
+executionScore += volSurge ? 20 : 0
+executionScore += inKillzone ? 20 : 0
+executionScore += rejectionOK ? 10 : 0
+executionScore := math.max(0, math.min(executionScore, 100))
+
+setupQuality = math.round(contextScore * 0.60 + executionScore * 0.40)
+setupGrade = executionScore >= 75 and contextScore >= 70 ? "A" : contextScore >= 70 and executionScore < 60 ? "Watchlist" : contextScore >= 55 ? "Caution" : "No Trade"
+
+executionStatus = "Wait"
+
+tradeReadyCondition = (longCondition or shortCondition) and contextScore >= 70 and executionScore >= 75 and rrOK
+watchlistCondition = contextScore >= 60 and executionScore < 60
+cautionCondition = contextScore >= 45 and contextScore < 60 and executionScore < 65
+avoidCondition = contextScore < 40 or (areaMismatch and biasConfidence < 55 and not sweepOK)
+
+executionStatus := tradeReadyCondition ? "Trade Allowed" : avoidCondition ? "Avoid" : watchlistCondition ? "Watchlist" : cautionCondition ? "Caution" : "No Trade"
+
+reasonsArr = array.new<string>()
+if outsideSession
+    reasonsArr.push("Outside Session")
+if not activePoiValid
+    reasonsArr.push(weakPoi ? "Weak POI" : locationOK ? "POI Not Confirmed" : "No Valid POI")
+if areaMismatch
+    reasonsArr.push(htfBias == BEARISH ? "Price in Discount" : "Price in Premium")
+if isLowVol
+    reasonsArr.push("Low Volume")
+if not sweepOK
+    reasonsArr.push("No Sweep")
+if not chochOK
+    reasonsArr.push(structureOld ? "Old Structure" : structureRecent ? "Recent Structure Waiting" : "No Fresh BOS/CHoCH")
+
+mainReason = reasonsArr.size() > 0 ? array.join(reasonsArr, " + ") : "Valid / Wait Entry"
+
+nextRequired = "Wait entry trigger"
+nextRequired := outsideSession ? "Wait active session" : nextRequired
+nextRequired := weakPoi ? "Wait stronger POI" : nextRequired
+nextRequired := not activePoiValid and locationOK and htfBias == BEARISH ? "Wait bear FVG/OB confirmation" : nextRequired
+nextRequired := not activePoiValid and locationOK and htfBias == BULLISH ? "Wait bull FVG/OB confirmation" : nextRequired
+nextRequired := not activePoiValid and not locationOK and htfBias == BEARISH ? "Wait premium + bear POI" : nextRequired
+nextRequired := not activePoiValid and not locationOK and htfBias == BULLISH ? "Wait discount + bull POI" : nextRequired
+nextRequired := areaMismatch and htfBias == BEARISH ? "Pullback to premium/supply" : nextRequired
+nextRequired := areaMismatch and htfBias == BULLISH ? "Pullback to discount/demand" : nextRequired
+nextRequired := activePoiValid and not sweepOK ? "Wait liquidity sweep" : nextRequired
+nextRequired := activePoiValid and sweepOK and not chochOK ? "Wait BOS/CHoCH" : nextRequired
+nextRequired := activePoiValid and sweepOK and chochOK and not fvgOK ? "Wait FVG/imbalance" : nextRequired
+nextRequired := activePoiValid and sweepOK and chochOK and fvgOK and not rejectionOK ? "Wait rejection candle" : nextRequired
+nextRequired := isLowVol ? "Wait volume support" : nextRequired
+
+totalTrades = strategy.closedtrades
+winRate = totalTrades > 0 ? strategy.wintrades / totalTrades * 100 : 0
+netProfit = strategy.netprofit
+
+bgHead = color.new(#0B1020, 0)
+bgSection = color.new(#151A2C, 0)
+bgLabel = color.new(#1E2438, 0)
+txtColor = color.white
+bullCol = color.new(#00C853, 10)
+bearCol = color.new(#FF3B45, 10)
+waitCol = color.new(#FFB300, 10)
+badCol = color.new(#FF3B45, 10)
+neutralCol = color.new(#2962FF, 15)
+watchCol = color.new(#FFB300, 5)
+cautionCol = color.new(#FF8C00, 8)
+
+biasCol = biasDirection == "Bullish" or biasDirection == "Bullish Lean" ? bullCol : bearCol
+alignCol = bullAligned or bearAligned ? bullCol : badCol
+setupCol = setupQuality >= 75 ? bullCol : setupQuality >= 45 ? waitCol : badCol
+contextCol = contextScore >= 70 ? bullCol : contextScore >= 50 ? waitCol : badCol
+executionCol = executionScore >= 70 ? bullCol : executionScore >= 40 ? waitCol : badCol
+execCol = executionStatus == "Trade Allowed" ? bullCol : executionStatus == "Watchlist" ? watchCol : executionStatus == "Caution" ? cautionCol : executionStatus == "Wait" ? waitCol : badCol
+marketCol = marketState == "Trending" or marketState == "Expansion" ? bullCol : marketState == "Range" ? waitCol : badCol
+volumeCol = volSurge ? bullCol : badCol
+sessionCol = inKillzone ? bullCol : badCol
+locationCol = locationOK ? bullCol : areaMismatch ? badCol : waitCol
+poiCol = activePoiValid ? bullCol : weakPoi ? waitCol : badCol
+structureCol = structureFresh ? bullCol : structureRecent ? waitCol : structureOld ? waitCol : badCol
+
+if showDashboard
+    table.cell(dash, 0, 0, "FINAL VERDICT", bgcolor=bgHead, text_color=txtColor, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 0, executionStatus, bgcolor=execCol, text_color=txtColor, text_size=size.small, text_halign=text.align_center)
+    table.cell(dash, 2, 0, timeframe.period, bgcolor=bgHead, text_color=txtColor, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 1, "Reason", bgcolor=bgLabel, text_color=txtColor, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 1, mainReason, bgcolor=neutralCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 1, "CTX " + str.tostring(contextScore) + "%", bgcolor=contextCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 2, "Next", bgcolor=bgLabel, text_color=txtColor, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 2, nextRequired, bgcolor=neutralCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 2, "Risk Gate", bgcolor=bgSection, text_color=txtColor, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 3, "BIAS", bgcolor=bgSection, text_color=txtColor, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 3, biasDirection, bgcolor=biasCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 3, str.tostring(biasConfidence) + "%", bgcolor=biasConfidence >= 70 ? bullCol : waitCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 4, "HTF", bgcolor=bgLabel, text_color=txtColor, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 4, htfBiasStr, bgcolor=htfBias == BULLISH ? bullCol : bearCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 4, "Higher TF", bgcolor=bgLabel, text_color=txtColor, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 5, "Swing", bgcolor=bgLabel, text_color=txtColor, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 5, swingBiasStr, bgcolor=swingTrend.bias == BULLISH ? bullCol : bearCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 5, "Structure", bgcolor=bgLabel, text_color=txtColor, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 6, "Internal", bgcolor=bgLabel, text_color=txtColor, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 6, internalBiasStr, bgcolor=internalTrend.bias == BULLISH ? bullCol : bearCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 6, trendAlignment, bgcolor=alignCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 7, "SETUP", bgcolor=bgSection, text_color=txtColor, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 7, currentArea, bgcolor=locationCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 7, "Context " + str.tostring(contextScore) + "%", bgcolor=contextCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 8, "Location", bgcolor=bgLabel, text_color=txtColor, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 8, locationText, bgcolor=locationCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 8, currentArea, bgcolor=locationCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 9, "POI", bgcolor=bgLabel, text_color=txtColor, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 9, activePoiText, bgcolor=poiCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 9, activePoiValid ? "Valid" : weakPoi ? "Weak" : "Wait", bgcolor=poiCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 10, "Liquidity", bgcolor=bgLabel, text_color=txtColor, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 10, liquidityText, bgcolor=sweepOK ? bullCol : waitCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 10, sweepOK ? "OK" : "Missing", bgcolor=sweepOK ? bullCol : waitCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 11, "Structure", bgcolor=bgLabel, text_color=txtColor, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 11, structureText, bgcolor=structureCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 11, structureFresh ? "Fresh" : structureRecent ? "Recent" : structureOld ? "Old" : "Wait", bgcolor=structureCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 12, "Volume", bgcolor=bgLabel, text_color=txtColor, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 12, volumeState, bgcolor=volumeCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 12, marketState, bgcolor=marketCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 13, "Session", bgcolor=bgLabel, text_color=txtColor, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 13, sessionStatus, bgcolor=sessionCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 13, inKillzone ? "Active" : "Dead", bgcolor=sessionCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 14, "EXECUTION", bgcolor=bgSection, text_color=txtColor, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 14, executionStatus, bgcolor=execCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 14, "Exec " + str.tostring(executionScore) + "%", bgcolor=executionCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 15, "Missing", bgcolor=bgLabel, text_color=txtColor, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 15, mainReason, bgcolor=neutralCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 15, setupGrade, bgcolor=setupCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 16, "Action", bgcolor=bgLabel, text_color=txtColor, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 16, nextRequired, bgcolor=neutralCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 16, executionStatus == "Trade Allowed" ? "Execute" : executionStatus == "Watchlist" ? "Watch" : "Wait", bgcolor=execCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 17, "STATS", bgcolor=bgSection, text_color=txtColor, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 17, "Trades " + str.tostring(totalTrades), bgcolor=bgSection, text_color=txtColor, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 17, str.tostring(winRate, "#.#") + "%", bgcolor=bgSection, text_color=txtColor, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 18, "P&L", bgcolor=bgLabel, text_color=txtColor, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 18, "$" + str.tostring(netProfit, "#.##"), bgcolor=netProfit >= 0 ? bullCol : bearCol, text_color=txtColor, text_size=size.tiny, text_halign=text.align_center)
+    table.cell(dash, 2, 18, "Tradexa Gate", bgcolor=bgLabel, text_color=txtColor, text_size=size.tiny, text_halign=text.align_right)

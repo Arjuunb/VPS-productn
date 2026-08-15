@@ -1,0 +1,48 @@
+{
+  "research_id": "SMC_NATIVE_V1_RESEARCH",
+  "manifest_version": 2,
+  "manifest_status": "VERIFIED",
+  "supersedes": "automation-hub/data/native_smc_visual_verification.json",
+  "purpose": "Native SMC visual verification only; not performance research and not executable.",
+  "execution_allowed": false,
+  "dataset": {
+    "archive_filename": "BTCUSDT-5m-2025-03.zip",
+    "archive_source": "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/5m/BTCUSDT-5m-2025-03.zip",
+    "official_checksum_source": "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/5m/BTCUSDT-5m-2025-03.zip.CHECKSUM",
+    "archive_sha256": "1eb1fb0c76a0e8302abdec42d54b844bd3c3d6d7e6e69ae434aaa1dea445d54d",
+    "official_checksum_sha256": "1eb1fb0c76a0e8302abdec42d54b844bd3c3d6d7e6e69ae434aaa1dea445d54d",
+    "payload_filename": "BTCUSDT-5m-2025-03.csv",
+    "payload_sha256": "095ffd662b5ae8b0d2780b86c1145791930c9a6da0403b7e658462831aee9db1",
+    "symbol": "BTCUSDT",
+    "timeframe": "5m",
+    "year": 2025,
+    "month": 3,
+    "partition": "TRAIN",
+    "period_start": "2025-03-01T00:00:00+00:00",
+    "period_end": "2025-03-31T23:55:00+00:00",
+    "expected_rows": 8928,
+    "expected_first_timestamp": "2025-03-01T00:00:00+00:00",
+    "expected_last_timestamp": "2025-03-31T23:55:00+00:00",
+    "expected_gaps": 0,
+    "expected_duplicates": 0
+  },
+  "revision_reason": "v1 copied the BTCUSDT 5m May 2025 archive hash into a March 2025 manifest. Existing research inventories and Binance Vision's official checksum identify 1eb1… as the March 2025 ZIP hash.",
+  "source_inventory_evidence": [
+    "automation-hub/data/strategy_v3_market_study.json",
+    "automation-hub/data/strategy_v2_v1_attribution.json",
+    "automation-hub/data/strategy_v2_development.json"
+  ],
+  "raw_archive_storage": "outside repository only",
+  "integrity_result": {
+    "status": "PASSED",
+    "row_count": 8928,
+    "duplicate_count": 0,
+    "gap_count": 0,
+    "malformed_count": 0,
+    "incomplete_count": 0,
+    "first_timestamp": "2025-03-01T00:00:00+00:00",
+    "last_timestamp": "2025-03-31T23:55:00+00:00"
+  },
+  "review_state": "INGESTED_FOR_VISUAL_REVIEW",
+  "evidence_content_sha256": "a4cbb05330ffa135774f8bdf35651ae5d6d86bdb63549e010323943835e6bc7b"
+}

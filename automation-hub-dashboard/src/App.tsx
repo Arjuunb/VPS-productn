@@ -39,6 +39,8 @@ const StrategyProofPage = lazy(() => import("./pages/StrategyProof"));
 const OptimizationPage = lazy(() => import("./pages/Optimization"));
 const AllocationPage = lazy(() => import("./pages/Allocation"));
 const TradingInstancesPage = lazy(() => import("./pages/TradingInstances"));
+const ForwardValidationPage = lazy(() => import("./pages/ForwardValidation"));
+const NativeSMCVisualPage = lazy(() => import("./pages/NativeSMCVisual"));
 import { AppContext, parseHash, slug } from "./app-context";
 
 const MOBILE = "(max-width: 720px)";
@@ -111,6 +113,8 @@ export default function App() {
       case "Allocation": return <AllocationPage />;
       case "Analytics": return <AnalyticsPage />;
       case "Strategy Proof": return <StrategyProofPage />;
+      case "Forward Validation": return <ForwardValidationPage />;
+      case "SMC Visual Lab": return <NativeSMCVisualPage />;
       case "Strategy Studio": return <StrategyStudioPage />;
       case "Grid & DCA": return <GridDCAPage />;
       case "AI Intelligence": return <AIIntelligencePage />;

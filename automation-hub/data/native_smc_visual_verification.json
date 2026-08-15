@@ -1,0 +1,82 @@
+{
+  "research_id": "SMC_NATIVE_V1_RESEARCH",
+  "manifest_version": 1,
+  "manifest_status": "SUPERSEDED",
+  "superseded_by": "automation-hub/data/native_smc_visual_verification_manifest_v2.json",
+  "stage": "VISUAL_STATE_VERIFICATION",
+  "status": "VISUAL_STATE_VERIFICATION_PARTIAL",
+  "execution_allowed": false,
+  "data_policy": "Closed authoritative exchange candles only; no generated fixtures, replay cache, validation, or untouched-test candles may be used as review evidence.",
+  "pre_registered_dataset": {
+    "exchange": "Binance Spot",
+    "provenance": "official Binance Vision monthly kline archive",
+    "symbol": "BTCUSDT",
+    "timeframe": "5m",
+    "start": "2025-03-01T00:00:00+00:00",
+    "end": "2025-03-31T23:55:00+00:00",
+    "partition": "TRAIN only",
+    "inventory_source": "automation-hub/data/strategy_v3_market_study.json",
+    "archive_sha256": "a1f4381240c422cda18464a054b34f75bb32bc5bb9137306e6c9d412e1b160aa",
+    "available_in_current_workspace": false,
+    "reviewed": false
+  },
+  "archive_download_attempt": {
+    "status": "PROVENANCE_MISMATCH_STOPPED",
+    "archive_name": "BTCUSDT-5m-2025-03.zip",
+    "source": "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/5m/BTCUSDT-5m-2025-03.zip",
+    "official_checksum_source": "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/5m/BTCUSDT-5m-2025-03.zip.CHECKSUM",
+    "byte_size": 475553,
+    "actual_sha256": "1eb1fb0c76a0e8302abdec42d54b844bd3c3d6d7e6e69ae434aaa1dea445d54d",
+    "expected_sha256": "a1f4381240c422cda18464a054b34f75bb32bc5bb9137306e6c9d412e1b160aa",
+    "official_checksum_matches_download": true,
+    "matches_pre_registered_hash": false,
+    "processed": false,
+    "row_count": null,
+    "first_timestamp": null,
+    "last_timestamp": null,
+    "detected_gaps": null,
+    "duplicate_count": null
+  },
+  "pre_registered_pass_criteria": {
+    "lookahead_defects": 0,
+    "duplicate_native_object_ids": 0,
+    "critical_setup_ordering_mismatches": 0,
+    "closed_htf_only": true,
+    "entry_ready_examples_must_be_explainable": true,
+    "human_review_required_before_pass": true,
+    "critical_components": ["swing pivot", "internal pivot", "BOS", "CHoCH", "liquidity sweep", "FVG", "order block", "setup sequence", "proposed entry", "SL", "TP"],
+    "cosmetic_mismatches_must_be_separate": true
+  },
+  "component_results": {
+    "swing_pivots": "NOT_REVIEWED",
+    "internal_pivots": "NOT_REVIEWED",
+    "bos": "NOT_REVIEWED",
+    "choch": "NOT_REVIEWED",
+    "liquidity_sweeps": "NOT_REVIEWED",
+    "fvgs": "NOT_REVIEWED",
+    "order_blocks": "NOT_REVIEWED",
+    "premium_discount": "NOT_REVIEWED",
+    "rejection_candles": "NOT_REVIEWED",
+    "setup_sequence": "NOT_REVIEWED",
+    "proposed_entry": "NOT_REVIEWED",
+    "stop_loss": "NOT_REVIEWED",
+    "take_profit": "NOT_REVIEWED"
+  },
+  "review_storage": {
+    "runtime_path_env": "HUB_SMC_VISUAL_REVIEW_PATH",
+    "default_path": "/var/lib/tradexa/smc_visual_reviews.json",
+    "learning_enabled": false,
+    "rule_mutation_enabled": false
+  },
+  "api": [
+    "GET /research/smc/chart",
+    "GET /research/smc/state",
+    "GET /research/smc/setups",
+    "GET /research/smc/setups/{id}",
+    "GET /research/smc/events",
+    "GET /research/smc/reviews",
+    "POST /research/smc/reviews"
+  ],
+  "evidence_hash": "NOT_AVAILABLE_PENDING_REAL_DATA_REVIEW",
+  "supersession_reason": "The v1 archive_sha256 was a transcription/configuration error: it is the BTCUSDT 5m May 2025 ZIP hash, while this manifest names March 2025. The original v1 value is retained unchanged for audit history."
+}
