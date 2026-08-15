@@ -609,6 +609,34 @@ a.brand:hover { opacity: 0.85; }
 .chart-full > .card, .chart-full > div { height: 100%; }
 @media (prefers-reduced-motion: reduce) { .pulse-dot { animation: none; } }
 
+/* Native SMC Visual Lab — concentrated research workstation. */
+.smc-workstation-card .card-body { display: grid; gap: 14px; }
+.smc-workspace-tabs { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding-bottom: 12px; border-bottom: 1px solid var(--card-border-soft); }
+.smc-workspace-tabs .dim { margin-left: auto; max-width: 460px; font-size: 11px; line-height: 1.4; }
+.smc-control-grid { display: grid; grid-template-columns: repeat(6, minmax(140px, 1fr)); gap: 10px; align-items: end; }
+.smc-control-grid .field { min-width: 0; }
+.smc-control-grid .btn { min-height: 38px; white-space: nowrap; }
+.smc-overlay-controls { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; padding: 10px 0 0; border-top: 1px solid var(--card-border-soft); }
+.smc-overlay-controls > .dim { padding-right: 4px; font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.smc-chart-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 350px); gap: 14px; align-items: start; }
+.smc-analysis-rail { display: grid; gap: 14px; position: sticky; top: 12px; }
+.smc-chart-card { overflow: hidden; border-color: rgba(124,185,232,.28); box-shadow: 0 12px 36px rgba(0,0,0,.22); }
+.smc-chart-card .card-head { background: linear-gradient(90deg, rgba(124,185,232,.06), transparent 48%); }
+.smc-chart-actions { display: inline-flex; align-items: center; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
+.smc-chart-actions .btn { padding: 6px 10px; font-size: 11px; }
+.smc-live-strip { display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; margin: 0 0 10px; padding: 8px 10px; border: 1px solid rgba(124,185,232,.20); border-radius: 8px; background: linear-gradient(90deg, rgba(124,185,232,.09), rgba(255,255,255,.01)); font-size: 11px; }
+.smc-live-strip .dim { margin-left: auto; font-size: 10.5px; }
+.smc-chart-footer { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 9px; padding-top: 9px; border-top: 1px solid var(--card-border-soft); color: var(--dim); font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.smc-chart-footer b { color: var(--text); font-family: var(--font-sans); }
+.smc-fullscreen { position: fixed; inset: 0; z-index: 120; overflow: auto; padding: 14px; background: #070708; }
+.smc-fullscreen-header { display: flex; align-items: center; justify-content: space-between; gap: 14px; max-width: 1800px; margin: 0 auto 10px; padding: 0 2px; }
+.smc-fullscreen-header > div { display: grid; gap: 2px; }
+.smc-fullscreen-header b { font-size: 14px; }
+.smc-fullscreen .smc-chart-card { max-width: 1800px; min-height: calc(100vh - 78px); margin: 0 auto; }
+.smc-fullscreen .smc-chart-card .card-body { min-height: calc(100vh - 155px); }
+@media (max-width: 1220px) { .smc-control-grid { grid-template-columns: repeat(3, minmax(150px, 1fr)); } .smc-chart-layout { grid-template-columns: 1fr; } .smc-analysis-rail { position: static; grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 720px) { .smc-control-grid { grid-template-columns: 1fr 1fr; } .smc-workspace-tabs .dim { margin-left: 0; } .smc-analysis-rail { grid-template-columns: 1fr; } .smc-chart-actions { justify-content: flex-start; } .smc-live-strip .dim { margin-left: 0; width: 100%; } .smc-fullscreen { padding: 8px; } .smc-fullscreen-header { align-items: flex-start; } }
+
 /* strategy canvas (react-flow custom nodes) */
 .sc-node { position: relative; min-width: 130px; padding: 8px 10px; border-radius: 10px; font-size: 11.5px;
   background: linear-gradient(180deg, #16161a, #101013); border: 1px solid var(--card-border); color: var(--text); }

@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Card from "../components/common/Card";
 import { Badge, EmptyState, Field, PageHeader } from "../components/common/ui";
 import NativeSMCChartOverlay, {
@@ -88,6 +88,7 @@ export default function NativeSMCVisualPage() {
   const [lightChart, setLightChart] = useState(false);
   const [workspace, setWorkspace] = useState<"chart" | "pine">("chart");
   const [chartFeed, setChartFeed] = useState<"checkpoint" | "mexc_perpetual" | "kraken_spot">("checkpoint");
+  const [fullChart, setFullChart] = useState(false);
   const [fitSignal, setFitSignal] = useState(0);
   const [classification, setClassification] = useState<ReviewClassification>("CORRECT");
   const [reason, setReason] = useState("");
@@ -147,45 +148,61 @@ export default function NativeSMCVisualPage() {
     setSymbol(nextSymbol); setTimeframe(nextTimeframe); setSelectedId(""); setSelectedCandle(""); setJumpValue("");
   };
 
+  useEffect(() => {
+    if (!fullChart) return;
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") setFullChart(false); };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [fullChart]);
+
+  const chartSubtitle = data?.data_provenance
+    ? `${data.data_provenance.venue} · ${data.data_provenance.market} · last closed ${at(data.data_provenance.last_closed_candle)}`
+    : "native verified closed OHLCV";
+  const chartPanel = data ? <Card
+    className="smc-chart-card"
+    title="Nexus SMC chart"
+    subtitle={`${chartSubtitle} · ${data.candles.length} candles`}
+    right={<div className="smc-chart-actions"><Badge text="CLOSED BARS" tone="green" /><button className="btn btn-soft" type="button" onClick={() => setFitSignal((value) => value + 1)}>Fit</button><button className="btn btn-primary" type="button" onClick={() => setFullChart((value) => !value)}>{fullChart ? "Exit full screen" : "Full screen"}</button></div>}
+  >
+    {data.data_provenance ? <div className="smc-live-strip"><span className="pulse-dot green" /><span><b>Live visual feed</b> · observed {at(data.data_provenance.observed_at)} · {data.data_provenance.closed_candles_used} confirmed candles</span><span className="dim">Forming candle excluded · execution disabled</span></div> : <div className="smc-live-strip"><span className="pulse-dot gold" /><span><b>Verified research checkpoint</b> · fixed March 2025 review evidence</span><span className="dim">Execution disabled</span></div>}
+    <NativeSMCChartOverlay state={data} filters={filters} selectedObjectId={selectedObjectId} onCandleSelect={onSelectCandle} fitContentSignal={fitSignal} lightMode={lightChart} height={fullChart ? "calc(100vh - 205px)" : "min(70vh, 780px)"} />
+    <div className="smc-chart-footer"><span><b>Selected OHLC</b> {selectedRow ? `O ${selectedRow.open} · H ${selectedRow.high} · L ${selectedRow.low} · C ${selectedRow.close} · V ${selectedRow.volume}` : "Click a candle to inspect its confirmed state"}</span><span>Wheel: zoom · Drag: pan · Esc: exit full screen</span></div>
+  </Card> : null;
+
   return <>
     <PageHeader title="Native SMC Visual Lab" subtitle="TradingView-style native structure verification · closed exchange candles only"
       actions={<><Badge text="SMC_NATIVE_V1_RESEARCH" tone="purple" /> <Badge text="EXECUTION DISABLED" tone="red" /></>} />
     <div className="instance-risk-notice amber" role="status"><b>Research visualisation only.</b> The browser renders backend objects; it cannot calculate SMC, create signals, or place paper/live orders.</div>
-    <Card title="Research workspace" subtitle="native chart objects and the immutable Pine reference are deliberately separate">
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
+    <Card className="smc-workstation-card" title="Research workspace" subtitle="native chart objects and the immutable Pine reference are deliberately separate">
+      <div className="smc-workspace-tabs">
         <button className={`btn ${workspace === "chart" ? "btn-primary" : "btn-soft"}`} type="button" onClick={() => setWorkspace("chart")}>Chart workspace</button>
         <button className={`btn ${workspace === "pine" ? "btn-primary" : "btn-soft"}`} type="button" onClick={() => setWorkspace("pine")}>Pine reference</button>
         <span className="dim" style={{ padding: "7px 2px", fontSize: 11 }}>The chart renders native closed-candle state; Pine is shown read-only for side-by-side review.</span>
       </div>
       {workspace === "chart" ? <>
-      <div className="form-grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", alignItems: "end" }}>
+      <div className="smc-control-grid">
         <Field label="Chart feed"><select value={chartFeed} onChange={(event) => { setChartFeed(event.target.value as typeof chartFeed); setSelectedCandle(""); }}><option value="checkpoint">Verified March 2025 checkpoint · BTCUSDT 5m</option><option value="mexc_perpetual">Live MEXC perpetual · closed candles</option><option value="kraken_spot">Live Kraken spot · closed candles</option></select></Field>
         <Field label="Symbol"><select value={symbol} onChange={(event) => switchDataset(event.target.value)}><option>BTCUSDT</option><option>ETHUSDT</option><option>SOLUSDT</option></select></Field>
         <Field label="Timeframe"><select value={timeframe} onChange={(event) => switchDataset(symbol, event.target.value)}><option>1m</option><option>3m</option><option>5m</option><option>30m</option><option>1h</option><option>4h</option><option>1d</option><option>1w</option></select></Field>
         {chartFeed === "checkpoint" ? <><Field label="Jump to UTC time"><input type="datetime-local" value={jumpValue} onChange={(event) => setJumpValue(event.target.value)} /></Field>
         <button className="btn btn-primary" type="button" onClick={jumpToTime}>Jump to time</button>
         <Field label="Review item"><select value={selectedObjectId ?? ""} onChange={(event) => { const index = reviewItems.findIndex((row) => row.object_id === event.target.value); selectReview(index); }}><option value="">Select review item</option>{reviewItems.map((row, index) => <option key={row.object_id} value={row.object_id}>{index + 1} / {reviewItems.length} · {category(row.category)} · {at(row.timestamp)}</option>)}</select></Field></> : <div className="dim" style={{ alignSelf: "center", fontSize: 12 }}>Refreshes every 15 seconds. The native model receives only fully closed candles.</div>}
-        <button className="btn btn-soft" type="button" onClick={() => setFitSignal((value) => value + 1)}>Fit chart</button>
       </div>
-      <div style={{ display: "flex", gap: 7, flexWrap: "wrap", marginTop: 10 }}>
-        <span className="dim" style={{ padding: "6px 2px", fontSize: 11 }}>Render filters:</span>
+      <div className="smc-overlay-controls">
+        <span className="dim">Render filters:</span>
         {([ ["Pivots", "pivots"], ["Internal", "internal"], ["Swing", "swing"], ["Structure", "structure"], ["Liquidity", "liquidity"], ["FVG", "fvg"], ["Order blocks", "orderBlocks"], ["Mitigated", "mitigated"], ["Labels", "labels"] ] as [string, keyof NativeSMCOverlayFilters][]).map(([label, key]) => <Toggle key={key} label={label} enabled={filters[key]} onClick={() => setFilter(key)} />)}
         <Toggle label="Light chart" enabled={lightChart} onClick={() => setLightChart((value) => !value)} />
       </div>
       </> : <PineReferencePanel reference={pineReference.data} error={pineReference.error} />}
     </Card>
     {workspace === "chart" && (state.error ? <div className="instance-risk-notice red">{state.error}</div> : !data?.candles.length ? <EmptyState text={chartFeed === "checkpoint" ? "No verified closed-candle checkpoint is attached. Configure HUB_SMC_VISUAL_CHECKPOINT_PATH before reviewing native SMC." : "The selected live venue has not returned enough valid closed candles yet."} /> : <>
-      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(300px, 360px)", gap: 14, alignItems: "start" }}>
-        <Card title="Nexus SMC chart" subtitle={`${data.data_provenance ? `${data.data_provenance.venue} · ${data.data_provenance.market} · last closed ${at(data.data_provenance.last_closed_candle)}` : "native verified closed OHLCV"} · ${data.candles.length} candles · crosshair · wheel zoom · drag pan`}>
-          {data.data_provenance ? <div className="instance-risk-notice amber" style={{ marginBottom: 10 }}><b>Live visual comparison only.</b> Observed {at(data.data_provenance.observed_at)} · {data.data_provenance.closed_candles_used} closed candles · the forming candle is excluded · no SMC execution authority.</div> : null}
-          <NativeSMCChartOverlay state={data} filters={filters} selectedObjectId={selectedObjectId} onCandleSelect={onSelectCandle} fitContentSignal={fitSignal} lightMode={lightChart} height="min(76vh, 860px)" />
-          <div className="risk-list terminal" style={{ marginTop: 8 }}><div className="risk-item"><span>Selected OHLC</span><b>{selectedRow ? `O ${selectedRow.open} · H ${selectedRow.high} · L ${selectedRow.low} · C ${selectedRow.close} · V ${selectedRow.volume}` : "Click a candle"}</b></div></div>
-        </Card>
-        <div style={{ display: "grid", gap: 14 }}>
+      {!fullChart ? <div className="smc-chart-layout">
+        {chartPanel}
+        <aside className="smc-analysis-rail">
           <VerdictPanel snapshot={selectedSnapshot} selectedObjectId={selectedObjectId} data={data} />
           <CandleInspector candle={selectedRow} snapshot={selectedSnapshot} data={data} />
-        </div>
-      </div>
+        </aside>
+      </div> : null}
       {chartFeed === "checkpoint" ? <Card title="Frozen 82-item review workflow" subtitle="deterministic sample · classifications are evaluation evidence only">
         <div className="risk-list terminal" style={{ marginBottom: 12 }}><div className="risk-item"><span>Progress</span><b>{reviewItems.length ? `${reviewIndex + 1} / ${reviewItems.length}` : "No sample"}</b></div><div className="risk-item"><span>Selected item</span><b>{selectedReview ? `${category(selectedReview.category)} · ${shortId(selectedReview.object_id)} · ${at(selectedReview.timestamp)}` : "—"}</b></div></div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
@@ -206,5 +223,6 @@ export default function NativeSMCVisualPage() {
         <div className="tablewrap" style={{ marginTop: 14 }}><table className="data-table"><thead><tr><th>Object</th><th>Classification</th><th>Selected candle</th><th>Reason</th></tr></thead><tbody>{(reviews.data?.reviews ?? []).map((row) => <tr key={row.id}><td><code>{shortId(row.object_id)}</code></td><td><Badge text={row.classification} tone={row.classification === "CORRECT" ? "green" : row.classification === "INCORRECT" ? "red" : "amber"} /></td><td>{at(row.selected_candle_timestamp)}</td><td className="dim">{row.reason ?? row.notes ?? "—"}</td></tr>)}{!reviews.data?.reviews.length ? <tr><td colSpan={4} className="dim ta-center">No human classifications recorded.</td></tr> : null}</tbody></table></div>
       </Card> : <div className="instance-risk-notice amber"><b>Live view is not parity evidence.</b> Use the verified March 2025 checkpoint and its frozen review sample to record formal Pine-to-native comparisons. The live venue view is for current visual observation only.</div>}
     </>)}
+    {fullChart && chartPanel ? <div className="smc-fullscreen" role="dialog" aria-modal="true" aria-label="Full screen native SMC chart"><div className="smc-fullscreen-header"><div><span className="eyebrow">RESEARCH VIEW</span><b>{symbol} · {timeframe} · {chartFeed === "checkpoint" ? "Verified checkpoint" : "Live exchange"}</b></div><button className="btn btn-soft" type="button" onClick={() => setFullChart(false)}>Exit full screen · Esc</button></div>{chartPanel}</div> : null}
   </>;
 }

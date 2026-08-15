@@ -102,9 +102,20 @@ function chartOption(state: NativeSMCChartState, filters: NativeSMCOverlayFilter
   return {
     animation: false,
     backgroundColor: canvas,
-    axisPointer: { link: [{ xAxisIndex: [0, 1] }], label: { backgroundColor: lightMode ? "#e9edf3" : "#171a20", color: lightMode ? "#111827" : "#e5e7eb" } },
+    axisPointer: {
+      link: [{ xAxisIndex: [0, 1] }],
+      snap: true,
+      animation: false,
+      label: { backgroundColor: lightMode ? "#e9edf3" : "#171a20", color: lightMode ? "#111827" : "#e5e7eb" },
+    },
     tooltip: {
-      trigger: "axis", axisPointer: { type: "cross" },
+      trigger: "axis",
+      triggerOn: "mousemove",
+      showDelay: 90,
+      hideDelay: 120,
+      transitionDuration: 0.08,
+      confine: true,
+      axisPointer: { type: "cross" },
       formatter: (params: any) => {
         const custom = (params as any[]).find((row) => row.data?.metadata);
         if (custom?.data?.metadata) return custom.data.metadata.split("\n").join("<br/>");
@@ -126,7 +137,9 @@ function chartOption(state: NativeSMCChartState, filters: NativeSMCOverlayFilter
       { id: "smc-volume-y", gridIndex: 1, position: "right", axisLabel: { color: text, fontSize: 10 }, splitLine: { show: false } },
     ],
     dataZoom: [
-      { id: "smc-inside-zoom", type: "inside", xAxisIndex: [0, 1], zoomOnMouseWheel: true, moveOnMouseMove: true, moveOnMouseWheel: true },
+      // TradingView-like interaction: wheel zooms, but simply moving the
+      // pointer never pans or shifts the visible window.
+      { id: "smc-inside-zoom", type: "inside", xAxisIndex: [0, 1], zoomOnMouseWheel: true, moveOnMouseMove: false, moveOnMouseWheel: false },
       { id: "smc-slider-zoom", type: "slider", xAxisIndex: [0, 1], bottom: "2%", height: 16, borderColor: axis, fillerColor: "rgba(105,185,255,.14)", handleStyle: { color: "#69b9ff" }, textStyle: { color: text } },
     ],
     series: [
