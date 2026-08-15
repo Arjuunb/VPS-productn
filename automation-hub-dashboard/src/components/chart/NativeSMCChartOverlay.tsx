@@ -32,6 +32,8 @@ export interface NativeSMCOverlayFilters {
 
 interface Props {
   state: NativeSMCChartState;
+  /** The user-selected chart timeframe. Used only for display-range scaling. */
+  timeframe?: string;
   filters: NativeSMCOverlayFilters;
   selectedObjectId?: string;
   onCandleSelect: (timestamp: string) => void;
@@ -44,7 +46,39 @@ const shortId = (id: string) => `${id.slice(0, 10)}…`;
 const colorFor = (direction: Direction) => direction === "bullish" ? "#21c77a" : direction === "bearish" ? "#ef5b5b" : "#9ca3af";
 const timestamp = (value: string) => value.replace("T", " ").replace("+00:00", " UTC").slice(0, 23);
 
-function chartOption(state: NativeSMCChartState, filters: NativeSMCOverlayFilters, selectedObjectId?: string, lightMode = false): EChartsOption {
+// Premium/discount is a visual aid in this Lab, not a new native-SMC input.
+// Each value represents a comparable recent market horizon for its timeframe,
+// rather than the all-history range held in a native research snapshot.
+const DISPLAY_RANGE_BARS: Record<string, number> = {
+  "1m": 180, "3m": 160, "5m": 144, "30m": 96,
+  "1h": 72, "4h": 60, "1d": 60, "1w": 52,
+};
+
+export interface DisplayDealingRange {
+  high: number;
+  low: number;
+  equilibrium: number;
+  start: string;
+  end: string;
+  bars: number;
+}
+
+export function timeframeDisplayRange(candles: NativeCandle[], timeframe = "5m", anchorTimestamp?: string): DisplayDealingRange | null {
+  if (!candles.length) return null;
+  const requestedIndex = anchorTimestamp ? candles.findIndex((row) => row.timestamp === anchorTimestamp) : -1;
+  const endIndex = requestedIndex >= 0 ? requestedIndex : candles.length - 1;
+  const bars = Math.min(DISPLAY_RANGE_BARS[timeframe] ?? 120, endIndex + 1);
+  const rangeCandles = candles.slice(endIndex - bars + 1, endIndex + 1);
+  let high = Number.NEGATIVE_INFINITY;
+  let low = Number.POSITIVE_INFINITY;
+  for (const candle of rangeCandles) {
+    high = Math.max(high, candle.high);
+    low = Math.min(low, candle.low);
+  }
+  return { high, low, equilibrium: (high + low) / 2, start: rangeCandles[0].timestamp, end: rangeCandles[rangeCandles.length - 1].timestamp, bars: rangeCandles.length };
+}
+
+function chartOption(state: NativeSMCChartState, timeframe: string, filters: NativeSMCOverlayFilters, selectedObjectId?: string, lightMode = false): EChartsOption {
   const closedCandles = state.candles;
   // The display candle intentionally remains outside the native model's
   // snapshots. It makes the chart feel live without turning an unclosed bar
@@ -56,7 +90,11 @@ function chartOption(state: NativeSMCChartState, filters: NativeSMCOverlayFilter
   const first = labels[0];
   const last = labels[labels.length - 1];
   const selectedSnapshot = state.selected_snapshot ?? state.snapshot;
-  const range = selectedSnapshot?.dealing_range;
+  // Do not reuse snapshot.dealing_range here: it is intentionally calculated
+  // from the full engine history for native-state evidence. The chart overlay
+  // needs a local, timeframe-aware viewing range instead.
+  const range = timeframeDisplayRange(closedCandles, timeframe, selectedSnapshot?.candle_open);
+  const rangeEnd = range?.end === closedCandles[closedCandles.length - 1]?.timestamp ? last : range?.end;
   const eventAt = (row: NativeEvent) => row.confirmed_at ?? row.timestamp;
   const inWindow = (value?: string | null) => Boolean(value && labelSet.has(value));
   const spanStart = (value: string) => labelSet.has(value) ? value : first;
@@ -99,8 +137,8 @@ function chartOption(state: NativeSMCChartState, filters: NativeSMCOverlayFilter
     { yAxis: row.target, name: "TAKE PROFIT", lineStyle: { color: "#21c77a", type: "dashed" } },
   ]);
   const rangeAreas = range ? [
-    [{ name: "DISCOUNT", xAxis: first, yAxis: range.low, itemStyle: { color: "rgba(34,197,94,.06)" } }, { xAxis: last, yAxis: range.equilibrium }],
-    [{ name: "PREMIUM", xAxis: first, yAxis: range.equilibrium, itemStyle: { color: "rgba(239,91,91,.06)" } }, { xAxis: last, yAxis: range.high }],
+    [{ name: `DISCOUNT · ${range.bars} bars`, xAxis: range.start, yAxis: range.low, itemStyle: { color: "rgba(34,197,94,.06)" } }, { xAxis: rangeEnd, yAxis: range.equilibrium }],
+    [{ name: `PREMIUM · ${range.bars} bars`, xAxis: range.start, yAxis: range.equilibrium, itemStyle: { color: "rgba(239,91,91,.06)" } }, { xAxis: rangeEnd, yAxis: range.high }],
   ] : [];
   const lastCandle = candles[candles.length - 1];
   const canvas = lightMode ? "#ffffff" : "#101216";
@@ -165,9 +203,9 @@ function chartOption(state: NativeSMCChartState, filters: NativeSMCOverlayFilter
         markArea: { silent: true, label: { color: "#bac4d5", fontSize: 10 }, data: [...rangeAreas, ...fvgAreas, ...obAreas] },
         markLine: { silent: true, symbol: "none", label: { color: "#cfd6e4", fontSize: 10 }, data: [
           ...(range ? [
-            { yAxis: range.high, name: "Range high", lineStyle: { color: "#ef5b5b", type: "dotted" } },
-            { yAxis: range.equilibrium, name: `EQUILIBRIUM ${range.equilibrium}`, lineStyle: { color: "#eab54f", type: "dashed" } },
-            { yAxis: range.low, name: "Range low", lineStyle: { color: "#21c77a", type: "dotted" } },
+            { yAxis: range.high, name: `${timeframe} range high`, lineStyle: { color: "#ef5b5b", type: "dotted" } },
+            { yAxis: range.equilibrium, name: `${timeframe} equilibrium ${range.equilibrium}`, lineStyle: { color: "#eab54f", type: "dashed" } },
+            { yAxis: range.low, name: `${timeframe} range low`, lineStyle: { color: "#21c77a", type: "dotted" } },
           ] : []),
           ...(lastCandle ? [{ yAxis: lastCandle.close, name: `${hasFormingCandle ? "LIVE" : "LAST"} ${lastCandle.close}`, lineStyle: { color: lastCandle.close >= lastCandle.open ? "#21c77a" : "#ef5b5b", width: hasFormingCandle ? 1.5 : 1 } }] : []),
           ...proposalLines,
@@ -180,8 +218,8 @@ function chartOption(state: NativeSMCChartState, filters: NativeSMCOverlayFilter
   } as EChartsOption;
 }
 
-export default function NativeSMCChartOverlay({ state, filters, selectedObjectId, onCandleSelect, fitContentSignal, lightMode = false, height = 700 }: Props) {
-  const option = useMemo(() => chartOption(state, filters, selectedObjectId, lightMode), [state, filters, selectedObjectId, lightMode]);
+export default function NativeSMCChartOverlay({ state, timeframe = "5m", filters, selectedObjectId, onCandleSelect, fitContentSignal, lightMode = false, height = 700 }: Props) {
+  const option = useMemo(() => chartOption(state, timeframe, filters, selectedObjectId, lightMode), [state, timeframe, filters, selectedObjectId, lightMode]);
   const events = useMemo(() => ({
     click: (event: any) => {
       if (event?.seriesName !== "Market candles" || typeof event.dataIndex !== "number") return;
