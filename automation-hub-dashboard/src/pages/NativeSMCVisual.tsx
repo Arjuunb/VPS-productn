@@ -182,7 +182,11 @@ export default function NativeSMCVisualPage() {
   const focusedAt = chartFeed === "checkpoint" ? (selectedCandle || selectedSample?.timestamp || "") : "";
   const chartPath = chartFeed === "checkpoint"
     ? `/research/smc/chart?symbol=${symbol}&timeframe=${timeframe}&window=800${focusedAt ? `&at=${encodeURIComponent(focusedAt)}` : ""}`
-    : `/research/smc/live-chart?symbol=${symbol}&timeframe=${timeframe}&venue=${chartFeed}&window=800&visible=${visibleBars}`;
+    // Keep a full recent history loaded behind the initial screen window.
+    // `visibleBars` controls only the initial chart viewport; sending it to
+    // the API used to discard all older candles, leaving nothing to drag back
+    // into on a live chart.
+    : `/research/smc/live-chart?symbol=${symbol}&timeframe=${timeframe}&venue=${chartFeed}&window=800&visible=800`;
   const state = useLive<NativeState & { data_provenance?: DataProvenance }>(chartPath, chartFeed === "checkpoint" ? 5_000 : liveRefreshMs);
   const reviews = useLive<ReviewsResponse>(`/research/smc/reviews?symbol=${symbol}&timeframe=${timeframe}`, 15_000);
   const pineReference = useLive<PineReference>("/research/smc/pine-reference", 600_000);
@@ -246,8 +250,8 @@ export default function NativeSMCVisualPage() {
   >
     <SMCTradingToolbar symbol={symbol} timeframe={timeframe} live={Boolean(data.data_provenance)} lastPrice={data.live_display?.last_price} onSymbolChange={(value) => switchDataset(value)} onTimeframeChange={(value) => switchDataset(symbol, value)} onOpenSettings={() => setWorkspace("settings")} />
     {data.data_provenance ? <div className="smc-live-strip"><span className="pulse-dot green" /><span><b>Live price display</b> · observed {at(data.live_display?.observed_at)} · {data.live_display?.is_forming ? "forming candle moves every ~3 seconds" : "awaiting provider forming candle"}</span><span className="dim">SMC uses {data.data_provenance.closed_candles_loaded} confirmed candles only · execution disabled</span></div> : <div className="smc-live-strip"><span className="pulse-dot gold" /><span><b>Verified research checkpoint</b> · fixed March 2025 review evidence</span><span className="dim">Execution disabled</span></div>}
-    <NativeSMCChartOverlay state={data} timeframe={timeframe} rightOffsetBars={rightOffsetBars} filters={filters} selectedObjectId={selectedObjectId} onCandleSelect={onSelectCandle} fitContentSignal={fitSignal} lightMode={lightChart} height={fullChart ? "calc(100vh - 255px)" : "min(70vh, 780px)"} />
-    <div className="smc-chart-footer"><span><b>{data.forming_candle ? "Live forming OHLC" : "Selected OHLC"}</b> {data.forming_candle ? `O ${data.forming_candle.open} · H ${data.forming_candle.high} · L ${data.forming_candle.low} · C ${data.forming_candle.close} · V ${data.forming_candle.volume}` : selectedRow ? `O ${selectedRow.open} · H ${selectedRow.high} · L ${selectedRow.low} · C ${selectedRow.close} · V ${selectedRow.volume}` : "Click a candle to inspect its confirmed state"}</span><span>Wheel: zoom · drag: pan · right space: {rightOffsetBars} bars · Esc: exit full screen</span></div>
+    <NativeSMCChartOverlay state={data} timeframe={timeframe} rightOffsetBars={rightOffsetBars} initialVisibleBars={visibleBars} filters={filters} selectedObjectId={selectedObjectId} onCandleSelect={onSelectCandle} fitContentSignal={fitSignal} lightMode={lightChart} height={fullChart ? "calc(100vh - 255px)" : "min(70vh, 780px)"} />
+    <div className="smc-chart-footer"><span><b>{data.forming_candle ? "Live forming OHLC" : "Selected OHLC"}</b> {data.forming_candle ? `O ${data.forming_candle.open} · H ${data.forming_candle.high} · L ${data.forming_candle.low} · C ${data.forming_candle.close} · V ${data.forming_candle.volume}` : selectedRow ? `O ${selectedRow.open} · H ${selectedRow.high} · L ${selectedRow.low} · C ${selectedRow.close} · V ${selectedRow.volume}` : "Click a candle to inspect its confirmed state"}</span><span>Drag a blank chart area to pan · wheel: zoom · right space: {rightOffsetBars} bars · Esc: exit full screen</span></div>
   </Card> : null;
 
   return <>

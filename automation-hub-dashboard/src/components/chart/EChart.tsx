@@ -24,6 +24,7 @@ interface EChartProps {
 export default function EChart({ option, height = "100%", className, style, onEvents, preserveInteraction = false, fitContentSignal }: EChartProps) {
   const elRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<echarts.ECharts | null>(null);
+  const hasRenderedRef = useRef(false);
 
   useEffect(() => {
     if (!elRef.current) return;
@@ -42,8 +43,17 @@ export default function EChart({ option, height = "100%", className, style, onEv
 
   useEffect(() => {
     if (!chartRef.current) return;
-    if (preserveInteraction) chartRef.current.setOption(option, { notMerge: false, lazyUpdate: true });
-    else chartRef.current.setOption(option, true);
+    // Live charts refresh their candles frequently. Applying a fresh dataZoom
+    // configuration on every refresh silently snaps the user back to the
+    // newest bar, which makes click-and-drag panning feel broken. Set the
+    // initial viewport once, then leave the current zoom/pan state in place.
+    if (preserveInteraction && hasRenderedRef.current) {
+      const { dataZoom: _preservedDataZoom, ...optionWithoutDataZoom } = option;
+      chartRef.current.setOption(optionWithoutDataZoom, { notMerge: false, lazyUpdate: true });
+    } else {
+      chartRef.current.setOption(option, true);
+      hasRenderedRef.current = true;
+    }
   }, [option, preserveInteraction]);
 
   useEffect(() => {

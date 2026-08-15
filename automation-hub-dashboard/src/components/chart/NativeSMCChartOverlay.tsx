@@ -36,6 +36,8 @@ interface Props {
   timeframe?: string;
   /** Empty chart slots after the latest candle, for live-chart positioning. */
   rightOffsetBars?: number;
+  /** Initial number of recent bars visible before the user pans or zooms. */
+  initialVisibleBars?: number;
   filters: NativeSMCOverlayFilters;
   selectedObjectId?: string;
   onCandleSelect: (timestamp: string) => void;
@@ -92,7 +94,7 @@ function futureChartSlots(lastTimestamp: string | undefined, timeframe: string, 
   return Array.from({ length: count }, (_, index) => new Date(start + step * (index + 1)).toISOString());
 }
 
-function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetBars: number, filters: NativeSMCOverlayFilters, selectedObjectId?: string, lightMode = false): EChartsOption {
+function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetBars: number, initialVisibleBars: number, filters: NativeSMCOverlayFilters, selectedObjectId?: string, lightMode = false): EChartsOption {
   const closedCandles = state.candles;
   // The display candle intentionally remains outside the native model's
   // snapshots. It makes the chart feel live without turning an unclosed bar
@@ -102,6 +104,13 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
   const candleLabels = candles.map((row) => row.timestamp);
   const futureSlots = futureChartSlots(candleLabels[candleLabels.length - 1], timeframe, rightOffsetBars);
   const labels = [...candleLabels, ...futureSlots];
+  // A pan can only happen when the visible viewport is narrower than the
+  // loaded history. Open on the recent working window, with right-side space
+  // for the forming candle, just as a charting terminal does.
+  const initialWindowBars = Math.min(labels.length, Math.max(24, initialVisibleBars + futureSlots.length));
+  const initialStart = labels.length > initialWindowBars
+    ? ((labels.length - initialWindowBars) / labels.length) * 100
+    : 0;
   const labelSet = new Set(candleLabels);
   const first = candleLabels[0];
   const last = candleLabels[candleLabels.length - 1];
@@ -204,8 +213,8 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
     dataZoom: [
       // Drag-pan only activates while the pointer is pressed; ordinary hover
       // continues to be a stable crosshair inspection action.
-      { id: "smc-inside-zoom", type: "inside", xAxisIndex: [0, 1], zoomOnMouseWheel: true, moveOnMouseMove: true, moveOnMouseWheel: false, preventDefaultMouseMove: true, cursorGrab: "grab", cursorGrabbing: "grabbing" },
-      { id: "smc-slider-zoom", type: "slider", xAxisIndex: [0, 1], bottom: "2%", height: 16, borderColor: axis, fillerColor: "rgba(105,185,255,.14)", handleStyle: { color: "#69b9ff" }, textStyle: { color: text } },
+      { id: "smc-inside-zoom", type: "inside", xAxisIndex: [0, 1], start: initialStart, end: 100, zoomOnMouseWheel: true, moveOnMouseMove: true, moveOnMouseWheel: false, preventDefaultMouseMove: true, cursorGrab: "grab", cursorGrabbing: "grabbing" },
+      { id: "smc-slider-zoom", type: "slider", xAxisIndex: [0, 1], start: initialStart, end: 100, bottom: "2%", height: 16, borderColor: axis, fillerColor: "rgba(105,185,255,.14)", handleStyle: { color: "#69b9ff" }, textStyle: { color: text } },
     ],
     series: [
       {
@@ -234,8 +243,8 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
   } as EChartsOption;
 }
 
-export default function NativeSMCChartOverlay({ state, timeframe = "5m", rightOffsetBars = 12, filters, selectedObjectId, onCandleSelect, fitContentSignal, lightMode = false, height = 700 }: Props) {
-  const option = useMemo(() => chartOption(state, timeframe, rightOffsetBars, filters, selectedObjectId, lightMode), [state, timeframe, rightOffsetBars, filters, selectedObjectId, lightMode]);
+export default function NativeSMCChartOverlay({ state, timeframe = "5m", rightOffsetBars = 12, initialVisibleBars = 240, filters, selectedObjectId, onCandleSelect, fitContentSignal, lightMode = false, height = 700 }: Props) {
+  const option = useMemo(() => chartOption(state, timeframe, rightOffsetBars, initialVisibleBars, filters, selectedObjectId, lightMode), [state, timeframe, rightOffsetBars, initialVisibleBars, filters, selectedObjectId, lightMode]);
   const events = useMemo(() => ({
     click: (event: any) => {
       if (event?.seriesName !== "Market candles" || typeof event.dataIndex !== "number") return;
