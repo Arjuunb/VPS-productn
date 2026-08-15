@@ -19,10 +19,31 @@ def test_live_visual_uses_only_closed_bars_and_never_enables_execution():
     now = datetime(2025, 3, 1, tzinfo=UTC) + timedelta(minutes=5 * 250)
     state = live_visual_state(now=now, fetcher=_bars)
     assert state["execution_allowed"] is False
-    assert len(state["candles"]) == 250
-    assert state["data_provenance"]["mode"] == "LIVE_EXCHANGE_CLOSED_CANDLES"
+    assert len(state["candles"]) == 240
+    assert state["forming_candle"] is None
+    assert state["live_display"]["execution_uses_closed_bars_only"] is True
+    assert state["data_provenance"]["mode"] == "LIVE_EXCHANGE_DISPLAY_WITH_CLOSED_BAR_SMC"
     assert state["data_provenance"]["venue"] == "MEXC perpetual"
     assert state["data_provenance"]["forming_candle_excluded"] is False
+
+
+def test_live_visual_renders_forming_candle_without_feeding_it_to_smc():
+    start = datetime(2025, 3, 1, tzinfo=UTC)
+    now = start + timedelta(minutes=5 * 250)
+
+    def source(symbol: str, timeframe: str, venue: str, limit: int):
+        rows = _bars(symbol, timeframe, venue, limit)
+        # This candle has just opened at ``now`` and must be visual-only.
+        return rows + [Bar(now, 999, 1_005, 995, 1_002, 123)]
+
+    state = live_visual_state(now=now, fetcher=source)
+    forming = state["forming_candle"]
+    assert forming["timestamp"] == now.isoformat()
+    assert forming["close"] == 1_002
+    assert all(row["timestamp"] != forming["timestamp"] for row in state["candles"])
+    assert state["data_provenance"]["forming_candle_excluded"] is True
+    assert state["live_display"]["is_forming"] is True
+    assert state["execution_allowed"] is False
 
 
 def test_live_visual_rejects_unknown_venue():

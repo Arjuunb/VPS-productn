@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type Dispatch, type SetStateAction } from "react";
 import Card from "../components/common/Card";
 import { Badge, EmptyState, Field, PageHeader } from "../components/common/ui";
 import NativeSMCChartOverlay, {
@@ -15,7 +15,35 @@ interface ReviewSampleResponse { sample: ReviewSampleItem[] }
 interface Review { id: string; object_id: string; component: string; classification: ReviewClassification; reason?: string | null; notes?: string | null; selected_candle_timestamp?: string | null }
 interface ReviewsResponse { reviews: Review[] }
 interface PineReference { reference_id: string; status: string; language: string; sha256: string; execution_allowed: false; notice: string; content: string }
-interface DataProvenance { mode: string; venue: string; market: string; observed_at: string; closed_candles_used: number; last_closed_candle: string; forming_candle_excluded: boolean; execution_allowed: false }
+interface DataProvenance { mode: string; venue: string; market: string; observed_at: string; closed_candles_loaded: number; closed_candles_visible: number; last_closed_candle: string; forming_candle_excluded: boolean; execution_allowed: false }
+
+type ReferenceInput = { label: string; value: string };
+type ReferenceInputGroup = { title: string; inputs: ReferenceInput[] };
+const REFERENCE_INPUT_GROUPS: ReferenceInputGroup[] = [
+  { title: "PRO Strategy & Automation", inputs: [
+    { label: "ATR Length for SL", value: "14" }, { label: "Stop Loss ATR Multiplier", value: "1.5" }, { label: "Risk/Reward Ratio (TP)", value: "2.5" },
+    { label: "Killzone Session", value: "0700–1100, 1300–1600" }, { label: "Killzone Timezone", value: "Europe/London" }, { label: "Liquidity Sweep Memory", value: "10 bars" },
+    { label: "CHoCH Memory", value: "8 bars" }, { label: "FVG Entry Window", value: "5 bars" }, { label: "Confirmed bars only", value: "Enabled" }, { label: "Structure Break ATR Filter", value: "0.3" },
+  ] },
+  { title: "Price Action Filters", inputs: [{ label: "Require Rejection Candle Entry", value: "Enabled" }, { label: "Wick-to-Body Ratio", value: "2.0" }] },
+  { title: "Internal & Swing Structure", inputs: [
+    { label: "Show Internal Structure", value: "Enabled" }, { label: "Internal Pivot Length", value: "5" }, { label: "Internal Bull/Bear Structure", value: "All" }, { label: "Internal Label Size", value: "Tiny" }, { label: "Internal Confluence Filter", value: "Disabled" },
+    { label: "Show Swing Structure", value: "Enabled" }, { label: "Swing Structure", value: "All" }, { label: "Swing Label Size", value: "Small" }, { label: "Show Swing Points", value: "Disabled" }, { label: "Swing Pivot Length", value: "50" }, { label: "Strong/Weak High/Low", value: "Enabled" },
+  ] },
+  { title: "Order Blocks & Fair Value Gaps", inputs: [
+    { label: "Internal Order Blocks", value: "Enabled · 5" }, { label: "Swing Order Blocks", value: "Disabled · 5" }, { label: "Order Block Filter", value: "ATR" }, { label: "OB Mitigation", value: "High/Low" },
+    { label: "Equal High/Low", value: "Enabled · 3 bars · threshold 0.1" }, { label: "Fair Value Gaps", value: "Enabled" }, { label: "FVG Auto Threshold", value: "Enabled" }, { label: "FVG Volume Surge Filter", value: "Enabled" }, { label: "FVG Timeframe", value: "Chart timeframe" }, { label: "Extend FVG", value: "1 bar" },
+  ] },
+  { title: "Premium/Discount & Dashboard", inputs: [
+    { label: "Premium / Discount Zones", value: "Enabled" }, { label: "Dashboard", value: "Enabled · Top Right" }, { label: "HTF Bias Filter", value: "240 minutes (4h)" }, { label: "POI Proximity ATR Buffer", value: "0.8" },
+    { label: "Zone Lookback", value: "80 bars" }, { label: "Zone / Label Right Offset", value: "2 bars" },
+  ] },
+  { title: "Reference Visual Colours", inputs: [
+    { label: "Bullish / Bearish Structure", value: "#089981 / #F23645" }, { label: "Internal Bullish / Bearish OB", value: "#3179F5 / #F77C80 · 80% transparent" },
+    { label: "Swing Bullish / Bearish OB", value: "#1848CC / #B22833 · 80% transparent" }, { label: "Bullish / Bearish FVG", value: "#00FF68 / #FF0008 · 70% transparent" },
+    { label: "Premium / Equilibrium / Discount", value: "#F23645 / #878B94 / #089981" }, { label: "Colour Candles", value: "Disabled" },
+  ] },
+];
 
 const defaultFilters: NativeSMCOverlayFilters = { pivots: true, internal: true, swing: true, structure: true, liquidity: true, fvg: true, orderBlocks: true, mitigated: true, labels: true };
 const shortId = (id?: string | null) => id ? `${id.slice(0, 10)}…` : "—";
@@ -78,6 +106,27 @@ function PineReferencePanel({ reference, error }: { reference: PineReference | n
   </Card>;
 }
 
+function IndicatorAndChartSettings({ lightChart, setLightChart, visibleBars, setVisibleBars, liveRefreshMs, setLiveRefreshMs, setFitSignal }: {
+  lightChart: boolean; setLightChart: (value: boolean) => void; visibleBars: number; setVisibleBars: (value: number) => void;
+  liveRefreshMs: number; setLiveRefreshMs: (value: number) => void; setFitSignal: Dispatch<SetStateAction<number>>;
+}) {
+  return <div className="smc-settings-layout">
+    <Card title="Chart settings" subtitle="active display preferences — they never alter native SMC research state">
+      <div className="form-grid smc-settings-grid">
+        <Field label="Live visible candles"><select value={visibleBars} onChange={(event) => setVisibleBars(Number(event.target.value))}><option value={120}>120 · tight intraday view</option><option value={240}>240 · standard view</option><option value={400}>400 · extended view</option><option value={800}>800 · full loaded window</option></select></Field>
+        <Field label="Live refresh cadence"><select value={liveRefreshMs} onChange={(event) => setLiveRefreshMs(Number(event.target.value))}><option value={3000}>About every 3 seconds</option><option value={5000}>Every 5 seconds</option><option value={10000}>Every 10 seconds</option></select></Field>
+        <Field label="Chart theme"><select value={lightChart ? "light" : "dark"} onChange={(event) => setLightChart(event.target.value === "light")}><option value="dark">Nexus dark</option><option value="light">Light</option></select></Field>
+      </div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}><button className="btn btn-primary" type="button" onClick={() => setFitSignal((value) => value + 1)}>Reset chart view</button><span className="dim" style={{ alignSelf: "center", fontSize: 12 }}>Wheel zooms · drag pans · hovering never moves the chart.</span></div>
+      <div className="instance-risk-notice amber" style={{ marginTop: 12 }}><b>Live display boundary.</b> A forming candle may move visually, but it is not supplied to the native SMC engine. Structure, zones, snapshots, and execution authority remain closed-bar-only.</div>
+    </Card>
+    <Card title="Pine indicator inputs" subtitle="immutable SMC PRO v2 reference defaults · shown for TradingView comparison">
+      <div className="instance-risk-notice amber"><b>Read-only reference.</b> These are the original Pine defaults. Change them in TradingView when comparing the reference script; this Lab does not reconfigure the Pine source or native SMC model.</div>
+      <div className="smc-reference-input-groups">{REFERENCE_INPUT_GROUPS.map((group) => <details key={group.title} open><summary>{group.title}<span>{group.inputs.length} inputs</span></summary><div className="smc-reference-inputs">{group.inputs.map((input) => <label key={input.label}><span>{input.label}</span><input value={input.value} readOnly aria-label={`${group.title}: ${input.label}`} /></label>)}</div></details>)}</div>
+    </Card>
+  </div>;
+}
+
 export default function NativeSMCVisualPage() {
   const [symbol, setSymbol] = useState("BTCUSDT");
   const [timeframe, setTimeframe] = useState("5m");
@@ -86,10 +135,12 @@ export default function NativeSMCVisualPage() {
   const [jumpValue, setJumpValue] = useState("");
   const [filters, setFilters] = useState(defaultFilters);
   const [lightChart, setLightChart] = useState(false);
-  const [workspace, setWorkspace] = useState<"chart" | "pine">("chart");
+  const [workspace, setWorkspace] = useState<"chart" | "pine" | "settings">("chart");
   const [chartFeed, setChartFeed] = useState<"checkpoint" | "mexc_perpetual" | "kraken_spot">("checkpoint");
   const [fullChart, setFullChart] = useState(false);
   const [fitSignal, setFitSignal] = useState(0);
+  const [visibleBars, setVisibleBars] = useState(240);
+  const [liveRefreshMs, setLiveRefreshMs] = useState(3_000);
   const [classification, setClassification] = useState<ReviewClassification>("CORRECT");
   const [reason, setReason] = useState("");
   const [expectedStructure, setExpectedStructure] = useState("");
@@ -102,8 +153,8 @@ export default function NativeSMCVisualPage() {
   const focusedAt = chartFeed === "checkpoint" ? (selectedCandle || selectedSample?.timestamp || "") : "";
   const chartPath = chartFeed === "checkpoint"
     ? `/research/smc/chart?symbol=${symbol}&timeframe=${timeframe}&window=800${focusedAt ? `&at=${encodeURIComponent(focusedAt)}` : ""}`
-    : `/research/smc/live-chart?symbol=${symbol}&timeframe=${timeframe}&venue=${chartFeed}&window=800`;
-  const state = useLive<NativeState & { data_provenance?: DataProvenance }>(chartPath, chartFeed === "checkpoint" ? 5_000 : 15_000);
+    : `/research/smc/live-chart?symbol=${symbol}&timeframe=${timeframe}&venue=${chartFeed}&window=800&visible=${visibleBars}`;
+  const state = useLive<NativeState & { data_provenance?: DataProvenance }>(chartPath, chartFeed === "checkpoint" ? 5_000 : liveRefreshMs);
   const reviews = useLive<ReviewsResponse>(`/research/smc/reviews?symbol=${symbol}&timeframe=${timeframe}`, 15_000);
   const pineReference = useLive<PineReference>("/research/smc/pine-reference", 600_000);
   const data = state.data;
@@ -161,39 +212,40 @@ export default function NativeSMCVisualPage() {
   const chartPanel = data ? <Card
     className="smc-chart-card"
     title="Nexus SMC chart"
-    subtitle={`${chartSubtitle} · ${data.candles.length} candles`}
+    subtitle={`${chartSubtitle} · ${data.candles.length} visible closed candles${data.forming_candle ? " + forming candle" : ""}`}
     right={<div className="smc-chart-actions"><Badge text="CLOSED BARS" tone="green" /><button className="btn btn-soft" type="button" onClick={() => setFitSignal((value) => value + 1)}>Fit</button><button className="btn btn-primary" type="button" onClick={() => setFullChart((value) => !value)}>{fullChart ? "Exit full screen" : "Full screen"}</button></div>}
   >
-    {data.data_provenance ? <div className="smc-live-strip"><span className="pulse-dot green" /><span><b>Live visual feed</b> · observed {at(data.data_provenance.observed_at)} · {data.data_provenance.closed_candles_used} confirmed candles</span><span className="dim">Forming candle excluded · execution disabled</span></div> : <div className="smc-live-strip"><span className="pulse-dot gold" /><span><b>Verified research checkpoint</b> · fixed March 2025 review evidence</span><span className="dim">Execution disabled</span></div>}
+    {data.data_provenance ? <div className="smc-live-strip"><span className="pulse-dot green" /><span><b>Live price display</b> · observed {at(data.live_display?.observed_at)} · {data.live_display?.is_forming ? "forming candle moves every ~3 seconds" : "awaiting provider forming candle"}</span><span className="dim">SMC uses {data.data_provenance.closed_candles_loaded} confirmed candles only · execution disabled</span></div> : <div className="smc-live-strip"><span className="pulse-dot gold" /><span><b>Verified research checkpoint</b> · fixed March 2025 review evidence</span><span className="dim">Execution disabled</span></div>}
     <NativeSMCChartOverlay state={data} filters={filters} selectedObjectId={selectedObjectId} onCandleSelect={onSelectCandle} fitContentSignal={fitSignal} lightMode={lightChart} height={fullChart ? "calc(100vh - 205px)" : "min(70vh, 780px)"} />
-    <div className="smc-chart-footer"><span><b>Selected OHLC</b> {selectedRow ? `O ${selectedRow.open} · H ${selectedRow.high} · L ${selectedRow.low} · C ${selectedRow.close} · V ${selectedRow.volume}` : "Click a candle to inspect its confirmed state"}</span><span>Wheel: zoom · Drag: pan · Esc: exit full screen</span></div>
+    <div className="smc-chart-footer"><span><b>{data.forming_candle ? "Live forming OHLC" : "Selected OHLC"}</b> {data.forming_candle ? `O ${data.forming_candle.open} · H ${data.forming_candle.high} · L ${data.forming_candle.low} · C ${data.forming_candle.close} · V ${data.forming_candle.volume}` : selectedRow ? `O ${selectedRow.open} · H ${selectedRow.high} · L ${selectedRow.low} · C ${selectedRow.close} · V ${selectedRow.volume}` : "Click a candle to inspect its confirmed state"}</span><span>Wheel: zoom · Drag: pan · Esc: exit full screen</span></div>
   </Card> : null;
 
   return <>
-    <PageHeader title="Native SMC Visual Lab" subtitle="TradingView-style native structure verification · closed exchange candles only"
+    <PageHeader title="Native SMC Visual Lab" subtitle="TradingView-style live exchange display · native SMC remains confirmed-candle-only"
       actions={<><Badge text="SMC_NATIVE_V1_RESEARCH" tone="purple" /> <Badge text="EXECUTION DISABLED" tone="red" /></>} />
     <div className="instance-risk-notice amber" role="status"><b>Research visualisation only.</b> The browser renders backend objects; it cannot calculate SMC, create signals, or place paper/live orders.</div>
     <Card className="smc-workstation-card" title="Research workspace" subtitle="native chart objects and the immutable Pine reference are deliberately separate">
       <div className="smc-workspace-tabs">
         <button className={`btn ${workspace === "chart" ? "btn-primary" : "btn-soft"}`} type="button" onClick={() => setWorkspace("chart")}>Chart workspace</button>
         <button className={`btn ${workspace === "pine" ? "btn-primary" : "btn-soft"}`} type="button" onClick={() => setWorkspace("pine")}>Pine reference</button>
+        <button className={`btn ${workspace === "settings" ? "btn-primary" : "btn-soft"}`} type="button" onClick={() => setWorkspace("settings")}>Indicator & chart settings</button>
         <span className="dim" style={{ padding: "7px 2px", fontSize: 11 }}>The chart renders native closed-candle state; Pine is shown read-only for side-by-side review.</span>
       </div>
       {workspace === "chart" ? <>
       <div className="smc-control-grid">
-        <Field label="Chart feed"><select value={chartFeed} onChange={(event) => { setChartFeed(event.target.value as typeof chartFeed); setSelectedCandle(""); }}><option value="checkpoint">Verified March 2025 checkpoint · BTCUSDT 5m</option><option value="mexc_perpetual">Live MEXC perpetual · closed candles</option><option value="kraken_spot">Live Kraken spot · closed candles</option></select></Field>
+        <Field label="Chart feed"><select value={chartFeed} onChange={(event) => { setChartFeed(event.target.value as typeof chartFeed); setSelectedCandle(""); }}><option value="checkpoint">Verified March 2025 checkpoint · BTCUSDT 5m</option><option value="mexc_perpetual">Live MEXC perpetual · moving display / closed-bar SMC</option><option value="kraken_spot">Live Kraken spot · moving display / closed-bar SMC</option></select></Field>
         <Field label="Symbol"><select value={symbol} onChange={(event) => switchDataset(event.target.value)}><option>BTCUSDT</option><option>ETHUSDT</option><option>SOLUSDT</option></select></Field>
         <Field label="Timeframe"><select value={timeframe} onChange={(event) => switchDataset(symbol, event.target.value)}><option>1m</option><option>3m</option><option>5m</option><option>30m</option><option>1h</option><option>4h</option><option>1d</option><option>1w</option></select></Field>
         {chartFeed === "checkpoint" ? <><Field label="Jump to UTC time"><input type="datetime-local" value={jumpValue} onChange={(event) => setJumpValue(event.target.value)} /></Field>
         <button className="btn btn-primary" type="button" onClick={jumpToTime}>Jump to time</button>
-        <Field label="Review item"><select value={selectedObjectId ?? ""} onChange={(event) => { const index = reviewItems.findIndex((row) => row.object_id === event.target.value); selectReview(index); }}><option value="">Select review item</option>{reviewItems.map((row, index) => <option key={row.object_id} value={row.object_id}>{index + 1} / {reviewItems.length} · {category(row.category)} · {at(row.timestamp)}</option>)}</select></Field></> : <div className="dim" style={{ alignSelf: "center", fontSize: 12 }}>Refreshes every 15 seconds. The native model receives only fully closed candles.</div>}
+        <Field label="Review item"><select value={selectedObjectId ?? ""} onChange={(event) => { const index = reviewItems.findIndex((row) => row.object_id === event.target.value); selectReview(index); }}><option value="">Select review item</option>{reviewItems.map((row, index) => <option key={row.object_id} value={row.object_id}>{index + 1} / {reviewItems.length} · {category(row.category)} · {at(row.timestamp)}</option>)}</select></Field></> : <div className="dim" style={{ alignSelf: "center", fontSize: 12 }}>Refreshes about every 3 seconds. The moving candle is visual-only; the native model receives fully closed candles only.</div>}
       </div>
       <div className="smc-overlay-controls">
         <span className="dim">Render filters:</span>
         {([ ["Pivots", "pivots"], ["Internal", "internal"], ["Swing", "swing"], ["Structure", "structure"], ["Liquidity", "liquidity"], ["FVG", "fvg"], ["Order blocks", "orderBlocks"], ["Mitigated", "mitigated"], ["Labels", "labels"] ] as [string, keyof NativeSMCOverlayFilters][]).map(([label, key]) => <Toggle key={key} label={label} enabled={filters[key]} onClick={() => setFilter(key)} />)}
         <Toggle label="Light chart" enabled={lightChart} onClick={() => setLightChart((value) => !value)} />
       </div>
-      </> : <PineReferencePanel reference={pineReference.data} error={pineReference.error} />}
+      </> : workspace === "pine" ? <PineReferencePanel reference={pineReference.data} error={pineReference.error} /> : <IndicatorAndChartSettings lightChart={lightChart} setLightChart={setLightChart} visibleBars={visibleBars} setVisibleBars={setVisibleBars} liveRefreshMs={liveRefreshMs} setLiveRefreshMs={setLiveRefreshMs} setFitSignal={setFitSignal} />}
     </Card>
     {workspace === "chart" && (state.error ? <div className="instance-risk-notice red">{state.error}</div> : !data?.candles.length ? <EmptyState text={chartFeed === "checkpoint" ? "No verified closed-candle checkpoint is attached. Configure HUB_SMC_VISUAL_CHECKPOINT_PATH before reviewing native SMC." : "The selected live venue has not returned enough valid closed candles yet."} /> : <>
       {!fullChart ? <div className="smc-chart-layout">

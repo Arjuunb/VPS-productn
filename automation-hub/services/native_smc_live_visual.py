@@ -1,13 +1,16 @@
-"""Read-only live market feed for the Native SMC visual lab.
+"""Read-only near-real-time market feed for the Native SMC visual lab.
 
-This module is deliberately separate from Trading Instances. It obtains a
-small current OHLCV window for side-by-side review, rejects an open candle,
-builds a fresh research model in memory, and returns no execution authority.
-Nothing here writes a checkpoint, signal, order, or trade.
+The SMC model is deliberately fed confirmed candles only.  The most recent
+*forming* exchange candle is returned separately so the chart can move like a
+market terminal without letting unconfirmed data affect structure, setups, or
+execution (which remains permanently disabled for native SMC).
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from threading import RLock
+from time import monotonic
 from typing import Callable
 
 from bot.data.resample import TF_SECONDS
@@ -34,6 +37,24 @@ LIVE_VENUES = {
 
 class NativeSMCLiveDataUnavailable(RuntimeError):
     """A live visual source did not yield valid closed candles."""
+
+
+@dataclass
+class _LiveVisualFeed:
+    """In-memory display cache; it is never a trading worker or data store."""
+
+    engine: SMCMarketStructureEngine
+    first_closed_candle: datetime
+    loaded_closed_candles: int
+    last_raw_count: int
+    last_observed_at: datetime
+    forming_candle: Bar | None
+    last_fetch_monotonic: float
+
+
+_LIVE_FEEDS: dict[tuple[str, str, str], _LiveVisualFeed] = {}
+_LIVE_FEEDS_LOCK = RLock()
+_LIVE_REFRESH_SECONDS = 2.5
 
 
 def _validate(symbol: str, timeframe: str, venue: str) -> tuple[str, str, str]:
@@ -69,13 +90,37 @@ def fetch_venue_ohlcv(symbol: str, timeframe: str, venue: str, limit: int) -> li
     return bars
 
 
-def live_visual_state(symbol: str = "BTCUSDT", timeframe: str = "5m", venue: str = "mexc_perpetual", *,
-                      limit: int = 800, now: datetime | None = None,
-                      fetcher: Callable[[str, str, str, int], list[Bar]] = fetch_venue_ohlcv) -> dict:
-    """Return current visual state from real, closed venue candles only."""
-    symbol, timeframe, venue = _validate(symbol, timeframe, venue)
-    now = now or datetime.now(timezone.utc)
-    raw = fetcher(symbol, timeframe, venue, max(200, min(int(limit), 1000)))
+def _forming_candle(raw: list[Bar], timeframe_seconds: int, now: datetime) -> Bar | None:
+    """Return the current provider candle for display without accepting it as fact."""
+    candidates = [bar for bar in raw if bar.timestamp + timedelta(seconds=timeframe_seconds) > now]
+    if not candidates:
+        return None
+    candidate = max(candidates, key=lambda bar: bar.timestamp)
+    if min(candidate.open, candidate.high, candidate.low, candidate.close) <= 0:
+        return None
+    if candidate.volume < 0 or candidate.high < max(candidate.open, candidate.close, candidate.low):
+        return None
+    if candidate.low > min(candidate.open, candidate.close, candidate.high):
+        return None
+    return candidate
+
+
+def _candle_payload(bar: Bar | None) -> dict | None:
+    if bar is None:
+        return None
+    return {
+        "timestamp": bar.timestamp.isoformat(),
+        "open": bar.open,
+        "high": bar.high,
+        "low": bar.low,
+        "close": bar.close,
+        "volume": bar.volume,
+    }
+
+
+def _new_feed(symbol: str, timeframe: str, venue: str, limit: int, now: datetime,
+              fetcher: Callable[[str, str, str, int], list[Bar]]) -> _LiveVisualFeed:
+    raw = fetcher(symbol, timeframe, venue, max(200, min(int(limit), 1_000)))
     closed = valid_closed_bars(raw, TF_SECONDS[timeframe], now=now)
     if len(closed) < 200:
         raise NativeSMCLiveDataUnavailable(
@@ -83,20 +128,91 @@ def live_visual_state(symbol: str = "BTCUSDT", timeframe: str = "5m", venue: str
         )
     engine = SMCMarketStructureEngine(SMCConfig(symbol=symbol, timeframe=timeframe))
     engine.ingest_authoritative_closed_bars(closed, timeframe_seconds=TF_SECONDS[timeframe], now=now)
-    state = engine.visual_state(candle_window=min(800, len(closed)))
+    return _LiveVisualFeed(
+        engine=engine,
+        first_closed_candle=closed[0].timestamp,
+        loaded_closed_candles=len(closed),
+        last_raw_count=len(raw),
+        last_observed_at=now,
+        forming_candle=_forming_candle(raw, TF_SECONDS[timeframe], now),
+        last_fetch_monotonic=monotonic(),
+    )
+
+
+def _refresh_feed(feed: _LiveVisualFeed, symbol: str, timeframe: str, venue: str,
+                  now: datetime, fetcher: Callable[[str, str, str, int], list[Bar]]) -> None:
+    """Advance an existing feed with a tiny provider window.
+
+    ``process_closed_bar`` is idempotent, so overlap is intentional: the last
+    few provider candles protect against a boundary arriving just as it closes.
+    """
+    raw = fetcher(symbol, timeframe, venue, 6)
+    closed = valid_closed_bars(raw, TF_SECONDS[timeframe], now=now)
+    feed.engine.ingest_authoritative_closed_bars(closed, timeframe_seconds=TF_SECONDS[timeframe], now=now)
+    feed.loaded_closed_candles = len(feed.engine.bars)
+    feed.last_raw_count = len(raw)
+    feed.last_observed_at = now
+    feed.forming_candle = _forming_candle(raw, TF_SECONDS[timeframe], now)
+    feed.last_fetch_monotonic = monotonic()
+
+
+def live_visual_state(symbol: str = "BTCUSDT", timeframe: str = "5m", venue: str = "mexc_perpetual", *,
+                      limit: int = 800, visible: int = 240, now: datetime | None = None,
+                      fetcher: Callable[[str, str, str, int], list[Bar]] = fetch_venue_ohlcv) -> dict:
+    """Return a real-time display state while isolating native SMC to closed bars.
+
+    Production calls share a small in-memory feed and poll it at most once per
+    short interval.  Deterministic callers that provide a clock or a fetcher
+    bypass that cache, keeping tests and evidence generation reproducible.
+    """
+    symbol, timeframe, venue = _validate(symbol, timeframe, venue)
+    if not 20 <= int(visible) <= 1_000:
+        raise ValueError("visible must be between 20 and 1000")
+    supplied_clock_or_fetcher = now is not None or fetcher is not fetch_venue_ohlcv
+    observed_at = now or datetime.now(timezone.utc)
+    key = (symbol, timeframe, venue)
+
+    if supplied_clock_or_fetcher:
+        feed = _new_feed(symbol, timeframe, venue, limit, observed_at, fetcher)
+    else:
+        with _LIVE_FEEDS_LOCK:
+            feed = _LIVE_FEEDS.get(key)
+            if feed is None:
+                feed = _new_feed(symbol, timeframe, venue, limit, observed_at, fetcher)
+                _LIVE_FEEDS[key] = feed
+            elif monotonic() - feed.last_fetch_monotonic >= _LIVE_REFRESH_SECONDS:
+                _refresh_feed(feed, symbol, timeframe, venue, observed_at, fetcher)
+
+    state = feed.engine.visual_state(candle_window=min(int(visible), len(feed.engine.bars)))
+    forming = _candle_payload(feed.forming_candle)
+    candle_closes_at = (
+        (feed.forming_candle.timestamp + timedelta(seconds=TF_SECONDS[timeframe])).isoformat()
+        if feed.forming_candle else None
+    )
+    state["forming_candle"] = forming
+    state["live_display"] = {
+        "is_forming": forming is not None,
+        "observed_at": feed.last_observed_at.isoformat(),
+        "refresh_interval_seconds": _LIVE_REFRESH_SECONDS,
+        "candle_closes_at": candle_closes_at,
+        "last_price": forming["close"] if forming else state["candles"][-1]["close"],
+        "execution_uses_closed_bars_only": True,
+    }
     state["data_provenance"] = {
-        "mode": "LIVE_EXCHANGE_CLOSED_CANDLES",
+        "mode": "LIVE_EXCHANGE_DISPLAY_WITH_CLOSED_BAR_SMC",
         "venue": LIVE_VENUES[venue]["label"],
         "ccxt_exchange": LIVE_VENUES[venue]["ccxt_id"],
         "market": LIVE_VENUES[venue]["market"](symbol),
         "symbol": symbol,
         "timeframe": timeframe,
-        "observed_at": now.isoformat(),
-        "raw_candles_received": len(raw),
-        "closed_candles_used": len(closed),
-        "first_closed_candle": closed[0].timestamp.isoformat(),
-        "last_closed_candle": closed[-1].timestamp.isoformat(),
-        "forming_candle_excluded": len(raw) > len(closed),
+        "observed_at": feed.last_observed_at.isoformat(),
+        "raw_candles_received": feed.last_raw_count,
+        "closed_candles_loaded": feed.loaded_closed_candles,
+        "closed_candles_visible": len(state["candles"]),
+        "closed_candles_used": feed.loaded_closed_candles,
+        "first_closed_candle": feed.first_closed_candle.isoformat(),
+        "last_closed_candle": feed.engine.bars[-1].timestamp.isoformat(),
+        "forming_candle_excluded": forming is not None,
         "execution_allowed": False,
     }
     return state

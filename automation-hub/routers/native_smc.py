@@ -51,10 +51,11 @@ def chart(symbol: str = "BTCUSDT", timeframe: str = "5m", at: str | None = None,
 
 
 @router.get("/live-chart")
-def live_chart(symbol: str = "BTCUSDT", timeframe: str = "5m", venue: str = "mexc_perpetual", window: int = 800):
+def live_chart(symbol: str = "BTCUSDT", timeframe: str = "5m", venue: str = "mexc_perpetual",
+               window: int = 800, visible: int = 240):
     """Read-only live-exchange visualisation; never a trading data path."""
     try:
-        return live_visual_state(symbol, timeframe, venue, limit=window)
+        return live_visual_state(symbol, timeframe, venue, limit=window, visible=visible)
     except (NativeSMCLiveDataUnavailable, ValueError) as exc:
         raise HTTPException(503, str(exc)) from exc
 

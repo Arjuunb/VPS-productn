@@ -21,6 +21,9 @@ export interface NativeSMCChartState {
   research_id: string; execution_allowed: false; candles: NativeCandle[]; pivots: NativePivot[]; events: NativeEvent[];
   fair_value_gaps: NativeZone[]; order_blocks: NativeZone[]; proposals: NativeProposal[];
   snapshot: NativeSnapshot | null; selected_snapshot: NativeSnapshot | null; snapshot_ledger: NativeSnapshot[];
+  /** A provider-supplied open candle for display. Never contributes to SMC state. */
+  forming_candle?: NativeCandle | null;
+  live_display?: { is_forming: boolean; observed_at: string; refresh_interval_seconds: number; candle_closes_at: string | null; last_price: number; execution_uses_closed_bars_only: true };
 }
 export interface NativeSMCOverlayFilters {
   pivots: boolean; internal: boolean; swing: boolean; structure: boolean; liquidity: boolean;
@@ -42,7 +45,12 @@ const colorFor = (direction: Direction) => direction === "bullish" ? "#21c77a" :
 const timestamp = (value: string) => value.replace("T", " ").replace("+00:00", " UTC").slice(0, 23);
 
 function chartOption(state: NativeSMCChartState, filters: NativeSMCOverlayFilters, selectedObjectId?: string, lightMode = false): EChartsOption {
-  const candles = state.candles;
+  const closedCandles = state.candles;
+  // The display candle intentionally remains outside the native model's
+  // snapshots. It makes the chart feel live without turning an unclosed bar
+  // into market-structure evidence.
+  const hasFormingCandle = Boolean(state.forming_candle);
+  const candles = hasFormingCandle ? [...closedCandles, state.forming_candle!] : closedCandles;
   const labels = candles.map((row) => row.timestamp);
   const labelSet = new Set(labels);
   const first = labels[0];
@@ -100,7 +108,9 @@ function chartOption(state: NativeSMCChartState, filters: NativeSMCOverlayFilter
   const text = lightMode ? "#344054" : "#98a2b3";
 
   return {
-    animation: false,
+    animation: true,
+    animationDurationUpdate: 220,
+    animationEasingUpdate: "linear",
     backgroundColor: canvas,
     axisPointer: {
       link: [{ xAxisIndex: [0, 1] }],
@@ -119,9 +129,10 @@ function chartOption(state: NativeSMCChartState, filters: NativeSMCOverlayFilter
       formatter: (params: any) => {
         const custom = (params as any[]).find((row) => row.data?.metadata);
         if (custom?.data?.metadata) return custom.data.metadata.split("\n").join("<br/>");
-        const candle = (params as any[]).find((row) => row.seriesName === "Closed candles");
-        const value = candle?.data as number[] | undefined;
-        return value ? `${candle.axisValue}<br/>O ${value[0]} · H ${value[3]} · L ${value[2]} · C ${value[1]}` : "";
+        const candle = (params as any[]).find((row) => row.seriesName === "Market candles");
+        const value = Array.isArray(candle?.data) ? candle.data : candle?.data?.value as number[] | undefined;
+        const status = candle?.data?.forming ? "FORMING · visual only" : "CLOSED · native SMC eligible";
+        return value ? `${candle.axisValue}<br/><b>${status}</b><br/>O ${value[0]} · H ${value[3]} · L ${value[2]} · C ${value[1]}` : "";
       },
     },
     grid: [
@@ -144,8 +155,12 @@ function chartOption(state: NativeSMCChartState, filters: NativeSMCOverlayFilter
     ],
     series: [
       {
-        id: "smc-candles", type: "candlestick", name: "Closed candles", xAxisIndex: 0, yAxisIndex: 0,
-        data: candles.map((row) => [row.open, row.close, row.low, row.high]), barMaxWidth: 18,
+        id: "smc-candles", type: "candlestick", name: "Market candles", xAxisIndex: 0, yAxisIndex: 0,
+        data: candles.map((row, index) => ({
+          value: [row.open, row.close, row.low, row.high],
+          forming: hasFormingCandle && index === candles.length - 1,
+          itemStyle: hasFormingCandle && index === candles.length - 1 ? { opacity: 0.78, borderWidth: 2 } : undefined,
+        })), barMaxWidth: 18,
         itemStyle: { color: "#089981", color0: "#f23645", borderColor: "#089981", borderColor0: "#f23645" },
         markArea: { silent: true, label: { color: "#bac4d5", fontSize: 10 }, data: [...rangeAreas, ...fvgAreas, ...obAreas] },
         markLine: { silent: true, symbol: "none", label: { color: "#cfd6e4", fontSize: 10 }, data: [
@@ -154,11 +169,11 @@ function chartOption(state: NativeSMCChartState, filters: NativeSMCOverlayFilter
             { yAxis: range.equilibrium, name: `EQUILIBRIUM ${range.equilibrium}`, lineStyle: { color: "#eab54f", type: "dashed" } },
             { yAxis: range.low, name: "Range low", lineStyle: { color: "#21c77a", type: "dotted" } },
           ] : []),
-          ...(lastCandle ? [{ yAxis: lastCandle.close, name: `LAST ${lastCandle.close}`, lineStyle: { color: lastCandle.close >= lastCandle.open ? "#21c77a" : "#ef5b5b", width: 1 } }] : []),
+          ...(lastCandle ? [{ yAxis: lastCandle.close, name: `${hasFormingCandle ? "LIVE" : "LAST"} ${lastCandle.close}`, lineStyle: { color: lastCandle.close >= lastCandle.open ? "#21c77a" : "#ef5b5b", width: hasFormingCandle ? 1.5 : 1 } }] : []),
           ...proposalLines,
         ] },
       },
-      { id: "smc-volume", type: "bar", name: "Volume", xAxisIndex: 1, yAxisIndex: 1, data: candles.map((row) => ({ value: row.volume, itemStyle: { color: row.close >= row.open ? "rgba(8,153,129,.70)" : "rgba(242,54,69,.70)" } })), barMaxWidth: 18 },
+      { id: "smc-volume", type: "bar", name: "Volume", xAxisIndex: 1, yAxisIndex: 1, data: candles.map((row, index) => ({ value: row.volume, itemStyle: { color: row.close >= row.open ? "rgba(8,153,129,.70)" : "rgba(242,54,69,.70)", opacity: hasFormingCandle && index === candles.length - 1 ? 0.72 : 1 } })), barMaxWidth: 18 },
       { id: "smc-pivots", type: "scatter", name: "Native pivots", xAxisIndex: 0, yAxisIndex: 0, data: pivotData as any[], symbolSize: 8, label: { show: filters.labels, formatter: (row: any) => row.data.name, color: "#d7deea", fontSize: 9, position: "top" }, z: 8 },
       { id: "smc-structure", type: "scatter", name: "Native structure", xAxisIndex: 0, yAxisIndex: 0, data: structureData as any[], symbol: "diamond", symbolSize: 11, label: { show: filters.labels, formatter: (row: any) => row.data.name, color: "#d7deea", fontSize: 9, position: "bottom" }, z: 9 },
     ],
@@ -169,7 +184,9 @@ export default function NativeSMCChartOverlay({ state, filters, selectedObjectId
   const option = useMemo(() => chartOption(state, filters, selectedObjectId, lightMode), [state, filters, selectedObjectId, lightMode]);
   const events = useMemo(() => ({
     click: (event: any) => {
-      if (event?.seriesName !== "Closed candles" || typeof event.dataIndex !== "number") return;
+      if (event?.seriesName !== "Market candles" || typeof event.dataIndex !== "number") return;
+      // There is intentionally no state snapshot for the still-forming candle.
+      if (event.dataIndex >= state.candles.length) return;
       const candle = state.candles[event.dataIndex];
       if (candle) onCandleSelect(candle.timestamp);
     },
