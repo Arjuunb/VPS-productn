@@ -8,6 +8,7 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from services.native_smc import VisualReview, VisualReviewLedger, research_engine
+from services.native_smc_live_visual import NativeSMCLiveDataUnavailable, live_visual_state
 from services.native_smc_visual_verification import deterministic_review_sample
 
 router = APIRouter(prefix="/research/smc", tags=["research-smc"])
@@ -47,6 +48,15 @@ def state(symbol: str = "BTCUSDT", timeframe: str = "5m", at: str | None = None,
 def chart(symbol: str = "BTCUSDT", timeframe: str = "5m", at: str | None = None, window: int = 400):
     """Chart contract made only from native engine objects and raw candles."""
     return research_engine(symbol, timeframe).visual_state(candle_at=_at_timestamp(at), candle_window=window)
+
+
+@router.get("/live-chart")
+def live_chart(symbol: str = "BTCUSDT", timeframe: str = "5m", venue: str = "mexc_perpetual", window: int = 800):
+    """Read-only live-exchange visualisation; never a trading data path."""
+    try:
+        return live_visual_state(symbol, timeframe, venue, limit=window)
+    except (NativeSMCLiveDataUnavailable, ValueError) as exc:
+        raise HTTPException(503, str(exc)) from exc
 
 
 @router.get("/pine-reference")
