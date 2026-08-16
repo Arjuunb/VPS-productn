@@ -43,6 +43,8 @@ def test_live_visual_renders_forming_candle_without_feeding_it_to_smc():
     assert all(row["timestamp"] != forming["timestamp"] for row in state["candles"])
     assert state["data_provenance"]["forming_candle_excluded"] is True
     assert state["live_display"]["is_forming"] is True
+    assert state["live_display"]["last_price"] == 1_002
+    assert state["live_display"]["price_direction"] == "unchanged"
     assert state["execution_allowed"] is False
 
 
@@ -51,7 +53,15 @@ def test_live_visual_rejects_unknown_venue():
         live_visual_state(venue="unknown", fetcher=_bars)
 
 
-@pytest.mark.parametrize("timeframe", ["1m", "3m", "5m", "30m", "1h", "4h", "1d", "1w"])
+def test_live_price_direction_is_factual_and_never_interpolated():
+    from services.native_smc_live_visual import _price_direction
+
+    assert _price_direction(100.0, 101.0) == "up"
+    assert _price_direction(101.0, 100.0) == "down"
+    assert _price_direction(100.0, 100.0) == "unchanged"
+
+
+@pytest.mark.parametrize("timeframe", ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"])
 def test_live_visual_accepts_each_supported_comparison_timeframe(timeframe):
     # Validation is intentionally separated from fetching so every intended
     # TradingView comparison interval has an explicit server-side contract.

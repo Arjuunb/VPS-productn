@@ -713,6 +713,16 @@ a.brand:hover { opacity: 0.85; }
 .smc-chart-heading span { overflow: hidden; color: var(--dim); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .smc-chart-surface .smc-live-strip { margin: 8px 10px; }
 .smc-chart-surface .smc-chart-footer { margin: 8px 10px 10px; }
+.smc-live-strip.is-stale { border-color: rgba(234,181,79,.45); background: linear-gradient(90deg, rgba(234,181,79,.12), rgba(255,255,255,.01)); }
+.smc-chart-canvas { position: relative; min-width: 0; overflow: hidden; }
+.smc-live-price-ticker { position: absolute; z-index: 5; right: 3px; display: grid; min-width: 68px; padding: 2px 5px 3px; border: 1px solid; border-radius: 3px; color: #f8fafc; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; line-height: 1.05; pointer-events: none; transform: translateY(-50%); box-shadow: 0 2px 8px rgba(0,0,0,.28); }
+.smc-live-price-ticker b { font-size: 11px; font-weight: 800; letter-spacing: -.02em; }
+.smc-live-price-ticker small { margin-top: 2px; font-size: 9px; font-weight: 700; letter-spacing: .04em; opacity: .88; }
+.smc-live-price-ticker.up { border-color: #20b779; background: #087f6c; }
+.smc-live-price-ticker.down { border-color: #e45b68; background: #c92f3d; }
+.smc-live-price-ticker.unchanged { border-color: #758197; background: #384252; }
+.smc-live-price-ticker.stale { border-color: #b48a39; background: #4a3a1b; color: #f6d68e; }
+.smc-live-price-ticker.light { box-shadow: 0 2px 7px rgba(15,23,42,.18); }
 .smc-state-panel { min-width: 0; border: 1px solid var(--card-border); border-radius: 8px; background: #0c0e12; overflow: hidden; }
 .smc-state-panel.is-collapsed { width: 44px; }
 .smc-state-panel-head { display: flex; align-items: center; justify-content: space-between; min-height: 42px; padding: 8px 9px; border-bottom: 1px solid var(--card-border-soft); }

@@ -49,6 +49,11 @@ class _LiveVisualFeed:
     last_raw_count: int
     last_observed_at: datetime
     forming_candle: Bar | None
+    # These display-only values are deliberately sourced from the same raw
+    # exchange candle as the chart.  They never enter the native SMC engine.
+    last_price: float
+    price_direction: str
+    price_updated_at: datetime
     last_fetch_monotonic: float
 
 
@@ -57,12 +62,31 @@ _LIVE_FEEDS_LOCK = RLock()
 _LIVE_REFRESH_SECONDS = 2.5
 
 
+def _display_price(forming: Bar | None, closed: list[Bar]) -> float:
+    """Return the one authoritative display price for this visual feed."""
+    if forming is not None:
+        return float(forming.close)
+    if closed:
+        return float(closed[-1].close)
+    raise NativeSMCLiveDataUnavailable("live visual source has no display price")
+
+
+def _price_direction(previous: float | None, current: float) -> str:
+    if previous is None:
+        return "unchanged"
+    if current > previous:
+        return "up"
+    if current < previous:
+        return "down"
+    return "unchanged"
+
+
 def _validate(symbol: str, timeframe: str, venue: str) -> tuple[str, str, str]:
     symbol, timeframe, venue = symbol.upper(), timeframe.lower(), venue.lower()
     if symbol not in {"BTCUSDT", "ETHUSDT", "SOLUSDT"}:
         raise ValueError("symbol must be one of BTCUSDT, ETHUSDT, or SOLUSDT")
-    if timeframe not in {"1m", "3m", "5m", "30m", "1h", "4h", "1d", "1w"}:
-        raise ValueError("timeframe must be one of 1m, 3m, 5m, 30m, 1h, 4h, 1d, or 1w")
+    if timeframe not in {"1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"}:
+        raise ValueError("timeframe must be one of 1m, 3m, 5m, 15m, 30m, 1h, 4h, 1d, or 1w")
     if venue not in LIVE_VENUES:
         raise ValueError("venue must be one of mexc_perpetual or kraken_spot")
     return symbol, timeframe, venue
@@ -128,13 +152,18 @@ def _new_feed(symbol: str, timeframe: str, venue: str, limit: int, now: datetime
         )
     engine = SMCMarketStructureEngine(SMCConfig(symbol=symbol, timeframe=timeframe))
     engine.ingest_authoritative_closed_bars(closed, timeframe_seconds=TF_SECONDS[timeframe], now=now)
+    forming = _forming_candle(raw, TF_SECONDS[timeframe], now)
+    price = _display_price(forming, closed)
     return _LiveVisualFeed(
         engine=engine,
         first_closed_candle=closed[0].timestamp,
         loaded_closed_candles=len(closed),
         last_raw_count=len(raw),
         last_observed_at=now,
-        forming_candle=_forming_candle(raw, TF_SECONDS[timeframe], now),
+        forming_candle=forming,
+        last_price=price,
+        price_direction="unchanged",
+        price_updated_at=now,
         last_fetch_monotonic=monotonic(),
     )
 
@@ -153,6 +182,10 @@ def _refresh_feed(feed: _LiveVisualFeed, symbol: str, timeframe: str, venue: str
     feed.last_raw_count = len(raw)
     feed.last_observed_at = now
     feed.forming_candle = _forming_candle(raw, TF_SECONDS[timeframe], now)
+    current_price = _display_price(feed.forming_candle, closed or feed.engine.bars)
+    feed.price_direction = _price_direction(feed.last_price, current_price)
+    feed.last_price = current_price
+    feed.price_updated_at = now
     feed.last_fetch_monotonic = monotonic()
 
 
@@ -195,7 +228,12 @@ def live_visual_state(symbol: str = "BTCUSDT", timeframe: str = "5m", venue: str
         "observed_at": feed.last_observed_at.isoformat(),
         "refresh_interval_seconds": _LIVE_REFRESH_SECONDS,
         "candle_closes_at": candle_closes_at,
-        "last_price": forming["close"] if forming else state["candles"][-1]["close"],
+        # The chart, right-axis ticker, toolbar and watchlist consume this one
+        # exchange-derived value. Do not add client-side synthetic motion.
+        "last_price": feed.last_price,
+        "price_direction": feed.price_direction,
+        "price_updated_at": feed.price_updated_at.isoformat(),
+        "source_mode": "exchange_ohlcv_live_poll",
         "execution_uses_closed_bars_only": True,
     }
     state["data_provenance"] = {
