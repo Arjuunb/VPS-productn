@@ -8,7 +8,11 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from services.native_smc import VisualReview, VisualReviewLedger, research_engine
-from services.native_smc_live_visual import NativeSMCLiveDataUnavailable, live_visual_state
+from services.native_smc_live_visual import (
+    NativeSMCLiveDataUnavailable,
+    live_visual_history,
+    live_visual_state,
+)
 from services.native_smc_visual_verification import deterministic_review_sample
 
 router = APIRouter(prefix="/research/smc", tags=["research-smc"])
@@ -56,6 +60,22 @@ def live_chart(symbol: str = "BTCUSDT", timeframe: str = "5m", venue: str = "mex
     """Read-only live-exchange visualisation; never a trading data path."""
     try:
         return live_visual_state(symbol, timeframe, venue, limit=window, visible=visible)
+    except (NativeSMCLiveDataUnavailable, ValueError) as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@router.get("/live-history")
+def live_history(symbol: str = "BTCUSDT", timeframe: str = "5m", venue: str = "mexc_perpetual",
+                 before: str | None = None, limit: int = 400):
+    """One paginated, closed-candle exchange page for Visual Lab browsing."""
+    if before is None:
+        raise HTTPException(422, "'before' is required for historical paging")
+    parsed_before = _at_timestamp(before)
+    # Guarded above; keeping this explicit makes the non-optional boundary of
+    # the service contract clear without changing timestamp semantics.
+    assert parsed_before is not None
+    try:
+        return live_visual_history(symbol, timeframe, venue, before=parsed_before, limit=limit)
     except (NativeSMCLiveDataUnavailable, ValueError) as exc:
         raise HTTPException(503, str(exc)) from exc
 

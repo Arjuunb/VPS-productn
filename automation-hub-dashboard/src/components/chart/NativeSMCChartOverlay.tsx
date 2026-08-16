@@ -64,6 +64,15 @@ interface Props {
   /** Current display range, owned by the visual workspace only. */
   viewport?: ChartTimeViewport | null;
   onViewportChange?: (range: ChartTimeViewport) => void;
+  /** Request one earlier exchange page only after the user reaches the left edge. */
+  onHistoryNearStart?: () => void;
+  historyLoading?: boolean;
+  hasMoreHistory?: boolean;
+  /** True while the viewport is intentionally browsing behind the live edge. */
+  historicalMode?: boolean;
+  onGoLive?: () => void;
+  /** Versioned count of candles prepended by the read-only history page API. */
+  prependedHistory?: { version: number; count: number } | null;
   onPriceAxisDrag?: (deltaY: number, shiftKey: boolean) => void;
   onResetPriceScale?: () => void;
   onChartPointerDown?: () => void;
@@ -91,6 +100,23 @@ function priceDecimals(value: number): number {
 function formatPrice(value: number): string {
   const digits = priceDecimals(value);
   return value.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+
+function formatVolume(value: number): string {
+  const magnitude = Math.abs(value);
+  if (magnitude >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(2)}B`;
+  if (magnitude >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
+  if (magnitude >= 1_000) return `${(value / 1_000).toFixed(2)}K`;
+  return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+
+function compactCursorTime(value: string): string {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return value;
+  return new Intl.DateTimeFormat(undefined, {
+    day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: false,
+    timeZone: "UTC",
+  }).format(new Date(parsed)).replace(",", "") + " UTC";
 }
 
 function useCandleCountdown(candleClosesAt?: string | null, observedAt?: string): string {
@@ -304,6 +330,9 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
     tooltip: {
       trigger: "axis",
       triggerOn: "mousemove",
+      // The compact React readout below is easier to scan than a floating
+      // tooltip, while ECharts still owns the coordinate-accurate crosshair.
+      showContent: false,
       showDelay: 90,
       hideDelay: 120,
       transitionDuration: 0.08,
@@ -323,11 +352,11 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
       { left: 58, right: 74, top: "79%", height: "13%" },
     ],
     xAxis: [
-      { id: "smc-price-x", type: "category", data: labels, boundaryGap: true, axisLine: { lineStyle: { color: axis } }, axisLabel: { show: false } },
-      { id: "smc-volume-x", type: "category", gridIndex: 1, data: labels, boundaryGap: true, axisLine: { lineStyle: { color: axis } }, axisLabel: { color: text, formatter: (value: string) => value.slice(5, 16), fontSize: 10 } },
+      { id: "smc-price-x", type: "category", data: labels, boundaryGap: true, axisLine: { lineStyle: { color: axis } }, axisLabel: { show: false }, axisPointer: { label: { show: false } } },
+      { id: "smc-volume-x", type: "category", gridIndex: 1, data: labels, boundaryGap: true, axisLine: { lineStyle: { color: axis } }, axisLabel: { color: text, formatter: (value: string) => value.slice(5, 16), fontSize: 10 }, axisPointer: { label: { show: true, formatter: (item: any) => compactCursorTime(String(item.value)) } } },
     ],
     yAxis: [
-      { id: "smc-price-y", scale: true, position: "right", axisLine: { lineStyle: { color: axis } }, axisLabel: { color: text, fontSize: 10 }, splitLine: { lineStyle: { color: lightMode ? "#edf0f5" : "#1d222b" } }, ...priceAxisRange },
+      { id: "smc-price-y", scale: true, position: "right", axisLine: { lineStyle: { color: axis } }, axisLabel: { color: text, fontSize: 10 }, splitLine: { lineStyle: { color: lightMode ? "#edf0f5" : "#1d222b" } }, axisPointer: { label: { show: true, formatter: (item: any) => formatPrice(Number(item.value)) } }, ...priceAxisRange },
       { id: "smc-volume-y", gridIndex: 1, position: "right", axisLabel: { color: text, fontSize: 10 }, splitLine: { show: false } },
     ],
     dataZoom: [
@@ -371,7 +400,7 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
   } as EChartsOption, priceAxisRange, livePrice, liveDirection };
 }
 
-export default function NativeSMCChartOverlay({ state, timeframe = "5m", rightOffsetBars = 12, initialVisibleBars = 120, filters, selectedObjectId, onCandleSelect, fitContentSignal, latestSignal, centerTimestamp, priceViewport, viewport, onViewportChange, onPriceAxisDrag, onResetPriceScale, onChartPointerDown, lightMode = false, liveDataStale = false, height = 700 }: Props) {
+export default function NativeSMCChartOverlay({ state, timeframe = "5m", rightOffsetBars = 12, initialVisibleBars = 120, filters, selectedObjectId, onCandleSelect, fitContentSignal, latestSignal, centerTimestamp, priceViewport, viewport, onViewportChange, onHistoryNearStart, historyLoading = false, hasMoreHistory = true, historicalMode = false, onGoLive, prependedHistory, onPriceAxisDrag, onResetPriceScale, onChartPointerDown, lightMode = false, liveDataStale = false, height = 700 }: Props) {
   const presentation = useMemo(() => chartOption(state, timeframe, rightOffsetBars, initialVisibleBars, filters, selectedObjectId, lightMode, priceViewport, viewport, liveDataStale), [state, timeframe, rightOffsetBars, initialVisibleBars, filters, selectedObjectId, lightMode, priceViewport, viewport, liveDataStale]);
   const labels = state.candles.length + (state.forming_candle ? 1 : 0) + Math.max(0, rightOffsetBars);
   const localWindowBars = Math.min(labels, Math.max(24, initialVisibleBars + rightOffsetBars));
@@ -392,6 +421,15 @@ export default function NativeSMCChartOverlay({ state, timeframe = "5m", rightOf
   // Fit deliberately returns to a concise local range instead of full history.
   const focusWindow = useMemo(() => windowAround(currentSpanBars), [windowAround, currentSpanBars]);
   const fitWindow = useMemo(() => windowAround(localWindowBars), [windowAround, localWindowBars]);
+  const allCandles = useMemo(() => state.forming_candle ? [...state.candles, state.forming_candle] : state.candles, [state.candles, state.forming_candle]);
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
+  const inspectedCandle = hoveredIndex !== null && hoveredIndex >= 0 && hoveredIndex < allCandles.length
+    ? allCandles[hoveredIndex]
+    : allCandles[allCandles.length - 1];
+  const handleViewportChange = useCallback((range: ChartTimeViewport) => {
+    onViewportChange?.(range);
+    if (range.start <= 3.5 && hasMoreHistory && !historyLoading) onHistoryNearStart?.();
+  }, [onViewportChange, onHistoryNearStart, hasMoreHistory, historyLoading]);
   const events = useMemo(() => ({
     click: (event: any) => {
       if (event?.seriesName !== "Market candles" || typeof event.dataIndex !== "number") return;
@@ -400,10 +438,19 @@ export default function NativeSMCChartOverlay({ state, timeframe = "5m", rightOf
       const candle = state.candles[event.dataIndex];
       if (candle) onCandleSelect(candle.timestamp);
     },
-  }), [onCandleSelect, state.candles]);
+    updateAxisPointer: (event: any) => {
+      const axis = (event?.axesInfo ?? []).find((item: any) => item.axisDim === "x" && Number.isFinite(Number(item.value)));
+      const index = axis ? Number(axis.value) : -1;
+      setHoveredIndex(index >= 0 && index < allCandles.length ? index : null);
+    },
+    globalout: () => setHoveredIndex(null),
+  }), [onCandleSelect, state.candles, allCandles.length]);
   const live = state.live_display;
   return <div className="smc-chart-canvas" style={{ height }}>
-    <EChart option={presentation.option} height="100%" onEvents={events} preserveInteraction fitContentSignal={fitContentSignal} fitRange={fitWindow ?? { start: Math.max(0, ((labels - localWindowBars) / Math.max(1, labels)) * 100), end: 100 }} latestSignal={latestSignal} latestStart={newestWindow.start} focusWindow={focusWindow} onViewportChange={onViewportChange} onPriceAxisDrag={onPriceAxisDrag} onResetPriceScale={onResetPriceScale} onChartPointerDown={onChartPointerDown} style={{ borderRadius: 8 }} />
+    <EChart option={presentation.option} height="100%" onEvents={events} preserveInteraction fitContentSignal={fitContentSignal} fitRange={fitWindow ?? { start: Math.max(0, ((labels - localWindowBars) / Math.max(1, labels)) * 100), end: 100 }} latestSignal={latestSignal} latestStart={newestWindow.start} focusWindow={focusWindow} onViewportChange={handleViewportChange} prependedData={prependedHistory ? { ...prependedHistory, total: labels } : null} onPriceAxisDrag={onPriceAxisDrag} onResetPriceScale={onResetPriceScale} onChartPointerDown={onChartPointerDown} style={{ borderRadius: 8 }} />
+    {inspectedCandle ? <div className={`smc-ohlc-readout ${inspectedCandle.close >= inspectedCandle.open ? "bullish" : "bearish"}`} aria-live="polite"><b>{compactCursorTime(inspectedCandle.timestamp)}</b><span>O {formatPrice(inspectedCandle.open)}</span><span>H {formatPrice(inspectedCandle.high)}</span><span>L {formatPrice(inspectedCandle.low)}</span><span>C {formatPrice(inspectedCandle.close)}</span><span>Vol {formatVolume(inspectedCandle.volume)}</span>{hoveredIndex !== null ? <em>CURSOR</em> : <em>LATEST</em>}</div> : null}
+    {historyLoading ? <span className="smc-history-loading">Loading history…</span> : null}
+    {historicalMode && onGoLive ? <button type="button" className="smc-go-live" onClick={onGoLive}>→ Live</button> : null}
     {live && presentation.livePrice !== null ? <LivePriceTicker price={presentation.livePrice} range={presentation.priceAxisRange} direction={presentation.liveDirection} candleClosesAt={live.candle_closes_at} observedAt={live.observed_at} stale={liveDataStale} lightMode={lightMode} /> : null}
   </div>;
 }

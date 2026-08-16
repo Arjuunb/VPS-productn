@@ -92,14 +92,17 @@ def _validate(symbol: str, timeframe: str, venue: str) -> tuple[str, str, str]:
     return symbol, timeframe, venue
 
 
-def fetch_venue_ohlcv(symbol: str, timeframe: str, venue: str, limit: int) -> list[Bar]:
+def fetch_venue_ohlcv(symbol: str, timeframe: str, venue: str, limit: int, *,
+                      since_ms: int | None = None) -> list[Bar]:
     """Fetch raw live candles from the explicitly selected visual venue."""
     config = LIVE_VENUES[venue]
     try:
         import ccxt
         exchange_class = getattr(ccxt, config["ccxt_id"])
         exchange = exchange_class({"enableRateLimit": True, "options": config["options"]})
-        rows = exchange.fetch_ohlcv(config["market"](symbol), timeframe=timeframe, limit=limit)
+        rows = exchange.fetch_ohlcv(
+            config["market"](symbol), timeframe=timeframe, limit=limit, since=since_ms,
+        )
     except Exception as exc:
         raise NativeSMCLiveDataUnavailable(
             f"{config['label']} did not provide {symbol} {timeframe}: {type(exc).__name__}: {exc}"
@@ -112,6 +115,52 @@ def fetch_venue_ohlcv(symbol: str, timeframe: str, venue: str, limit: int) -> li
     if not bars:
         raise NativeSMCLiveDataUnavailable(f"{config['label']} returned no {symbol} {timeframe} candles")
     return bars
+
+
+def live_visual_history(symbol: str = "BTCUSDT", timeframe: str = "5m", venue: str = "mexc_perpetual", *,
+                        before: datetime, limit: int = 400, now: datetime | None = None,
+                        fetcher: Callable[..., list[Bar]] = fetch_venue_ohlcv) -> dict:
+    """Return one genuine, closed-candle page before ``before`` for chart browsing.
+
+    This is deliberately a display-data endpoint.  It neither restores nor
+    changes native SMC state: the Visual Lab can extend its historical canvas
+    without turning old bars into an execution or research-selection input.
+    """
+    symbol, timeframe, venue = _validate(symbol, timeframe, venue)
+    if before.tzinfo is None:
+        before = before.replace(tzinfo=timezone.utc)
+    else:
+        before = before.astimezone(timezone.utc)
+    page_size = max(50, min(int(limit), 1_000))
+    observed_at = now or datetime.now(timezone.utc)
+    step_seconds = TF_SECONDS[timeframe]
+    # Ask for exactly the preceding page.  Exchanges may return a smaller
+    # final page; that is an honest end-of-available-history signal.
+    since_ms = int((before - timedelta(seconds=step_seconds * page_size)).timestamp() * 1_000)
+    raw = fetcher(symbol, timeframe, venue, page_size, since_ms=since_ms)
+    closed = [bar for bar in valid_closed_bars(raw, step_seconds, now=observed_at) if bar.timestamp < before]
+    closed = closed[-page_size:]
+    return {
+        "research_only": True,
+        "execution_allowed": False,
+        "candles": [_candle_payload(bar) for bar in closed],
+        "before": before.isoformat(),
+        "oldest": closed[0].timestamp.isoformat() if closed else None,
+        "newest": closed[-1].timestamp.isoformat() if closed else None,
+        "has_more_history": len(closed) >= page_size,
+        "data_provenance": {
+            "mode": "LIVE_EXCHANGE_HISTORICAL_DISPLAY_PAGE",
+            "venue": LIVE_VENUES[venue]["label"],
+            "ccxt_exchange": LIVE_VENUES[venue]["ccxt_id"],
+            "market": LIVE_VENUES[venue]["market"](symbol),
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "observed_at": observed_at.isoformat(),
+            "request_before": before.isoformat(),
+            "closed_candles_returned": len(closed),
+            "execution_allowed": False,
+        },
+    }
 
 
 def _forming_candle(raw: list[Bar], timeframe_seconds: int, now: datetime) -> Bar | None:

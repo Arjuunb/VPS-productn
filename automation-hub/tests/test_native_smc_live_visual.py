@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from bot.types import Bar
-from services.native_smc_live_visual import live_visual_state
+from services.native_smc_live_visual import live_visual_history, live_visual_state
 
 
 UTC = timezone.utc
@@ -51,6 +51,30 @@ def test_live_visual_renders_forming_candle_without_feeding_it_to_smc():
 def test_live_visual_rejects_unknown_venue():
     with pytest.raises(ValueError, match="venue"):
         live_visual_state(venue="unknown", fetcher=_bars)
+
+
+def test_live_history_is_closed_only_ordered_and_execution_disabled():
+    start = datetime(2025, 3, 1, tzinfo=UTC)
+    before = start + timedelta(minutes=5 * 200)
+    now = start + timedelta(minutes=5 * 251)
+    received_since = []
+
+    def source(symbol: str, timeframe: str, venue: str, limit: int, *, since_ms=None):
+        received_since.append(since_ms)
+        return _bars(symbol, timeframe, venue, limit)
+
+    page = live_visual_history(before=before, limit=60, now=now, fetcher=source)
+
+    timestamps = [row["timestamp"] for row in page["candles"]]
+    assert received_since and received_since[0] is not None
+    assert page["execution_allowed"] is False
+    assert page["data_provenance"]["mode"] == "LIVE_EXCHANGE_HISTORICAL_DISPLAY_PAGE"
+    assert len(timestamps) == 60
+    assert timestamps == sorted(timestamps)
+    assert len(timestamps) == len(set(timestamps))
+    assert all(value < before.isoformat() for value in timestamps)
+    assert page["newest"] == timestamps[-1]
+    assert page["has_more_history"] is True
 
 
 def test_live_price_direction_is_factual_and_never_interpolated():

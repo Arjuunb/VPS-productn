@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useState, type Dispatch, type SetStateAction } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import Card from "../components/common/Card";
 import { Badge, EmptyState, Field, PageHeader } from "../components/common/ui";
 import NativeSMCChartOverlay, {
   type NativeCandle, type NativeEvent, type NativePivot, type NativeProposal, type NativeSMCChartState,
   type ChartPriceViewport, type ChartTimeViewport, type NativeSMCOverlayFilters, type NativeSnapshot, type NativeZone,
 } from "../components/chart/NativeSMCChartOverlay";
-import { apiPostJson, useLive } from "../lib/api";
+import { apiGet, apiPostJson, useLive } from "../lib/api";
 
 type ReviewClassification = "CORRECT" | "INCORRECT" | "AMBIGUOUS";
 interface Setup { id: string; direction: "bullish" | "bearish"; phase: string; next_required_event: string; transitions: { id: string; timestamp: string; to_phase: string; reason: string; object_id?: string | null }[] }
@@ -16,6 +16,7 @@ interface Review { id: string; object_id: string; component: string; classificat
 interface ReviewsResponse { reviews: Review[] }
 interface PineReference { reference_id: string; status: string; language: string; sha256: string; execution_allowed: false; notice: string; content: string }
 interface DataProvenance { mode: string; venue: string; market: string; observed_at: string; closed_candles_loaded: number; closed_candles_visible: number; last_closed_candle: string; forming_candle_excluded: boolean; execution_allowed: false }
+interface LiveHistoryPage { candles: NativeCandle[]; has_more_history: boolean; oldest: string | null; newest: string | null; execution_allowed: false }
 
 type ReferenceInput = { label: string; value: string };
 type ReferenceInputGroup = { title: string; inputs: ReferenceInput[] };
@@ -65,6 +66,12 @@ const at = (value?: string | null) => value ? value.replace("T", " ").replace("+
 const bias = (value?: number) => value === 1 ? "Bullish" : value === -1 ? "Bearish" : "Neutral";
 const category = (value: string) => value.split("_").join(" ").toUpperCase();
 const toUtc = (value: string) => value ? new Date(value).toISOString() : "";
+
+function mergeCandles(...groups: NativeCandle[][]): NativeCandle[] {
+  const byTimestamp = new Map<string, NativeCandle>();
+  for (const group of groups) for (const candle of group) byTimestamp.set(candle.timestamp, candle);
+  return [...byTimestamp.values()].sort((left, right) => left.timestamp.localeCompare(right.timestamp));
+}
 
 function Toggle({ label, enabled, onClick }: { label: string; enabled: boolean; onClick: () => void }) {
   return <button type="button" className={`btn ${enabled ? "btn-primary" : "btn-soft"}`} style={{ padding: "6px 9px", fontSize: 11 }} onClick={onClick} aria-pressed={enabled}>{label}</button>;
@@ -195,6 +202,15 @@ export default function NativeSMCVisualPage() {
   const [autoFollowLatest, setAutoFollowLatest] = useState(true);
   const [priceViewport, setPriceViewport] = useState<ChartPriceViewport>({ auto: true, scale: 1, offset: 0 });
   const [timeViewport, setTimeViewport] = useState<ChartTimeViewport | null>(null);
+  const [olderCandles, setOlderCandles] = useState<NativeCandle[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [hasMoreHistory, setHasMoreHistory] = useState(true);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [historyPrepend, setHistoryPrepend] = useState({ version: 0, count: 0 });
+  // The chart can emit several near-left-edge viewport updates for a single
+  // drag. Keep one request in flight so those events cannot fetch duplicate
+  // exchange pages before React has rendered `historyLoading`.
+  const historyRequestRef = useRef(false);
   const [classification, setClassification] = useState<ReviewClassification>("CORRECT");
   const [reason, setReason] = useState("");
   const [expectedStructure, setExpectedStructure] = useState("");
@@ -218,6 +234,7 @@ export default function NativeSMCVisualPage() {
   const reviews = useLive<ReviewsResponse>(`/research/smc/reviews?symbol=${symbol}&timeframe=${timeframe}`, 15_000);
   const pineReference = useLive<PineReference>("/research/smc/pine-reference", 600_000);
   const data = state.data;
+  const chartData = useMemo(() => data ? { ...data, candles: mergeCandles(olderCandles, data.candles) } : null, [data, olderCandles]);
   const reviewItems = sample.data?.sample ?? [];
   const reviewIndex = Math.max(0, reviewItems.findIndex((row) => row.object_id === selectedId));
   const selectedObjectId = selectedId || undefined;
@@ -237,6 +254,35 @@ export default function NativeSMCVisualPage() {
     const next = data?.candles[index + direction];
     if (next) onSelectCandle(next.timestamp);
   };
+  const goToLive = useCallback(() => {
+    setAutoFollowLatest(true);
+    setLatestSignal((value) => value + 1);
+  }, []);
+  useEffect(() => {
+    historyRequestRef.current = false;
+    setOlderCandles([]); setHasMoreHistory(true); setHistoryLoading(false); setHistoryError(null);
+    setHistoryPrepend((current) => ({ version: current.version + 1, count: 0 }));
+  }, [symbol, timeframe, chartFeed]);
+  const requestOlderHistory = useCallback(async () => {
+    if (chartFeed === "checkpoint" || historyRequestRef.current || historyLoading || !hasMoreHistory || !chartData?.candles.length) return;
+    const before = chartData.candles[0].timestamp;
+    historyRequestRef.current = true;
+    setHistoryLoading(true); setHistoryError(null);
+    try {
+      const page = await apiGet<LiveHistoryPage>(`/research/smc/live-history?symbol=${symbol}&timeframe=${timeframe}&venue=${chartFeed}&before=${encodeURIComponent(before)}&limit=400`);
+      const merged = mergeCandles(page.candles, olderCandles);
+      const count = Math.max(0, merged.length - olderCandles.length);
+      setOlderCandles(merged);
+      setHasMoreHistory(page.has_more_history && count > 0);
+      if (count > 0) setHistoryPrepend((current) => ({ version: current.version + 1, count }));
+    } catch (error) {
+      setHistoryError(error instanceof Error ? error.message : "Unable to load older exchange candles.");
+    } finally { historyRequestRef.current = false; setHistoryLoading(false); }
+  }, [chartFeed, chartData?.candles, hasMoreHistory, historyLoading, olderCandles, symbol, timeframe]);
+  const handleViewportChange = useCallback((range: ChartTimeViewport) => {
+    setTimeViewport(range);
+    setAutoFollowLatest(range.end >= 99.2);
+  }, []);
   const submitReview = async () => {
     if (!selectedObjectId || saving || !selectedReview) return;
     setSaving(true); setReviewError(null);
@@ -265,13 +311,13 @@ export default function NativeSMCVisualPage() {
       if (isTyping(event.target)) return;
       if (event.key === "Escape") { if (fullChart) setFullChart(false); else { setSelectedCandle(""); setSelectedId(""); } return; }
       if (event.key.toLowerCase() === "f") { event.preventDefault(); setFitSignal((value) => value + 1); setPriceViewport({ auto: true, scale: 1, offset: 0 }); return; }
-      if (event.key.toLowerCase() === "l") { event.preventDefault(); setLatestSignal((value) => value + 1); return; }
+      if (event.key.toLowerCase() === "l") { event.preventDefault(); goToLive(); return; }
       if (event.key === "ArrowLeft") { event.preventDefault(); event.shiftKey ? selectReview(Math.max(0, reviewIndex - 1)) : stepCandle(-1); }
       if (event.key === "ArrowRight") { event.preventDefault(); event.shiftKey ? selectReview(Math.min(reviewItems.length - 1, reviewIndex + 1)) : stepCandle(1); }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [fullChart, reviewIndex, reviewItems.length, selectReview]);
+  }, [fullChart, reviewIndex, reviewItems.length, selectReview, goToLive]);
 
   useEffect(() => { localStorage.setItem("tradexa.smc.watchlistCollapsed", watchlistCollapsed ? "1" : "0"); }, [watchlistCollapsed]);
   useEffect(() => { localStorage.setItem("tradexa.smc.smcPanelCollapsed", smcPanelCollapsed ? "1" : "0"); }, [smcPanelCollapsed]);
@@ -292,8 +338,8 @@ export default function NativeSMCVisualPage() {
   const chartPanel = data ? <section className="smc-chart-surface" aria-label="Native SMC chart workspace">
     <div className="smc-chart-heading"><div><b>Nexus SMC chart</b><span>{chartSubtitle} · {data.candles.length} closed candles{data.forming_candle ? " + visual forming candle" : ""}</span></div><Badge text="CLOSED-BAR SMC" tone="green" /></div>
     {data.data_provenance ? <div className={`smc-live-strip ${liveDataStale ? "is-stale" : ""}`}><span className={`pulse-dot ${liveDataStale ? "gold" : "green"}`} /><span><b>{liveDataStale ? "Live feed stale" : "Live exchange feed"}</b> · observed {at(data.live_display?.observed_at)} · {liveDataStale ? "last confirmed price frozen" : "forming candle is display-only"}</span><span className="dim">Native SMC uses closed candles only</span></div> : <div className="smc-live-strip"><span className="pulse-dot gold" /><span><b>Verified March 2025 checkpoint</b> · frozen human-review evidence</span><span className="dim">Execution disabled</span></div>}
-    <NativeSMCChartOverlay state={data} timeframe={timeframe} rightOffsetBars={rightOffsetBars} initialVisibleBars={visibleBars} filters={filters} selectedObjectId={selectedObjectId} onCandleSelect={onSelectCandle} fitContentSignal={fitSignal} latestSignal={latestSignal} centerTimestamp={selectedId ? selectedSnapshot?.candle_open : undefined} priceViewport={priceViewport} viewport={timeViewport} onViewportChange={setTimeViewport} onChartPointerDown={() => setAutoFollowLatest(false)} onPriceAxisDrag={adjustPriceViewport} onResetPriceScale={() => setPriceViewport({ auto: true, scale: 1, offset: 0 })} lightMode={lightChart} liveDataStale={liveDataStale} height={fullChart ? "calc(100vh - 250px)" : "min(68vh, 810px)"} />
-    <div className="smc-chart-footer"><span><b>{data.forming_candle ? "Live forming OHLC" : "Selected OHLC"}</b> {data.forming_candle ? `O ${data.forming_candle.open} · H ${data.forming_candle.high} · L ${data.forming_candle.low} · C ${data.forming_candle.close} · V ${data.forming_candle.volume}` : selectedRow ? `O ${selectedRow.open} · H ${selectedRow.high} · L ${selectedRow.low} · C ${selectedRow.close} · V ${selectedRow.volume}` : "Click any closed candle to lock its backend snapshot"}</span><span>Drag chart to pan · wheel to zoom · drag price scale to resize · Shift+drag price scale to pan · double-click price scale resets</span></div>
+    <NativeSMCChartOverlay state={chartData ?? data} timeframe={timeframe} rightOffsetBars={rightOffsetBars} initialVisibleBars={visibleBars} filters={filters} selectedObjectId={selectedObjectId} onCandleSelect={onSelectCandle} fitContentSignal={fitSignal} latestSignal={latestSignal} centerTimestamp={selectedId ? selectedSnapshot?.candle_open : undefined} priceViewport={priceViewport} viewport={timeViewport} onViewportChange={handleViewportChange} onHistoryNearStart={requestOlderHistory} historyLoading={historyLoading} hasMoreHistory={hasMoreHistory} historicalMode={!autoFollowLatest} onGoLive={goToLive} prependedHistory={historyPrepend} onPriceAxisDrag={adjustPriceViewport} onResetPriceScale={() => setPriceViewport({ auto: true, scale: 1, offset: 0 })} lightMode={lightChart} liveDataStale={liveDataStale} height={fullChart ? "calc(100vh - 250px)" : "min(68vh, 810px)"} />
+    <div className="smc-chart-footer"><span><b>{autoFollowLatest ? "Live follow" : "Historical browse"}</b> · crosshair inspects closed candles without changing native SMC state{chartFeed !== "checkpoint" && !hasMoreHistory ? " · oldest page reached" : ""}{historyError ? ` · ${historyError}` : ""}</span><span>Drag chart to pan · wheel to zoom · hover for OHLCV · L / Latest returns to live · drag price scale to resize</span></div>
   </section> : null;
 
   const reviewTerminal = chartFeed === "checkpoint" ? <div className="smc-bottom-content">
@@ -308,7 +354,7 @@ export default function NativeSMCVisualPage() {
   </div>;
 
   const chartWorkspace = state.error && !data ? <div className="instance-risk-notice red">{state.error}</div> : !data?.candles.length ? <EmptyState text={chartFeed === "checkpoint" ? "No verified closed-candle checkpoint is attached. Configure HUB_SMC_VISUAL_CHECKPOINT_PATH before reviewing native SMC." : "The selected live venue has not returned enough valid closed candles yet."} /> : <section className="smc-terminal-workspace">
-    <SMCTradingToolbar symbol={symbol} timeframe={timeframe} chartFeed={chartFeed} live={Boolean(data.data_provenance)} lastPrice={data.live_display?.last_price} reviewProgress={chartFeed === "checkpoint" ? `${selectedId ? reviewIndex + 1 : 0}/${reviewItems.length || 0}` : "LIVE"} showObjects={showObjects} showJump={showJump} autoFollowLatest={autoFollowLatest} onSymbolChange={switchDataset} onTimeframeChange={(value) => switchDataset(symbol, value)} onFeedChange={(feed) => { setChartFeed(feed); setSelectedCandle(""); setTimeViewport(null); setAutoFollowLatest(true); setLatestSignal((value) => value + 1); }} onToggleObjects={() => setShowObjects((value) => !value)} onToggleJump={() => setShowJump((value) => !value)} onFit={() => { setTimeViewport(null); setFitSignal((value) => value + 1); setPriceViewport({ auto: true, scale: 1, offset: 0 }); }} onLatest={() => { setAutoFollowLatest(true); setLatestSignal((value) => value + 1); }} onCompare={() => setWorkspace("pine")} onAutoScale={() => setPriceViewport({ auto: true, scale: 1, offset: 0 })} onOpenSettings={() => setWorkspace("settings")} onFullScreen={() => setFullChart(true)} />
+    <SMCTradingToolbar symbol={symbol} timeframe={timeframe} chartFeed={chartFeed} live={Boolean(data.data_provenance)} lastPrice={data.live_display?.last_price} reviewProgress={chartFeed === "checkpoint" ? `${selectedId ? reviewIndex + 1 : 0}/${reviewItems.length || 0}` : "LIVE"} showObjects={showObjects} showJump={showJump} autoFollowLatest={autoFollowLatest} onSymbolChange={switchDataset} onTimeframeChange={(value) => switchDataset(symbol, value)} onFeedChange={(feed) => { setChartFeed(feed); setSelectedCandle(""); setTimeViewport(null); goToLive(); }} onToggleObjects={() => setShowObjects((value) => !value)} onToggleJump={() => setShowJump((value) => !value)} onFit={() => { setTimeViewport(null); setFitSignal((value) => value + 1); setPriceViewport({ auto: true, scale: 1, offset: 0 }); }} onLatest={goToLive} onCompare={() => setWorkspace("pine")} onAutoScale={() => setPriceViewport({ auto: true, scale: 1, offset: 0 })} onOpenSettings={() => setWorkspace("settings")} onFullScreen={() => setFullChart(true)} />
     {showJump ? <div className="smc-compact-control-row"><label>Jump to UTC<input type="datetime-local" value={jumpValue} onChange={(event) => setJumpValue(event.target.value)} /></label><button className="btn btn-primary" type="button" onClick={jumpToTime}>Jump</button>{chartFeed === "checkpoint" ? <label>Review item<select value={selectedObjectId ?? ""} onChange={(event) => selectReview(reviewItems.findIndex((row) => row.object_id === event.target.value))}><option value="">Select review item</option>{reviewItems.map((row, index) => <option key={row.object_id} value={row.object_id}>{index + 1} · {category(row.category)} · {at(row.timestamp)}</option>)}</select></label> : null}<label>Right space<select value={rightOffsetBars} onChange={(event) => setRightOffsetBars(Number(event.target.value))}><option value={6}>6 bars</option><option value={12}>12 bars</option><option value={24}>24 bars</option><option value={48}>48 bars</option><option value={96}>96 bars</option><option value={160}>160 bars</option></select></label></div> : null}
     {showObjects ? <div className="smc-overlay-controls"><span className="dim">Visual objects</span>{([ ["Pivots", "pivots"], ["Internal", "internal"], ["Swing", "swing"], ["Structure", "structure"], ["Liquidity", "liquidity"], ["FVG", "fvg"], ["Order blocks", "orderBlocks"], ["Mitigated", "mitigated"], ["Labels", "labels"] ] as [string, keyof NativeSMCOverlayFilters][]).map(([label, key]) => <Toggle key={key} label={label} enabled={filters[key]} onClick={() => setFilter(key)} />)}<Toggle label="Light" enabled={lightChart} onClick={() => setLightChart((value) => !value)} /></div> : null}
     {terminalGrid}

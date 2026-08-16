@@ -27,6 +27,8 @@ interface EChartProps {
   onChartPointerDown?: () => void;
   /** Keeps caller-owned display bounds synchronized with native slider/pan actions. */
   onViewportChange?: (range: { start: number; end: number }) => void;
+  /** Keep the viewed candles fixed when a history page is prepended. */
+  prependedData?: { version: number; count: number; total: number } | null;
 }
 
 type ZoomRange = { start: number; end: number };
@@ -40,7 +42,7 @@ const clamp = (value: number, min: number, max: number) => Math.max(min, Math.mi
  * - Resizes with its container via ResizeObserver.
  * - Disposes on unmount (no leaks, no console errors).
  */
-export default function EChart({ option, height = "100%", className, style, onEvents, preserveInteraction = false, fitContentSignal, fitRange, latestSignal, latestStart = 0, focusWindow, onPriceAxisDrag, onResetPriceScale, onChartPointerDown, onViewportChange }: EChartProps) {
+export default function EChart({ option, height = "100%", className, style, onEvents, preserveInteraction = false, fitContentSignal, fitRange, latestSignal, latestStart = 0, focusWindow, onPriceAxisDrag, onResetPriceScale, onChartPointerDown, onViewportChange, prependedData }: EChartProps) {
   const elRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<echarts.ECharts | null>(null);
   const hasRenderedRef = useRef(false);
@@ -114,6 +116,21 @@ export default function EChart({ option, height = "100%", className, style, onEv
     lastFocusKeyRef.current = focusWindow.key;
     applyZoomRange(focusWindow);
   }, [focusWindow]);
+
+  useEffect(() => {
+    if (!prependedData || prependedData.count <= 0 || prependedData.total <= prependedData.count) return;
+    // ECharts expresses the time viewport as percentages.  Inserting candles
+    // at index zero would otherwise shift the same percentage to an older
+    // screen position. Convert the current range to indices, offset it by the
+    // page length, then convert it back to the enlarged series.
+    const current = readZoomRange();
+    const previousTotal = prependedData.total - prependedData.count;
+    const next = {
+      start: ((current.start / 100) * previousTotal + prependedData.count) / prependedData.total * 100,
+      end: ((current.end / 100) * previousTotal + prependedData.count) / prependedData.total * 100,
+    };
+    applyZoomRange(next);
+  }, [prependedData?.version]);
 
   useEffect(() => {
     const chart = chartRef.current;
