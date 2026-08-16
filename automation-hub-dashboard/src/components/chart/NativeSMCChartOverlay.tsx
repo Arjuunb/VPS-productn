@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useCallback, useMemo } from "react";
 import type { EChartsOption } from "echarts";
 import EChart from "./EChart";
 
@@ -30,6 +30,16 @@ export interface NativeSMCOverlayFilters {
   fvg: boolean; orderBlocks: boolean; mitigated: boolean; labels: boolean;
 }
 
+export interface ChartPriceViewport {
+  auto: boolean;
+  /** Higher values show a wider price range. */
+  scale: number;
+  /** Range-relative vertical displacement when auto-scale is disabled. */
+  offset: number;
+}
+
+export interface ChartTimeViewport { start: number; end: number }
+
 interface Props {
   state: NativeSMCChartState;
   /** The user-selected chart timeframe. Used only for display-range scaling. */
@@ -42,24 +52,33 @@ interface Props {
   selectedObjectId?: string;
   onCandleSelect: (timestamp: string) => void;
   fitContentSignal: number;
+  latestSignal?: number;
+  centerTimestamp?: string;
+  priceViewport?: ChartPriceViewport;
+  /** Current display range, owned by the visual workspace only. */
+  viewport?: ChartTimeViewport | null;
+  onViewportChange?: (range: ChartTimeViewport) => void;
+  onPriceAxisDrag?: (deltaY: number, shiftKey: boolean) => void;
+  onResetPriceScale?: () => void;
+  onChartPointerDown?: () => void;
   lightMode?: boolean;
   height?: number | string;
 }
 
-const shortId = (id: string) => `${id.slice(0, 10)}…`;
 const colorFor = (direction: Direction) => direction === "bullish" ? "#21c77a" : direction === "bearish" ? "#ef5b5b" : "#9ca3af";
 const timestamp = (value: string) => value.replace("T", " ").replace("+00:00", " UTC").slice(0, 23);
+const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 
 // Premium/discount is a visual aid in this Lab, not a new native-SMC input.
 // Each value represents a comparable recent market horizon for its timeframe,
 // rather than the all-history range held in a native research snapshot.
 const DISPLAY_RANGE_BARS: Record<string, number> = {
-  "1m": 180, "3m": 160, "5m": 144, "30m": 96,
+  "1m": 180, "3m": 150, "5m": 120, "15m": 110, "30m": 96,
   "1h": 72, "4h": 60, "1d": 60, "1w": 52,
 };
 
 const TIMEFRAME_MS: Record<string, number> = {
-  "1m": 60_000, "3m": 3 * 60_000, "5m": 5 * 60_000, "30m": 30 * 60_000,
+  "1m": 60_000, "3m": 3 * 60_000, "5m": 5 * 60_000, "15m": 15 * 60_000, "30m": 30 * 60_000,
   "1h": 60 * 60_000, "4h": 4 * 60 * 60_000, "1d": 24 * 60 * 60_000, "1w": 7 * 24 * 60 * 60_000,
 };
 
@@ -94,7 +113,7 @@ function futureChartSlots(lastTimestamp: string | undefined, timeframe: string, 
   return Array.from({ length: count }, (_, index) => new Date(start + step * (index + 1)).toISOString());
 }
 
-function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetBars: number, initialVisibleBars: number, filters: NativeSMCOverlayFilters, selectedObjectId?: string, lightMode = false): EChartsOption {
+function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetBars: number, initialVisibleBars: number, filters: NativeSMCOverlayFilters, selectedObjectId?: string, lightMode = false, priceViewport?: ChartPriceViewport, viewport?: ChartTimeViewport | null): EChartsOption {
   const closedCandles = state.candles;
   // The display candle intentionally remains outside the native model's
   // snapshots. It makes the chart feel live without turning an unclosed bar
@@ -114,14 +133,20 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
   const labelSet = new Set(candleLabels);
   const first = candleLabels[0];
   const last = candleLabels[candleLabels.length - 1];
-  const selectedSnapshot = state.selected_snapshot ?? state.snapshot;
+  const activeViewport = viewport ?? { start: initialStart, end: 100 };
+  const viewportStartIndex = clamp(Math.floor((activeViewport.start / 100) * labels.length), 0, Math.max(0, labels.length - 1));
+  const viewportEndIndex = clamp(Math.ceil((activeViewport.end / 100) * labels.length) - 1, viewportStartIndex, Math.max(0, labels.length - 1));
+  const visibleStart = labels[viewportStartIndex] ?? first;
+  const visibleEnd = candleLabels[Math.min(viewportEndIndex, candleLabels.length - 1)] ?? last;
+  const visibleCandles = candles.slice(viewportStartIndex, Math.min(viewportEndIndex + 1, candles.length));
   // Do not reuse snapshot.dealing_range here: it is intentionally calculated
   // from the full engine history for native-state evidence. The chart overlay
   // needs a local, timeframe-aware viewing range instead.
-  const range = timeframeDisplayRange(closedCandles, timeframe, selectedSnapshot?.candle_open);
-  const rangeEnd = range?.end === closedCandles[closedCandles.length - 1]?.timestamp ? last : range?.end;
+  const range = timeframeDisplayRange(visibleCandles, timeframe);
+  const rangeEnd = range?.end === visibleCandles[visibleCandles.length - 1]?.timestamp ? visibleEnd : range?.end;
   const eventAt = (row: NativeEvent) => row.confirmed_at ?? row.timestamp;
-  const inWindow = (value?: string | null) => Boolean(value && labelSet.has(value));
+  const inWindow = (value?: string | null) => Boolean(value && labelSet.has(value) && value >= visibleStart && value <= visibleEnd);
+  const overlapsVisibleWindow = (createdAt: string, removedAt?: string | null) => createdAt <= visibleEnd && (!removedAt || removedAt >= visibleStart);
   const spanStart = (value: string) => labelSet.has(value) ? value : first;
   const spanEnd = (value?: string | null) => value && labelSet.has(value) ? value : last;
 
@@ -132,15 +157,15 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
     if (row.event_type) return filters.structure && (row.scope === "internal" ? filters.internal : filters.swing) && inWindow(eventAt(row));
     return filters.liquidity && inWindow(row.timestamp);
   });
-  const zones = filters.fvg ? state.fair_value_gaps.filter((row) => (filters.mitigated || !row.mitigated) && row.created_at <= last && (!row.mitigation_at || row.mitigation_at >= first)) : [];
-  const orderBlocks = filters.orderBlocks ? state.order_blocks.filter((row) => (filters.mitigated || !row.mitigated) && row.created_at <= last && (!row.mitigation_at || row.mitigation_at >= first)) : [];
+  const zones = filters.fvg ? state.fair_value_gaps.filter((row) => (filters.mitigated || !row.mitigated) && overlapsVisibleWindow(row.created_at, row.mitigation_at)) : [];
+  const orderBlocks = filters.orderBlocks ? state.order_blocks.filter((row) => (filters.mitigated || !row.mitigated) && overlapsVisibleWindow(row.created_at, row.mitigation_at)) : [];
   const fvgAreas = zones.map((row) => [{
-    name: `${row.direction === "bullish" ? "Bull" : "Bear"} FVG ${shortId(row.id)}`,
+    name: `${row.direction === "bullish" ? "Bull" : "Bear"} FVG`,
     xAxis: spanStart(row.created_at), yAxis: row.bottom,
     itemStyle: { color: row.direction === "bullish" ? "rgba(34,197,94,.17)" : "rgba(239,91,91,.17)" },
   }, { xAxis: spanEnd(row.mitigation_at), yAxis: row.top }]);
   const obAreas = orderBlocks.map((row) => [{
-    name: `${row.direction === "bullish" ? "Bull" : "Bear"} OB ${shortId(row.id)}`,
+    name: `${row.direction === "bullish" ? "Bull" : "Bear"} OB`,
     xAxis: spanStart(row.created_at), yAxis: row.low,
     itemStyle: { color: row.direction === "bullish" ? "rgba(59,130,246,.14)" : "rgba(168,85,247,.14)" },
   }, { xAxis: spanEnd(row.mitigation_at), yAxis: row.high }]);
@@ -156,11 +181,6 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
     itemStyle: { color: colorFor(row.direction), borderColor: row.id === selectedObjectId ? "#ffffff" : undefined, borderWidth: row.id === selectedObjectId ? 2 : 0 },
     metadata: `${row.id}\n${row.event_type ? `${row.scope} ${row.event_type}` : "Liquidity sweep"}\nLevel: ${row.level}\nConfirmed: ${timestamp(eventAt(row)!)}`,
   }));
-  const proposalLines = state.proposals.flatMap((row) => [
-    { yAxis: row.entry, name: `ENTRY ${shortId(row.id)}`, lineStyle: { color: "#65b7ff", width: 1.5 } },
-    { yAxis: row.stop, name: "STOP LOSS", lineStyle: { color: "#ef5b5b", type: "dashed" } },
-    { yAxis: row.target, name: "TAKE PROFIT", lineStyle: { color: "#21c77a", type: "dashed" } },
-  ]);
   const rangeAreas = range ? [
     [{ name: `DISCOUNT · ${range.bars} bars`, xAxis: range.start, yAxis: range.low, itemStyle: { color: "rgba(34,197,94,.06)" } }, { xAxis: rangeEnd, yAxis: range.equilibrium }],
     [{ name: `PREMIUM · ${range.bars} bars`, xAxis: range.start, yAxis: range.equilibrium, itemStyle: { color: "rgba(239,91,91,.06)" } }, { xAxis: rangeEnd, yAxis: range.high }],
@@ -169,6 +189,33 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
   const canvas = lightMode ? "#ffffff" : "#101216";
   const axis = lightMode ? "#d1d5db" : "#2a2f38";
   const text = lightMode ? "#344054" : "#98a2b3";
+  // Price bounds deliberately come from the visible time range. An order
+  // block far outside the user's current view must not flatten local candles.
+  const priceSample = visibleCandles.length ? visibleCandles : candles.slice(-Math.min(initialVisibleBars, candles.length));
+  const candleLow = priceSample.length ? Math.min(...priceSample.map((row) => row.low)) : 0;
+  const candleHigh = priceSample.length ? Math.max(...priceSample.map((row) => row.high)) : 1;
+  const candleSpan = Math.max(candleHigh - candleLow, Math.abs(candleHigh) * 0.002, 1);
+  const nearbyProposals = state.proposals.filter((row) => row.entry >= candleLow - candleSpan * 0.5 && row.entry <= candleHigh + candleSpan * 0.5);
+  const overlayLevels = [
+    ...zones.flatMap((row) => [row.bottom, row.top]),
+    ...orderBlocks.flatMap((row) => [row.low, row.high]),
+    ...(range ? [range.low, range.high] : []),
+    ...nearbyProposals.flatMap((row) => [row.entry, row.stop, row.target]),
+  ].filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  const rawLow = Math.min(candleLow, ...overlayLevels);
+  const rawHigh = Math.max(candleHigh, ...overlayLevels);
+  const rawSpan = Math.max(rawHigh - rawLow, Math.abs(rawHigh) * 0.002, 1);
+  const proposalLines = nearbyProposals.flatMap((row) => [
+    { yAxis: row.entry, name: "ENTRY", lineStyle: { color: "#65b7ff", width: 1.5 } },
+    { yAxis: row.stop, name: "STOP LOSS", lineStyle: { color: "#ef5b5b", type: "dashed" } },
+    { yAxis: row.target, name: "TAKE PROFIT", lineStyle: { color: "#21c77a", type: "dashed" } },
+  ]);
+  const manualScale = Math.min(4, Math.max(0.18, priceViewport?.scale ?? 1));
+  const manualCenter = (rawHigh + rawLow) / 2 + rawSpan * (priceViewport?.offset ?? 0);
+  const pricePadding = rawSpan * 0.1;
+  const priceAxisRange = priceViewport && !priceViewport.auto
+    ? { min: manualCenter - (rawSpan * manualScale) / 2, max: manualCenter + (rawSpan * manualScale) / 2 }
+    : { min: rawLow - pricePadding, max: rawHigh + pricePadding };
 
   return {
     animation: true,
@@ -199,21 +246,22 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
       },
     },
     grid: [
-      { left: 58, right: 74, top: 32, height: "60%" },
-      { left: 58, right: 74, top: "76%", height: "12%" },
+      { left: 58, right: 74, top: 32, height: "67%" },
+      { left: 58, right: 74, top: "79%", height: "13%" },
     ],
     xAxis: [
       { id: "smc-price-x", type: "category", data: labels, boundaryGap: true, axisLine: { lineStyle: { color: axis } }, axisLabel: { show: false } },
       { id: "smc-volume-x", type: "category", gridIndex: 1, data: labels, boundaryGap: true, axisLine: { lineStyle: { color: axis } }, axisLabel: { color: text, formatter: (value: string) => value.slice(5, 16), fontSize: 10 } },
     ],
     yAxis: [
-      { id: "smc-price-y", scale: true, position: "right", axisLine: { lineStyle: { color: axis } }, axisLabel: { color: text, fontSize: 10 }, splitLine: { lineStyle: { color: lightMode ? "#edf0f5" : "#1d222b" } } },
+      { id: "smc-price-y", scale: true, position: "right", axisLine: { lineStyle: { color: axis } }, axisLabel: { color: text, fontSize: 10 }, splitLine: { lineStyle: { color: lightMode ? "#edf0f5" : "#1d222b" } }, ...priceAxisRange },
       { id: "smc-volume-y", gridIndex: 1, position: "right", axisLabel: { color: text, fontSize: 10 }, splitLine: { show: false } },
     ],
     dataZoom: [
-      // Drag-pan only activates while the pointer is pressed; ordinary hover
-      // continues to be a stable crosshair inspection action.
-      { id: "smc-inside-zoom", type: "inside", xAxisIndex: [0, 1], start: initialStart, end: 100, zoomOnMouseWheel: true, moveOnMouseMove: true, moveOnMouseWheel: false, preventDefaultMouseMove: true, cursorGrab: "grab", cursorGrabbing: "grabbing" },
+      // Pointer and wheel movement are handled by the reusable EChart shell
+      // so React refreshes cannot replace a library-owned pan/zoom range.
+      // The slider remains available for direct time-scale manipulation.
+      { id: "smc-inside-zoom", type: "inside", xAxisIndex: [0, 1], start: initialStart, end: 100, zoomOnMouseWheel: false, moveOnMouseMove: false, moveOnMouseWheel: false, preventDefaultMouseMove: false, cursorGrab: "grab", cursorGrabbing: "grabbing" },
       { id: "smc-slider-zoom", type: "slider", xAxisIndex: [0, 1], start: initialStart, end: 100, bottom: "2%", height: 16, borderColor: axis, fillerColor: "rgba(105,185,255,.14)", handleStyle: { color: "#69b9ff" }, textStyle: { color: text } },
     ],
     series: [
@@ -232,7 +280,12 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
             { yAxis: range.equilibrium, name: `${timeframe} equilibrium ${range.equilibrium}`, lineStyle: { color: "#eab54f", type: "dashed" } },
             { yAxis: range.low, name: `${timeframe} range low`, lineStyle: { color: "#21c77a", type: "dotted" } },
           ] : []),
-          ...(lastCandle ? [{ yAxis: lastCandle.close, name: `${hasFormingCandle ? "LIVE" : "LAST"} ${lastCandle.close}`, lineStyle: { color: lastCandle.close >= lastCandle.open ? "#21c77a" : "#ef5b5b", width: hasFormingCandle ? 1.5 : 1 } }] : []),
+          ...(lastCandle ? [{
+            yAxis: lastCandle.close,
+            name: `${hasFormingCandle ? "LIVE" : "LAST"} ${lastCandle.close}`,
+            lineStyle: { color: lastCandle.close >= lastCandle.open ? "#21c77a" : "#ef5b5b", width: hasFormingCandle ? 1.5 : 1 },
+            label: { show: true, position: "end", formatter: `${lastCandle.close.toLocaleString(undefined, { maximumFractionDigits: 4 })}`, color: "#f8fafc", backgroundColor: lastCandle.close >= lastCandle.open ? "#087f6c" : "#c92f3d", padding: [3, 5] },
+          }] : []),
           ...proposalLines,
         ] },
       },
@@ -243,8 +296,27 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
   } as EChartsOption;
 }
 
-export default function NativeSMCChartOverlay({ state, timeframe = "5m", rightOffsetBars = 12, initialVisibleBars = 240, filters, selectedObjectId, onCandleSelect, fitContentSignal, lightMode = false, height = 700 }: Props) {
-  const option = useMemo(() => chartOption(state, timeframe, rightOffsetBars, initialVisibleBars, filters, selectedObjectId, lightMode), [state, timeframe, rightOffsetBars, initialVisibleBars, filters, selectedObjectId, lightMode]);
+export default function NativeSMCChartOverlay({ state, timeframe = "5m", rightOffsetBars = 12, initialVisibleBars = 120, filters, selectedObjectId, onCandleSelect, fitContentSignal, latestSignal, centerTimestamp, priceViewport, viewport, onViewportChange, onPriceAxisDrag, onResetPriceScale, onChartPointerDown, lightMode = false, height = 700 }: Props) {
+  const option = useMemo(() => chartOption(state, timeframe, rightOffsetBars, initialVisibleBars, filters, selectedObjectId, lightMode, priceViewport, viewport), [state, timeframe, rightOffsetBars, initialVisibleBars, filters, selectedObjectId, lightMode, priceViewport, viewport]);
+  const labels = state.candles.length + (state.forming_candle ? 1 : 0) + Math.max(0, rightOffsetBars);
+  const localWindowBars = Math.min(labels, Math.max(24, initialVisibleBars + rightOffsetBars));
+  const currentSpanBars = viewport ? Math.max(24, Math.round(((viewport.end - viewport.start) / 100) * labels)) : localWindowBars;
+  const newestWindow = useMemo(() => {
+    const span = Math.min(labels, currentSpanBars);
+    return { start: Math.max(0, ((labels - span) / Math.max(1, labels)) * 100), end: 100 };
+  }, [labels, currentSpanBars]);
+  const windowAround = useCallback((span: number) => {
+    if (!centerTimestamp) return null;
+    const candleIndex = state.candles.findIndex((row) => row.timestamp === centerTimestamp);
+    if (candleIndex < 0 || labels <= 1) return null;
+    const boundedSpan = Math.min(labels, span);
+    const startIndex = Math.max(0, Math.min(labels - boundedSpan, candleIndex - Math.floor(boundedSpan / 2)));
+    return { key: centerTimestamp, start: (startIndex / labels) * 100, end: (Math.min(labels, startIndex + boundedSpan) / labels) * 100 };
+  }, [centerTimestamp, state.candles, labels]);
+  // Selecting an evidence item keeps whatever zoom level the analyst chose.
+  // Fit deliberately returns to a concise local range instead of full history.
+  const focusWindow = useMemo(() => windowAround(currentSpanBars), [windowAround, currentSpanBars]);
+  const fitWindow = useMemo(() => windowAround(localWindowBars), [windowAround, localWindowBars]);
   const events = useMemo(() => ({
     click: (event: any) => {
       if (event?.seriesName !== "Market candles" || typeof event.dataIndex !== "number") return;
@@ -254,5 +326,5 @@ export default function NativeSMCChartOverlay({ state, timeframe = "5m", rightOf
       if (candle) onCandleSelect(candle.timestamp);
     },
   }), [onCandleSelect, state.candles]);
-  return <EChart option={option} height={height} onEvents={events} preserveInteraction fitContentSignal={fitContentSignal} style={{ borderRadius: 8 }} />;
+  return <EChart option={option} height={height} onEvents={events} preserveInteraction fitContentSignal={fitContentSignal} fitRange={fitWindow ?? { start: Math.max(0, ((labels - localWindowBars) / Math.max(1, labels)) * 100), end: 100 }} latestSignal={latestSignal} latestStart={newestWindow.start} focusWindow={focusWindow} onViewportChange={onViewportChange} onPriceAxisDrag={onPriceAxisDrag} onResetPriceScale={onResetPriceScale} onChartPointerDown={onChartPointerDown} style={{ borderRadius: 8 }} />;
 }

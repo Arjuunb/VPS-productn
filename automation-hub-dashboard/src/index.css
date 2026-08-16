@@ -680,6 +680,74 @@ a.brand:hover { opacity: 0.85; }
 @media (max-width: 900px) { .smc-terminal-toolbar { align-items: flex-start; flex-wrap: wrap; } .smc-terminal-actions { margin-left: 0; } }
 @media (max-width: 720px) { .smc-control-grid, .smc-reference-inputs { grid-template-columns: 1fr 1fr; } .smc-workspace-tabs .dim { margin-left: 0; } .smc-analysis-rail { grid-template-columns: 1fr; } .smc-chart-actions { justify-content: flex-start; } .smc-live-strip .dim { margin-left: 0; width: 100%; } .smc-terminal-market .dim, .smc-live-quote { display: none; } .smc-timeframe-group { width: 100%; overflow-x: auto; border-left: 0; } .smc-terminal-actions { width: 100%; justify-content: space-between; } .smc-fullscreen { padding: 8px; } .smc-fullscreen-header { align-items: flex-start; } }
 
+/* Native SMC terminal shell: controls remain display-only and reuse the native chart canvas. */
+.smc-terminal-workspace { display: grid; gap: 10px; margin-top: 12px; min-width: 0; }
+.smc-terminal-toolbar { margin: 0; min-height: 44px; padding: 6px 8px; border-radius: 8px; overflow-x: auto; flex-wrap: nowrap; }
+.smc-toolbar-select, .smc-toolbar-mode { flex: 0 0 auto; height: 29px; padding: 4px 8px; border: 1px solid var(--card-border-soft); border-radius: 5px; background: rgba(255,255,255,.025); color: var(--text); font: 700 10px/1 var(--font-sans); }
+.smc-toolbar-mode { display: inline-flex; align-items: center; color: var(--dim); }
+.smc-terminal-actions { flex: 0 0 auto; }
+.smc-terminal-actions .btn { padding: 5px 8px; font-size: 10px; white-space: nowrap; }
+.smc-toolbar-progress { padding: 5px 7px; border-left: 1px solid var(--card-border-soft); color: var(--gold); font: 800 10px/1 ui-monospace, monospace; white-space: nowrap; }
+.smc-compact-control-row { display: flex; align-items: end; gap: 8px; flex-wrap: wrap; padding: 9px 10px; border: 1px solid var(--card-border-soft); border-radius: 8px; background: rgba(255,255,255,.015); }
+.smc-compact-control-row label { display: grid; gap: 4px; color: var(--dim); font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.smc-compact-control-row input, .smc-compact-control-row select { min-width: 150px; height: 32px; padding: 5px 8px; border: 1px solid var(--card-border-soft); border-radius: 5px; background: #101216; color: var(--text); }
+.smc-compact-control-row .btn { min-height: 32px; }
+.smc-terminal-grid { display: grid; grid-template-columns: clamp(190px, 16vw, 270px) minmax(0, 1fr) minmax(245px, 310px); gap: 10px; min-width: 0; align-items: stretch; }
+.smc-terminal-grid.watchlist-collapsed { grid-template-columns: 42px minmax(0, 1fr) minmax(245px, 310px); }
+.smc-terminal-grid.panel-collapsed { grid-template-columns: clamp(190px, 16vw, 270px) minmax(0, 1fr) 44px; }
+.smc-terminal-grid.watchlist-collapsed.panel-collapsed { grid-template-columns: 42px minmax(0, 1fr) 44px; }
+.smc-watchlist { min-width: 190px; max-width: 440px; height: 100%; resize: horizontal; border-radius: 8px; background: #0c0e12; }
+.smc-watchlist.is-collapsed { min-width: 0; width: 42px; resize: none; }
+.smc-watchlist-head { min-height: 42px; padding: 9px 10px; }
+.smc-watchlist-head b { font-size: 10px; letter-spacing: .11em; }
+.smc-watchlist-head span { font-size: 9px; }
+.smc-watchlist-columns, .smc-watchlist-rows button { grid-template-columns: minmax(0, 1fr) 72px 38px; gap: 5px; }
+.smc-watchlist-columns { padding: 7px 9px; }
+.smc-watchlist-rows button { padding: 8px 9px; }
+.smc-watchlist-rows i { width: 19px; height: 19px; font-size: 7px; }
+.smc-watchlist p { padding: 9px; font-size: 9px; }
+.smc-chart-surface { min-width: 0; overflow: hidden; border: 1px solid rgba(124,185,232,.28); border-radius: 9px; background: #0e1014; box-shadow: 0 16px 38px rgba(0,0,0,.23); }
+.smc-chart-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 48px; padding: 9px 12px; border-bottom: 1px solid var(--card-border-soft); background: linear-gradient(90deg, rgba(105,185,255,.06), transparent 46%); }
+.smc-chart-heading > div { display: grid; gap: 2px; min-width: 0; }
+.smc-chart-heading b { color: var(--text); font-size: 13px; }
+.smc-chart-heading span { overflow: hidden; color: var(--dim); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.smc-chart-surface .smc-live-strip { margin: 8px 10px; }
+.smc-chart-surface .smc-chart-footer { margin: 8px 10px 10px; }
+.smc-state-panel { min-width: 0; border: 1px solid var(--card-border); border-radius: 8px; background: #0c0e12; overflow: hidden; }
+.smc-state-panel.is-collapsed { width: 44px; }
+.smc-state-panel-head { display: flex; align-items: center; justify-content: space-between; min-height: 42px; padding: 8px 9px; border-bottom: 1px solid var(--card-border-soft); }
+.smc-state-panel-head b { font-size: 11px; letter-spacing: .05em; white-space: nowrap; }
+.smc-state-panel-head .btn { padding: 5px 8px; font-size: 11px; }
+.smc-state-panel > .card { margin: 0; border: 0; border-radius: 0; box-shadow: none; background: transparent; }
+.smc-state-panel > .card + .card { border-top: 1px solid var(--card-border-soft); }
+.smc-state-panel .card-head { padding: 10px 11px; }
+.smc-state-panel .card-body { padding: 10px 11px; }
+.smc-state-panel .risk-item { gap: 8px; padding: 7px 0; font-size: 10px; }
+.smc-state-panel .risk-item b { max-width: 160px; font-size: 10px; overflow-wrap: anywhere; text-align: right; }
+.smc-bottom-terminal { border: 1px solid var(--card-border); border-radius: 8px; background: #0c0e12; overflow: hidden; }
+.smc-bottom-tabs { display: flex; gap: 1px; border-bottom: 1px solid var(--card-border-soft); overflow-x: auto; }
+.smc-bottom-tabs button { padding: 9px 12px; border: 0; border-right: 1px solid var(--card-border-soft); background: transparent; color: var(--dim); font: 700 10px/1 var(--font-sans); cursor: pointer; white-space: nowrap; }
+.smc-bottom-tabs button:hover, .smc-bottom-tabs button.active { color: var(--text); background: rgba(105,185,255,.09); box-shadow: inset 0 -2px 0 var(--gold); }
+.smc-bottom-content { display: grid; gap: 10px; padding: 11px; color: var(--dim); font-size: 11px; }
+.smc-bottom-content .card { margin: -11px; border: 0; border-radius: 0; box-shadow: none; }
+.smc-bottom-content p { margin: 0; line-height: 1.45; }
+.smc-review-navigation { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.smc-review-navigation span { margin-right: auto; color: var(--dim); font-size: 11px; }
+.smc-review-navigation b { color: var(--text); }
+.smc-review-navigation .btn { padding: 5px 8px; font-size: 10px; }
+.smc-review-fields { grid-template-columns: repeat(5, minmax(130px, 1fr)); }
+.smc-review-fields .field label { font-size: 9px; }
+.smc-review-fields input, .smc-review-fields select { height: 31px; font-size: 11px; }
+.smc-status-bar { display: flex; align-items: center; gap: 14px; min-height: 28px; padding: 6px 10px; overflow-x: auto; border: 1px solid var(--card-border-soft); border-radius: 7px; background: #090b0e; color: var(--dim); font: 700 9.5px/1 ui-monospace, monospace; letter-spacing: .025em; white-space: nowrap; }
+.smc-status-bar span:last-child { color: #ff9c9c; }
+.smc-fullscreen { padding: 10px; }
+.smc-fullscreen .smc-terminal-grid { min-height: calc(100vh - 190px); grid-template-columns: minmax(0, 1fr) minmax(245px, 310px); }
+.smc-fullscreen .smc-terminal-grid.panel-collapsed { grid-template-columns: minmax(0, 1fr) 44px; }
+.smc-fullscreen .smc-chart-surface { display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; }
+.smc-fullscreen .smc-chart-surface > div:nth-of-type(3) { min-height: 0; }
+@media (max-width: 1250px) { .smc-terminal-grid, .smc-terminal-grid.watchlist-collapsed { grid-template-columns: minmax(0, 1fr) minmax(245px, 300px); } .smc-watchlist { grid-column: 1 / -1; resize: none; max-width: none; } .smc-watchlist.is-collapsed { display: none; } .smc-review-fields { grid-template-columns: repeat(3, minmax(140px, 1fr)); } }
+@media (max-width: 900px) { .smc-terminal-grid, .smc-terminal-grid.watchlist-collapsed, .smc-terminal-grid.panel-collapsed { grid-template-columns: 1fr; } .smc-state-panel.is-collapsed { width: auto; } .smc-terminal-actions { width: auto; margin-left: 0; } .smc-review-fields { grid-template-columns: repeat(2, minmax(140px, 1fr)); } }
+
 /* strategy canvas (react-flow custom nodes) */
 .sc-node { position: relative; min-width: 130px; padding: 8px 10px; border-radius: 10px; font-size: 11.5px;
   background: linear-gradient(180deg, #16161a, #101013); border: 1px solid var(--card-border); color: var(--text); }
