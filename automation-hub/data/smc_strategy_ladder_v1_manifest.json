@@ -1,8 +1,11 @@
 {
   "research_id": "SMC_NATIVE_V1_RESEARCH",
   "ladder_id": "SMC_STRATEGY_LADDER_V1",
-  "version": "SMC_STRATEGY_LADDER_V1.0.0-research",
-  "status": "FROZEN_RESEARCH_DEFINITION",
+  "version": "SMC_STRATEGY_LADDER_DRAFT_PRE_VERIFICATION",
+  "status": "DRAFT_PRE_VERIFICATION",
+  "visual_state_verification": "VISUAL_STATE_VERIFICATION_PARTIAL",
+  "blocked_by": "VISUAL_STATE_VERIFICATION",
+  "freeze_allowed": false,
   "execution_allowed": false,
   "performance_research": "NOT_RUN",
   "native_engine_source": "services/native_smc.py",
@@ -40,64 +43,64 @@
   "candidates": [
     {
       "strategy_id": "SMC_S1_PIVOT_REVERSAL",
-      "status": "RESEARCH_ONLY",
+      "status": "DRAFT_PRE_VERIFICATION",
       "objects": ["PivotPoint", "PriceAction", "SMCMarketSnapshot"],
       "long_sequence": ["confirmed pivot low", "bullish rejection"],
       "short_sequence": ["confirmed pivot high", "bearish rejection"],
       "invalidation": "opposite native structure after pivot confirmation",
       "expiry": "pivot age greater than 10 bars",
-      "configuration_sha256": "1d5e2f87d669b677bb9acd93ac4b3da387395a0ba9ac149f72ee69d2a86024a0"
+      "configuration_sha256": "aa978381bd6a00becaa2d76eb6cf98b57e070946d167528d98681042b6807939"
     },
     {
       "strategy_id": "SMC_S2_STRUCTURE",
-      "status": "RESEARCH_ONLY",
+      "status": "DRAFT_PRE_VERIFICATION",
       "objects": ["PivotPoint", "StructureEvent", "PriceAction", "SMCMarketSnapshot"],
       "long_sequence": ["pivot low", "bullish BOS/CHOCH after pivot", "bullish rejection"],
       "short_sequence": ["pivot high", "bearish BOS/CHOCH after pivot", "bearish rejection"],
       "invalidation": "opposite native structure after the qualifying shift",
       "expiry": "pivot over 10 bars or structure over 8 bars",
-      "configuration_sha256": "49a9ebbd40fa9656642728fe26dd85a5603b8170ee0c6a8137048e78843f7c9d"
+      "configuration_sha256": "e39a272421c92db48be43d1164ada1c54fa6bc5416a0304bb54b2e5a0798b9eb"
     },
     {
       "strategy_id": "SMC_S3_LIQUIDITY_STRUCTURE",
-      "status": "RESEARCH_ONLY",
+      "status": "DRAFT_PRE_VERIFICATION",
       "objects": ["PivotPoint", "LiquiditySweep", "StructureEvent", "PriceAction", "SMCMarketSnapshot"],
       "long_sequence": ["low-side native reference", "sell-side sweep", "bullish BOS/CHOCH after sweep", "bullish rejection"],
       "short_sequence": ["high-side native reference", "buy-side sweep", "bearish BOS/CHOCH after sweep", "bearish rejection"],
       "invalidation": "opposite native structure after the qualifying sweep",
       "expiry": "sweep over 10 bars or structure over 8 bars",
-      "configuration_sha256": "936a002bcf1f295ea620bb2dd1dd66b5a787e6cb95252e2e01bdfaf17443cd39"
+      "configuration_sha256": "8d21fe7f67f839677fbb2dd0705e5c2bb5fbcb99a91ad36783803eacd28c8f8a"
     },
     {
       "strategy_id": "SMC_S4_FVG_RETEST",
-      "status": "RESEARCH_ONLY",
+      "status": "DRAFT_PRE_VERIFICATION",
       "objects": ["LiquiditySweep", "StructureEvent", "FairValueGap", "PriceAction", "SMCMarketSnapshot"],
       "long_sequence": ["sell-side sweep", "bullish BOS/CHOCH", "same-direction FVG created after structure", "exact FVG retest", "bullish rejection"],
       "short_sequence": ["buy-side sweep", "bearish BOS/CHOCH", "same-direction FVG created after structure", "exact FVG retest", "bearish rejection"],
       "invalidation": "opposite structure or FVG mitigation before qualifying retest",
       "expiry": "sweep over 10, structure over 8, or FVG over 5 bars",
-      "configuration_sha256": "14e8d573af6b2e239bf3817d9de9520f38ce6be345a63e6e96d472e9fd2ccf6d"
+      "configuration_sha256": "361a1b5f7314abdf77ef84f761ef00f77d6787a0c79b9741df10b2bfad646da9"
     },
     {
       "strategy_id": "SMC_S5_ORDER_BLOCK_RETEST",
-      "status": "RESEARCH_ONLY",
+      "status": "DRAFT_PRE_VERIFICATION",
       "objects": ["LiquiditySweep", "StructureEvent", "OrderBlock", "PriceAction", "SMCMarketSnapshot"],
       "long_sequence": ["sell-side sweep", "bullish BOS/CHOCH", "same-shift bullish order block", "exact order-block retest", "bullish rejection"],
       "short_sequence": ["buy-side sweep", "bearish BOS/CHOCH", "same-shift bearish order block", "exact order-block retest", "bearish rejection"],
       "invalidation": "opposite structure or order-block mitigation before qualifying retest",
       "expiry": "sweep over 10, structure over 8, or order block over 5 bars",
-      "configuration_sha256": "e34f6b555bf7f5cad8c4ece98be111f3fdea35275af038cb08cdb002e7a15bf5"
+      "configuration_sha256": "1f4c63adbfc846837e688f1f0a35140a1b892691f05edc8c853aaacc3ff8da79"
     },
     {
       "strategy_id": "SMC_S6_FULL_SMC",
-      "status": "RESEARCH_ONLY",
+      "status": "DRAFT_PRE_VERIFICATION",
       "objects": ["LiquiditySweep", "StructureEvent", "FairValueGap", "OrderBlock", "DealingRange", "PriceAction", "SMCMarketSnapshot"],
       "long_sequence": ["HTF bullish", "discount", "sell-side sweep", "bullish BOS/CHOCH", "bullish FVG OR OB", "exact native POI retest", "bullish rejection", "native active session"],
       "short_sequence": ["HTF bearish", "premium", "buy-side sweep", "bearish BOS/CHOCH", "bearish FVG OR OB", "exact native POI retest", "bearish rejection", "native active session"],
       "frozen_poi_interpretation": "FVG_OR_OB",
       "invalidation": "HTF/location reversal, opposite structure, or POI mitigation before qualifying retest",
       "expiry": "sweep over 10, structure over 8, or POI over 5 bars",
-      "configuration_sha256": "c186ee24ec8c9db40248d4aad6abe7684451bca4fce9d4e33b9aafc73624ff10"
+      "configuration_sha256": "dc00f37b4f68b0be20aa0e93c95daf4cdb855311432948a056f44645ad69e18a"
     }
   ]
 }

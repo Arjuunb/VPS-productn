@@ -1,16 +1,17 @@
-# SMC Strategy Ladder Definition Report
+# SMC Strategy Ladder Definition Report — Blocked Draft
 
 ## Scope and status
 
 - Research family: `SMC_NATIVE_V1_RESEARCH`
 - Ladder: `SMC_STRATEGY_LADDER_V1`
-- Frozen version: `SMC_STRATEGY_LADDER_V1.0.0-research`
-- Definition status: **FROZEN_RESEARCH_DEFINITION**
-- Candidate status: **RESEARCH_ONLY**
+- Draft version: `SMC_STRATEGY_LADDER_DRAFT_PRE_VERIFICATION`
+- Definition status: **DRAFT_PRE_VERIFICATION**
+- Candidate status: **DRAFT_PRE_VERIFICATION**
+- Blocked by: **VISUAL_STATE_VERIFICATION**
 - `execution_allowed`: **false** for every candidate, trace, and proposal
 - Performance research: **NOT RUN**
 
-This is a definition-only research layer. It is not a backtest, a strategy-selection report, a forward-paper recommendation, or an execution release. No TRAIN, validation, walk-forward, or untouched-test dataset was opened while these definitions were created.
+The authoritative native verification record is `VISUAL_STATE_VERIFICATION_PARTIAL`, not passed. Therefore this is a draft-only architecture layer: it is not a frozen V1.0.0 definition, a backtest, a strategy-selection report, a forward-paper recommendation, or an execution release. No TRAIN, validation, walk-forward, or untouched-test dataset was opened while these definitions were created.
 
 ## Preserved boundaries
 
@@ -32,7 +33,7 @@ The ladder only consumes native `PivotPoint`, `StructureEvent`, `LiquiditySweep`
 
 The existing Native SMC Visual Lab displays read-only traces. Selecting a candidate merely highlights the native object IDs supplied by the backend; the browser never calculates SMC, changes snapshots, creates a signal, or changes a trading engine.
 
-## Frozen common mechanics
+## Draft shared mechanics
 
 | Mechanic | Frozen definition |
 | --- | --- |
@@ -63,14 +64,14 @@ Expired components cannot be recombined with newer components. A native opposite
 
 | ID | Strict ordered sequence | POI rule | Status |
 | --- | --- | --- | --- |
-| `SMC_S1_PIVOT_REVERSAL` | confirmed pivot low/high, then same-side native rejection | none | RESEARCH_ONLY |
-| `SMC_S2_STRUCTURE` | pivot, same-side native BOS/CHoCH after pivot, rejection | none | RESEARCH_ONLY |
-| `SMC_S3_LIQUIDITY_STRUCTURE` | native liquidity reference, sweep, same-side BOS/CHoCH after sweep, rejection | none | RESEARCH_ONLY |
-| `SMC_S4_FVG_RETEST` | sweep, structure, same-direction FVG after structure, exact FVG retest, rejection | exact FVG only | RESEARCH_ONLY |
-| `SMC_S5_ORDER_BLOCK_RETEST` | sweep, structure, same-shift order block, exact OB retest, rejection | exact same-shift OB only | RESEARCH_ONLY |
-| `SMC_S6_FULL_SMC` | completed HTF, location, sweep, structure, POI, retest, rejection, native session | **FVG_OR_OB** | RESEARCH_ONLY |
+| `SMC_S1_PIVOT_REVERSAL` | confirmed pivot low/high, then same-side native rejection | none | DRAFT_PRE_VERIFICATION |
+| `SMC_S2_STRUCTURE` | pivot, same-side native BOS/CHoCH after pivot, rejection | none | DRAFT_PRE_VERIFICATION |
+| `SMC_S3_LIQUIDITY_STRUCTURE` | native liquidity reference, sweep, same-side BOS/CHoCH after sweep, rejection | none | DRAFT_PRE_VERIFICATION |
+| `SMC_S4_FVG_RETEST` | sweep, structure, same-direction FVG after structure, exact FVG retest, rejection | exact FVG only | DRAFT_PRE_VERIFICATION |
+| `SMC_S5_ORDER_BLOCK_RETEST` | sweep, structure, same-shift order block, exact OB retest, rejection | exact same-shift OB only | DRAFT_PRE_VERIFICATION |
+| `SMC_S6_FULL_SMC` | completed HTF, location, sweep, structure, POI, retest, rejection, native session | **FVG_OR_OB** | DRAFT_PRE_VERIFICATION |
 
-Long and short definitions are mirrored. The S6 rule is frozen as `FVG_OR_OB`: one directional native FVG **or** native order block created after qualifying structure may be the POI. It cannot change within this version.
+Long and short definitions are mirrored. The provisional S6 `FVG_OR_OB` interpretation is present only for visual state review; it is not immutable until the prerequisite passes and an explicit freeze step creates `SMC_STRATEGY_LADDER_V1.0.0-research`.
 
 ## Traceability and visual review
 
@@ -91,7 +92,12 @@ Definition-level tests passed without reading a market dataset:
 
 No profitability claim, performance metric, ranking, optimization, candidate selection, or forward-paper authorization exists.
 
-## Next stage requires separate authorization
+## Required gate before freezing
+
+1. Complete independent human review of the native objects and attain `VISUAL_STATE_VERIFICATION_PASSED`.
+2. Rerun the ladder-definition freeze as a separately versioned release.
+
+## Later research requires separate authorization
 
 1. Approve and register authoritative historical exchange-data manifest(s).
 2. Run only the pre-registered TRAIN harness.

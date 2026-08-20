@@ -28,6 +28,7 @@ from services.smc_strategy_ladder import (
     evaluate_candidate,
     evaluate_ladder,
     manifest_payload,
+    visual_state_verification_status,
 )
 
 UTC = timezone.utc
@@ -72,7 +73,7 @@ def trace(result, direction: str = "bullish"):
     return next(row for row in result.direction_traces if row.direction == direction)
 
 
-def test_registry_is_complete_frozen_and_non_executable():
+def test_registry_is_complete_draft_blocked_and_non_executable():
     assert [row.strategy_id for row in candidate_registry()] == [
         "SMC_S1_PIVOT_REVERSAL", "SMC_S2_STRUCTURE", "SMC_S3_LIQUIDITY_STRUCTURE",
         "SMC_S4_FVG_RETEST", "SMC_S5_ORDER_BLOCK_RETEST", "SMC_S6_FULL_SMC",
@@ -80,17 +81,26 @@ def test_registry_is_complete_frozen_and_non_executable():
     assert all("research" in row.strategy_id.lower() or row.strategy_id.startswith("SMC_S") for row in candidate_registry())
     payload = manifest_payload()
     assert payload["version"] == LADDER_VERSION
+    assert payload["status"] == "DRAFT_PRE_VERIFICATION"
+    assert payload["visual_state_verification"] == "VISUAL_STATE_VERIFICATION_PARTIAL"
+    assert payload["blocked_by"] == "VISUAL_STATE_VERIFICATION"
+    assert payload["freeze_allowed"] is False
+    assert visual_state_verification_status() != "VISUAL_STATE_VERIFICATION_PASSED"
     assert payload["execution_allowed"] is False
     assert payload["performance_research"] == "NOT_RUN"
     assert all(row["execution_allowed"] is False for row in payload["candidates"])
 
 
-def test_checked_in_manifest_matches_the_frozen_runtime_definition():
+def test_checked_in_manifest_matches_the_draft_runtime_definition():
     manifest_path = Path(__file__).resolve().parents[1] / "data" / "smc_strategy_ladder_v1_manifest.json"
     checked_in = json.loads(manifest_path.read_text(encoding="utf-8"))
     runtime = manifest_payload()
 
     assert checked_in["version"] == runtime["version"]
+    assert checked_in["status"] == runtime["status"]
+    assert checked_in["visual_state_verification"] == runtime["visual_state_verification"]
+    assert checked_in["blocked_by"] == runtime["blocked_by"]
+    assert checked_in["freeze_allowed"] is False
     assert checked_in["native_engine_source_sha256"] == runtime["native_engine_source_hash"]
     assert checked_in["event_age_bars"] == EVENT_AGE_BARS
     assert checked_in["common_trade_mechanics"]["atr_length"] == ATR_LENGTH
