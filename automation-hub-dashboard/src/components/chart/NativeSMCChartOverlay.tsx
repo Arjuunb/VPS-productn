@@ -56,6 +56,8 @@ interface Props {
   initialVisibleBars?: number;
   filters: NativeSMCOverlayFilters;
   selectedObjectId?: string;
+  /** Native object IDs selected by a read-only research trace. */
+  highlightedObjectIds?: string[];
   onCandleSelect: (timestamp: string) => void;
   fitContentSignal: number;
   latestSignal?: number;
@@ -208,7 +210,7 @@ function futureChartSlots(lastTimestamp: string | undefined, timeframe: string, 
   return Array.from({ length: count }, (_, index) => new Date(start + step * (index + 1)).toISOString());
 }
 
-function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetBars: number, initialVisibleBars: number, filters: NativeSMCOverlayFilters, selectedObjectId?: string, lightMode = false, priceViewport?: ChartPriceViewport, viewport?: ChartTimeViewport | null, liveDataStale = false): ChartPresentation {
+function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetBars: number, initialVisibleBars: number, filters: NativeSMCOverlayFilters, selectedObjectId?: string, highlightedObjectIds: string[] = [], lightMode = false, priceViewport?: ChartPriceViewport, viewport?: ChartTimeViewport | null, liveDataStale = false): ChartPresentation {
   const closedCandles = state.candles;
   // The display candle intentionally remains outside the native model's
   // snapshots. It makes the chart feel live without turning an unclosed bar
@@ -218,6 +220,8 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
   const candleLabels = candles.map((row) => row.timestamp);
   const futureSlots = futureChartSlots(candleLabels[candleLabels.length - 1], timeframe, rightOffsetBars);
   const labels = [...candleLabels, ...futureSlots];
+  const highlightedIds = new Set(highlightedObjectIds);
+  const isHighlighted = (id: string) => id === selectedObjectId || highlightedIds.has(id);
   // A pan can only happen when the visible viewport is narrower than the
   // loaded history. Open on the recent working window, with right-side space
   // for the forming candle, just as a charting terminal does.
@@ -257,23 +261,23 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
   const fvgAreas = zones.map((row) => [{
     name: `${row.direction === "bullish" ? "Bull" : "Bear"} FVG`,
     xAxis: spanStart(row.created_at), yAxis: row.bottom,
-    itemStyle: { color: row.direction === "bullish" ? "rgba(34,197,94,.17)" : "rgba(239,91,91,.17)" },
+    itemStyle: { color: row.direction === "bullish" ? "rgba(34,197,94,.17)" : "rgba(239,91,91,.17)", borderColor: isHighlighted(row.id) ? "#ffffff" : undefined, borderWidth: isHighlighted(row.id) ? 2 : 0 },
   }, { xAxis: spanEnd(row.mitigation_at), yAxis: row.top }]);
   const obAreas = orderBlocks.map((row) => [{
     name: `${row.direction === "bullish" ? "Bull" : "Bear"} OB`,
     xAxis: spanStart(row.created_at), yAxis: row.low,
-    itemStyle: { color: row.direction === "bullish" ? "rgba(59,130,246,.14)" : "rgba(168,85,247,.14)" },
+    itemStyle: { color: row.direction === "bullish" ? "rgba(59,130,246,.14)" : "rgba(168,85,247,.14)", borderColor: isHighlighted(row.id) ? "#ffffff" : undefined, borderWidth: isHighlighted(row.id) ? 2 : 0 },
   }, { xAxis: spanEnd(row.mitigation_at), yAxis: row.high }]);
   const pivotData = visiblePivots.map((row) => ({
     name: `${row.strength === "strong" ? "Strong" : "Weak"} ${row.kind === "high" ? "High" : "Low"}`,
     value: [row.occurred_at, row.price],
-    itemStyle: { color: row.scope === "swing" ? "#eab54f" : "#69b9ff", borderColor: row.id === selectedObjectId ? "#ffffff" : undefined, borderWidth: row.id === selectedObjectId ? 2 : 0 },
+    itemStyle: { color: row.scope === "swing" ? "#eab54f" : "#69b9ff", borderColor: isHighlighted(row.id) ? "#ffffff" : undefined, borderWidth: isHighlighted(row.id) ? 2 : 0 },
     metadata: `${row.id}\n${row.scope} ${row.kind} · ${row.strength}\nOccurred: ${timestamp(row.occurred_at)}\nConfirmed: ${timestamp(row.confirmed_at)}`,
   }));
   const structureData = visibleEvents.map((row) => ({
     name: row.event_type ? `${row.scope === "swing" ? "S" : "I"} ${row.event_type}` : `${row.direction === "bullish" ? "SSL swept" : "BSL swept"}`,
     value: [eventAt(row)!, row.level],
-    itemStyle: { color: colorFor(row.direction), borderColor: row.id === selectedObjectId ? "#ffffff" : undefined, borderWidth: row.id === selectedObjectId ? 2 : 0 },
+    itemStyle: { color: colorFor(row.direction), borderColor: isHighlighted(row.id) ? "#ffffff" : undefined, borderWidth: isHighlighted(row.id) ? 2 : 0 },
     metadata: `${row.id}\n${row.event_type ? `${row.scope} ${row.event_type}` : "Liquidity sweep"}\nLevel: ${row.level}\nConfirmed: ${timestamp(eventAt(row)!)}`,
   }));
   const rangeAreas = range ? [
@@ -400,8 +404,8 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
   } as EChartsOption, priceAxisRange, livePrice, liveDirection };
 }
 
-export default function NativeSMCChartOverlay({ state, timeframe = "5m", rightOffsetBars = 12, initialVisibleBars = 120, filters, selectedObjectId, onCandleSelect, fitContentSignal, latestSignal, centerTimestamp, priceViewport, viewport, onViewportChange, onHistoryNearStart, historyLoading = false, hasMoreHistory = true, historicalMode = false, onGoLive, prependedHistory, onPriceAxisDrag, onResetPriceScale, onChartPointerDown, lightMode = false, liveDataStale = false, height = 700 }: Props) {
-  const presentation = useMemo(() => chartOption(state, timeframe, rightOffsetBars, initialVisibleBars, filters, selectedObjectId, lightMode, priceViewport, viewport, liveDataStale), [state, timeframe, rightOffsetBars, initialVisibleBars, filters, selectedObjectId, lightMode, priceViewport, viewport, liveDataStale]);
+export default function NativeSMCChartOverlay({ state, timeframe = "5m", rightOffsetBars = 12, initialVisibleBars = 120, filters, selectedObjectId, highlightedObjectIds, onCandleSelect, fitContentSignal, latestSignal, centerTimestamp, priceViewport, viewport, onViewportChange, onHistoryNearStart, historyLoading = false, hasMoreHistory = true, historicalMode = false, onGoLive, prependedHistory, onPriceAxisDrag, onResetPriceScale, onChartPointerDown, lightMode = false, liveDataStale = false, height = 700 }: Props) {
+  const presentation = useMemo(() => chartOption(state, timeframe, rightOffsetBars, initialVisibleBars, filters, selectedObjectId, highlightedObjectIds, lightMode, priceViewport, viewport, liveDataStale), [state, timeframe, rightOffsetBars, initialVisibleBars, filters, selectedObjectId, highlightedObjectIds, lightMode, priceViewport, viewport, liveDataStale]);
   const labels = state.candles.length + (state.forming_candle ? 1 : 0) + Math.max(0, rightOffsetBars);
   const localWindowBars = Math.min(labels, Math.max(24, initialVisibleBars + rightOffsetBars));
   const currentSpanBars = viewport ? Math.max(24, Math.round(((viewport.end - viewport.start) / 100) * labels)) : localWindowBars;

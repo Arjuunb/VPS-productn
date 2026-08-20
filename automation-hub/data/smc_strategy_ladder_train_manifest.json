@@ -1,0 +1,36 @@
+{
+  "research_id": "SMC_NATIVE_V1_RESEARCH",
+  "ladder_id": "SMC_STRATEGY_LADDER_V1",
+  "version": "SMC_STRATEGY_LADDER_V1.0.0-research",
+  "status": "PENDING_APPROVAL",
+  "execution_allowed": false,
+  "purpose": "Pre-registered future TRAIN harness only. No dataset has been opened, fetched, read, or evaluated by this manifest.",
+  "candidate_ids": [
+    "SMC_S1_PIVOT_REVERSAL",
+    "SMC_S2_STRUCTURE",
+    "SMC_S3_LIQUIDITY_STRUCTURE",
+    "SMC_S4_FVG_RETEST",
+    "SMC_S5_ORDER_BLOCK_RETEST",
+    "SMC_S6_FULL_SMC"
+  ],
+  "proposed_train_partition": {
+    "status": "PENDING_APPROVAL",
+    "assets": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+    "timeframes": ["5m", "15m", "1h"],
+    "start": "2025-01-01T00:00:00Z",
+    "end": "2025-06-30T23:59:59Z",
+    "source": "PENDING_APPROVAL_AUTHORITATIVE_EXCHANGE_DATASET"
+  },
+  "sealed_partitions": {
+    "validation": {"start": "2025-07-01T00:00:00Z", "status": "SEALED_NOT_OPENED"},
+    "untouched_test": {"start": "2025-10-01T00:00:00Z", "status": "SEALED_NOT_OPENED"}
+  },
+  "prohibited_before_authorization": [
+    "dataset fetch or inspection",
+    "performance metrics",
+    "candidate selection",
+    "parameter tuning",
+    "forward-paper enablement",
+    "live execution"
+  ]
+}

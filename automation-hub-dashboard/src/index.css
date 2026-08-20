@@ -1485,3 +1485,20 @@ a.brand:hover { opacity: 0.85; }
 /* ---- Price-level alert bell (ChartTools) ---- */
 .ct-bell { color: var(--dim-2); }
 .ct-bell.on { color: var(--gold); }
+
+/* ---- Native SMC frozen strategy ladder (research visualisation only) ---- */
+.smc-ladder-meta { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; color: var(--dim); font-size: 10px; }
+.smc-ladder-meta span { display: inline-flex; align-items: center; gap: 4px; }
+.smc-ladder-meta code { max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.smc-ladder-conditions { display: grid; gap: 5px; }
+.smc-ladder-condition { width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; padding: 7px 8px; border: 1px solid var(--card-border-soft); border-radius: 7px; background: var(--card-2); color: var(--text); text-align: left; cursor: default; }
+.smc-ladder-condition:not(:disabled) { cursor: pointer; }
+.smc-ladder-condition:not(:disabled):hover { border-color: var(--gold); }
+.smc-ladder-condition span { font-size: 11px; font-weight: 650; }
+.smc-ladder-condition b { font-size: 9px; letter-spacing: .04em; }
+.smc-ladder-condition small { grid-column: 1 / -1; color: var(--dim); font-size: 10px; line-height: 1.35; }
+.smc-ladder-condition.pass b { color: var(--green); }
+.smc-ladder-condition.missing b { color: var(--gold); }
+.smc-ladder-condition.invalidated, .smc-ladder-condition.expired { border-color: rgba(239,91,91,.42); }
+.smc-ladder-condition.invalidated b, .smc-ladder-condition.expired b { color: var(--red); }
+.smc-ladder-condition.not_required { opacity: .72; }

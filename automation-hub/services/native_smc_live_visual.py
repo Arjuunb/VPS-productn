@@ -266,6 +266,10 @@ def live_visual_state(symbol: str = "BTCUSDT", timeframe: str = "5m", venue: str
                 _refresh_feed(feed, symbol, timeframe, venue, observed_at, fetcher)
 
     state = feed.engine.visual_state(candle_window=min(int(visible), len(feed.engine.bars)))
+    # The ladder is a read-only projection of the same closed-bar native
+    # engine. It cannot create a signal, alter a snapshot, or place an order.
+    from services.smc_strategy_ladder import evaluate_ladder
+    state["strategy_ladder"] = evaluate_ladder(feed.engine)
     forming = _candle_payload(feed.forming_candle)
     candle_closes_at = (
         (feed.forming_candle.timestamp + timedelta(seconds=TF_SECONDS[timeframe])).isoformat()

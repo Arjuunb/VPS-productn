@@ -14,6 +14,7 @@ from services.native_smc_live_visual import (
     live_visual_state,
 )
 from services.native_smc_visual_verification import deterministic_review_sample
+from services.smc_strategy_ladder import evaluate_ladder, manifest_payload
 
 router = APIRouter(prefix="/research/smc", tags=["research-smc"])
 reviews = VisualReviewLedger()
@@ -45,13 +46,33 @@ def _at_timestamp(value: str | None) -> datetime | None:
 
 @router.get("/state")
 def state(symbol: str = "BTCUSDT", timeframe: str = "5m", at: str | None = None, window: int = 400):
-    return research_engine(symbol, timeframe).visual_state(candle_at=_at_timestamp(at), candle_window=window)
+    selected_at = _at_timestamp(at)
+    engine = research_engine(symbol, timeframe)
+    payload = engine.visual_state(candle_at=selected_at, candle_window=window)
+    payload["strategy_ladder"] = evaluate_ladder(engine, candle_at=selected_at)
+    return payload
 
 
 @router.get("/chart")
 def chart(symbol: str = "BTCUSDT", timeframe: str = "5m", at: str | None = None, window: int = 400):
     """Chart contract made only from native engine objects and raw candles."""
-    return research_engine(symbol, timeframe).visual_state(candle_at=_at_timestamp(at), candle_window=window)
+    selected_at = _at_timestamp(at)
+    engine = research_engine(symbol, timeframe)
+    payload = engine.visual_state(candle_at=selected_at, candle_window=window)
+    payload["strategy_ladder"] = evaluate_ladder(engine, candle_at=selected_at)
+    return payload
+
+
+@router.get("/strategy-ladder")
+def strategy_ladder(symbol: str = "BTCUSDT", timeframe: str = "5m", at: str | None = None):
+    """Frozen SMC research traces; it has no order or execution authority."""
+    engine = research_engine(symbol, timeframe)
+    return {
+        "research_only": True,
+        "execution_allowed": False,
+        "definition": manifest_payload(),
+        "evaluation": evaluate_ladder(engine, candle_at=_at_timestamp(at)),
+    }
 
 
 @router.get("/live-chart")
