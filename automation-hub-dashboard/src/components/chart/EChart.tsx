@@ -27,6 +27,8 @@ interface EChartProps {
   onChartPointerDown?: () => void;
   /** Keeps caller-owned display bounds synchronized with native slider/pan actions. */
   onViewportChange?: (range: { start: number; end: number }) => void;
+  /** Prevent navigation into an all-future window with no actual candles. */
+  maxZoomStart?: number;
   /** Keep the viewed candles fixed when a history page is prepended. */
   prependedData?: { version: number; count: number; total: number } | null;
 }
@@ -42,7 +44,7 @@ const clamp = (value: number, min: number, max: number) => Math.max(min, Math.mi
  * - Resizes with its container via ResizeObserver.
  * - Disposes on unmount (no leaks, no console errors).
  */
-export default function EChart({ option, height = "100%", className, style, onEvents, preserveInteraction = false, fitContentSignal, fitRange, latestSignal, latestStart = 0, focusWindow, onPriceAxisDrag, onResetPriceScale, onChartPointerDown, onViewportChange, prependedData }: EChartProps) {
+export default function EChart({ option, height = "100%", className, style, onEvents, preserveInteraction = false, fitContentSignal, fitRange, latestSignal, latestStart = 0, focusWindow, onPriceAxisDrag, onResetPriceScale, onChartPointerDown, onViewportChange, prependedData, maxZoomStart = 100 }: EChartProps) {
   const elRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<echarts.ECharts | null>(null);
   const hasRenderedRef = useRef(false);
@@ -52,9 +54,11 @@ export default function EChart({ option, height = "100%", className, style, onEv
   const zoomRangeRef = useRef<ZoomRange>({ start: 0, end: 100 });
   const fitRangeRef = useRef<ZoomRange | undefined>(fitRange);
   const latestStartRef = useRef(latestStart);
+  const maxZoomStartRef = useRef(maxZoomStart);
 
   useEffect(() => { fitRangeRef.current = fitRange; }, [fitRange]);
   useEffect(() => { latestStartRef.current = latestStart; }, [latestStart]);
+  useEffect(() => { maxZoomStartRef.current = clamp(maxZoomStart, 0, 100); }, [maxZoomStart]);
 
   useEffect(() => {
     if (!elRef.current) return;
@@ -78,10 +82,17 @@ export default function EChart({ option, height = "100%", className, style, onEv
       end: typeof current?.end === "number" ? current.end : zoomRangeRef.current.end,
     };
   };
-  const applyZoomRange = (range: ZoomRange) => {
+  const normalizeZoomRange = (range: ZoomRange): ZoomRange => {
     const span = clamp(range.end - range.start, 1, 100);
-    const start = clamp(range.start, 0, 100 - span);
-    const next = { start, end: start + span };
+    // `dataZoom` includes planned right-edge slots.  Without this upper
+    // bound, a tightly zoomed chart can be dragged entirely into those empty
+    // slots and appear blank even though valid candles are still loaded.
+    const maximumStart = Math.min(100 - span, maxZoomStartRef.current);
+    const start = clamp(range.start, 0, Math.max(0, maximumStart));
+    return { start, end: start + span };
+  };
+  const applyZoomRange = (range: ZoomRange) => {
+    const next = normalizeZoomRange(range);
     zoomRangeRef.current = next;
     chartRef.current?.dispatchAction({ type: "dataZoom", start: next.start, end: next.end });
   };
@@ -137,8 +148,13 @@ export default function EChart({ option, height = "100%", className, style, onEv
     if (!chart) return;
     const rememberZoom = () => {
       const range = readZoomRange();
-      zoomRangeRef.current = range;
-      onViewportChange?.(range);
+      const normalized = normalizeZoomRange(range);
+      if (Math.abs(normalized.start - range.start) > 0.001 || Math.abs(normalized.end - range.end) > 0.001) {
+        applyZoomRange(normalized);
+        return;
+      }
+      zoomRangeRef.current = normalized;
+      onViewportChange?.(normalized);
     };
     chart.on("datazoom", rememberZoom);
     return () => { chart.off("datazoom", rememberZoom); };

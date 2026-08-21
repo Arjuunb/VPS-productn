@@ -682,10 +682,17 @@ a.brand:hover { opacity: 0.85; }
 
 /* Native SMC terminal shell: controls remain display-only and reuse the native chart canvas. */
 .smc-terminal-workspace { display: grid; gap: 10px; margin-top: 12px; min-width: 0; }
-.smc-terminal-toolbar { margin: 0; min-height: 44px; padding: 6px 8px; border-radius: 8px; overflow-x: auto; flex-wrap: nowrap; }
+.smc-terminal-toolbar { display: grid; gap: 6px; margin: 0; padding: 7px 8px; border-radius: 8px; overflow: hidden; }
+.smc-terminal-primary-row, .smc-terminal-secondary-row { display: flex; align-items: center; gap: 8px; min-width: 0; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; }
+.smc-terminal-primary-row { min-height: 32px; }
+.smc-terminal-secondary-row { padding-top: 6px; border-top: 1px solid var(--card-border-soft); }
+.smc-terminal-primary-row .smc-terminal-market, .smc-terminal-primary-row .smc-timeframe-group, .smc-fullscreen-button { flex: 0 0 auto; }
+.smc-terminal-market { min-width: 142px; }
+.smc-timeframe-group { min-width: max-content; white-space: nowrap; }
+.smc-fullscreen-button { margin-left: auto; white-space: nowrap; }
 .smc-toolbar-select, .smc-toolbar-mode { flex: 0 0 auto; height: 29px; padding: 4px 8px; border: 1px solid var(--card-border-soft); border-radius: 5px; background: rgba(255,255,255,.025); color: var(--text); font: 700 10px/1 var(--font-sans); }
 .smc-toolbar-mode { display: inline-flex; align-items: center; color: var(--dim); }
-.smc-terminal-actions { flex: 0 0 auto; }
+.smc-terminal-actions { flex: 0 0 auto; margin-left: 0; }
 .smc-terminal-actions .btn { padding: 5px 8px; font-size: 10px; white-space: nowrap; }
 .smc-toolbar-progress { padding: 5px 7px; border-left: 1px solid var(--card-border-soft); color: var(--gold); font: 800 10px/1 ui-monospace, monospace; white-space: nowrap; }
 .smc-compact-control-row { display: flex; align-items: end; gap: 8px; flex-wrap: wrap; padding: 9px 10px; border: 1px solid var(--card-border-soft); border-radius: 8px; background: rgba(255,255,255,.015); }
@@ -709,6 +716,8 @@ a.brand:hover { opacity: 0.85; }
 .smc-chart-surface { min-width: 0; overflow: hidden; border: 1px solid rgba(124,185,232,.28); border-radius: 9px; background: #0e1014; box-shadow: 0 16px 38px rgba(0,0,0,.23); }
 .smc-chart-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 48px; padding: 9px 12px; border-bottom: 1px solid var(--card-border-soft); background: linear-gradient(90deg, rgba(105,185,255,.06), transparent 46%); }
 .smc-chart-heading > div { display: grid; gap: 2px; min-width: 0; }
+.smc-chart-heading-actions { display: inline-flex !important; align-items: center; justify-content: flex-end; gap: 7px; flex: 0 0 auto; }
+.smc-chart-fullscreen { white-space: nowrap; }
 .smc-chart-heading b { color: var(--text); font-size: 13px; }
 .smc-chart-heading span { overflow: hidden; color: var(--dim); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .smc-chart-surface .smc-live-strip { margin: 8px 10px; }
@@ -766,6 +775,7 @@ a.brand:hover { opacity: 0.85; }
 .smc-fullscreen .smc-chart-surface > div:nth-of-type(3) { min-height: 0; }
 @media (max-width: 1250px) { .smc-terminal-grid, .smc-terminal-grid.watchlist-collapsed { grid-template-columns: minmax(0, 1fr) minmax(245px, 300px); } .smc-watchlist { grid-column: 1 / -1; resize: none; max-width: none; } .smc-watchlist.is-collapsed { display: none; } .smc-review-fields { grid-template-columns: repeat(3, minmax(140px, 1fr)); } }
 @media (max-width: 900px) { .smc-terminal-grid, .smc-terminal-grid.watchlist-collapsed, .smc-terminal-grid.panel-collapsed { grid-template-columns: 1fr; } .smc-state-panel.is-collapsed { width: auto; } .smc-terminal-actions { width: auto; margin-left: 0; } .smc-review-fields { grid-template-columns: repeat(2, minmax(140px, 1fr)); } }
+@media (max-width: 720px) { .smc-terminal-primary-row, .smc-terminal-secondary-row { padding-bottom: 2px; } .smc-terminal-market { min-width: 126px; } .smc-timeframe-group { width: auto; overflow: visible; border-left: 1px solid var(--card-border-soft); } .smc-fullscreen-button { margin-left: 0; } .smc-chart-heading { align-items: flex-start; } .smc-chart-heading-actions { flex-wrap: wrap; } }
 @media (max-width: 720px) { .smc-ohlc-readout { left: 8px; right: 58px; max-width: none; overflow: hidden; font-size: 9px; } .smc-ohlc-readout b { display: none; } .smc-ohlc-readout span:nth-of-type(2), .smc-ohlc-readout span:nth-of-type(3) { display: none; } .smc-go-live { right: 66px; } }
 
 /* strategy canvas (react-flow custom nodes) */
