@@ -27,6 +27,11 @@ interface EChartProps {
   onChartPointerDown?: () => void;
   /** Keeps caller-owned display bounds synchronized with native slider/pan actions. */
   onViewportChange?: (range: { start: number; end: number }) => void;
+  /**
+   * An optional caller-owned viewport. This is used when a persisted range
+   * needs repair before rendering; normal pan/zoom remains chart-owned.
+   */
+  viewport?: { start: number; end: number };
   /** Prevent navigation into an all-future window with no actual candles. */
   maxZoomStart?: number;
   /** Keep the viewed candles fixed when a history page is prepended. */
@@ -44,7 +49,7 @@ const clamp = (value: number, min: number, max: number) => Math.max(min, Math.mi
  * - Resizes with its container via ResizeObserver.
  * - Disposes on unmount (no leaks, no console errors).
  */
-export default function EChart({ option, height = "100%", className, style, onEvents, preserveInteraction = false, fitContentSignal, fitRange, latestSignal, latestStart = 0, focusWindow, onPriceAxisDrag, onResetPriceScale, onChartPointerDown, onViewportChange, prependedData, maxZoomStart = 100 }: EChartProps) {
+export default function EChart({ option, height = "100%", className, style, onEvents, preserveInteraction = false, fitContentSignal, fitRange, latestSignal, latestStart = 0, focusWindow, onPriceAxisDrag, onResetPriceScale, onChartPointerDown, onViewportChange, viewport, prependedData, maxZoomStart = 100 }: EChartProps) {
   const elRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<echarts.ECharts | null>(null);
   const hasRenderedRef = useRef(false);
@@ -96,6 +101,15 @@ export default function EChart({ option, height = "100%", className, style, onEv
     zoomRangeRef.current = next;
     chartRef.current?.dispatchAction({ type: "dataZoom", start: next.start, end: next.end });
   };
+
+  useEffect(() => {
+    if (!chartRef.current || !viewport) return;
+    const requested = normalizeZoomRange(viewport);
+    const current = readZoomRange();
+    if (Math.abs(requested.start - current.start) > 0.001 || Math.abs(requested.end - current.end) > 0.001) {
+      applyZoomRange(requested);
+    }
+  }, [viewport?.start, viewport?.end, maxZoomStart]);
 
   useEffect(() => {
     if (!chartRef.current) return;
@@ -151,6 +165,11 @@ export default function EChart({ option, height = "100%", className, style, onEv
       const normalized = normalizeZoomRange(range);
       if (Math.abs(normalized.start - range.start) > 0.001 || Math.abs(normalized.end - range.end) > 0.001) {
         applyZoomRange(normalized);
+        // The chart option is derived by the React parent.  Keep that
+        // caller-owned viewport in sync with the repaired dataZoom range;
+        // otherwise the renderer can still calculate an all-future, blank
+        // candle window even though ECharts itself has been clamped.
+        onViewportChange?.(normalized);
         return;
       }
       zoomRangeRef.current = normalized;

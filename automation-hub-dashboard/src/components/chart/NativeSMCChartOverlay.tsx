@@ -89,7 +89,43 @@ const timestamp = (value: string) => value.replace("T", " ").replace("+00:00", "
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 
 type PriceAxisRange = { min: number; max: number };
-type ChartPresentation = { option: EChartsOption; priceAxisRange: PriceAxisRange; livePrice: number | null; liveDirection: "up" | "down" | "unchanged" };
+type ChartPresentation = {
+  option: EChartsOption;
+  priceAxisRange: PriceAxisRange;
+  livePrice: number | null;
+  liveDirection: "up" | "down" | "unchanged";
+  viewport: ChartTimeViewport;
+};
+
+/**
+ * Keep a time window connected to actual candles, not just the planned
+ * right-edge display slots. This is display-only: it never changes the
+ * native SMC snapshot or any research state.
+ */
+function normalizeChartViewport(
+  requested: ChartTimeViewport,
+  labelCount: number,
+  actualCandleCount: number,
+): ChartTimeViewport {
+  if (!labelCount || !actualCandleCount) return { start: 0, end: 100 };
+  const minimumSpan = Math.min(100, Math.max(100 / labelCount, (Math.min(2, actualCandleCount) / labelCount) * 100));
+  const span = clamp(requested.end - requested.start, minimumSpan, 100);
+  // Reserve the last two real candles for the tightest permitted pan. Future
+  // slots can still be visible at the right edge, but cannot fill the entire
+  // pane and make the main grid look blank.
+  const maximumStart = Math.min(
+    100 - span,
+    ((Math.max(0, actualCandleCount - Math.min(2, actualCandleCount))) / labelCount) * 100,
+  );
+  const start = clamp(requested.start, 0, Math.max(0, maximumStart));
+  return { start, end: start + span };
+}
+
+function sameViewport(left: ChartTimeViewport | null | undefined, right: ChartTimeViewport): boolean {
+  return Boolean(left
+    && Math.abs(left.start - right.start) < 0.001
+    && Math.abs(left.end - right.end) < 0.001);
+}
 
 function priceDecimals(value: number): number {
   const magnitude = Math.abs(value);
@@ -232,7 +268,11 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
   const labelSet = new Set(candleLabels);
   const first = candleLabels[0];
   const last = candleLabels[candleLabels.length - 1];
-  const activeViewport = viewport ?? { start: initialStart, end: 100 };
+  const activeViewport = normalizeChartViewport(
+    viewport ?? { start: initialStart, end: 100 },
+    labels.length,
+    candles.length,
+  );
   const viewportStartIndex = clamp(Math.floor((activeViewport.start / 100) * labels.length), 0, Math.max(0, labels.length - 1));
   const viewportEndIndex = clamp(Math.ceil((activeViewport.end / 100) * labels.length) - 1, viewportStartIndex, Math.max(0, labels.length - 1));
   const visibleStart = labels[viewportStartIndex] ?? first;
@@ -367,8 +407,8 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
       // Pointer and wheel movement are handled by the reusable EChart shell
       // so React refreshes cannot replace a library-owned pan/zoom range.
       // The slider remains available for direct time-scale manipulation.
-      { id: "smc-inside-zoom", type: "inside", xAxisIndex: [0, 1], start: initialStart, end: 100, zoomOnMouseWheel: false, moveOnMouseMove: false, moveOnMouseWheel: false, preventDefaultMouseMove: false, cursorGrab: "grab", cursorGrabbing: "grabbing" },
-      { id: "smc-slider-zoom", type: "slider", xAxisIndex: [0, 1], start: initialStart, end: 100, bottom: "2%", height: 16, borderColor: axis, fillerColor: "rgba(105,185,255,.14)", handleStyle: { color: "#69b9ff" }, textStyle: { color: text } },
+      { id: "smc-inside-zoom", type: "inside", xAxisIndex: [0, 1], start: activeViewport.start, end: activeViewport.end, zoomOnMouseWheel: false, moveOnMouseMove: false, moveOnMouseWheel: false, preventDefaultMouseMove: false, cursorGrab: "grab", cursorGrabbing: "grabbing" },
+      { id: "smc-slider-zoom", type: "slider", xAxisIndex: [0, 1], start: activeViewport.start, end: activeViewport.end, bottom: "2%", height: 16, borderColor: axis, fillerColor: "rgba(105,185,255,.14)", handleStyle: { color: "#69b9ff" }, textStyle: { color: text } },
     ],
     series: [
       {
@@ -401,7 +441,7 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
       { id: "smc-pivots", type: "scatter", name: "Native pivots", xAxisIndex: 0, yAxisIndex: 0, data: pivotData as any[], symbolSize: 8, label: { show: filters.labels, formatter: (row: any) => row.data.name, color: "#d7deea", fontSize: 9, position: "top" }, z: 8 },
       { id: "smc-structure", type: "scatter", name: "Native structure", xAxisIndex: 0, yAxisIndex: 0, data: structureData as any[], symbol: "diamond", symbolSize: 11, label: { show: filters.labels, formatter: (row: any) => row.data.name, color: "#d7deea", fontSize: 9, position: "bottom" }, z: 9 },
     ],
-  } as EChartsOption, priceAxisRange, livePrice, liveDirection };
+  } as EChartsOption, priceAxisRange, livePrice, liveDirection, viewport: activeViewport };
 }
 
 export default function NativeSMCChartOverlay({ state, timeframe = "5m", rightOffsetBars = 12, initialVisibleBars = 120, filters, selectedObjectId, highlightedObjectIds, onCandleSelect, fitContentSignal, latestSignal, centerTimestamp, priceViewport, viewport, onViewportChange, onHistoryNearStart, historyLoading = false, hasMoreHistory = true, historicalMode = false, onGoLive, prependedHistory, onPriceAxisDrag, onResetPriceScale, onChartPointerDown, lightMode = false, liveDataStale = false, height = 700 }: Props) {
@@ -438,6 +478,12 @@ export default function NativeSMCChartOverlay({ state, timeframe = "5m", rightOf
     onViewportChange?.(range);
     if (range.start <= 3.5 && hasMoreHistory && !historyLoading) onHistoryNearStart?.();
   }, [onViewportChange, onHistoryNearStart, hasMoreHistory, historyLoading]);
+  useEffect(() => {
+    // Repair a previously persisted/received viewport before it can leave
+    // the main chart in a future-only window. The parent owns display state,
+    // so it must receive the normalized range as well as ECharts.
+    if (!sameViewport(viewport, presentation.viewport)) onViewportChange?.(presentation.viewport);
+  }, [viewport, presentation.viewport, onViewportChange]);
   const events = useMemo(() => ({
     click: (event: any) => {
       if (event?.seriesName !== "Market candles" || typeof event.dataIndex !== "number") return;
@@ -455,7 +501,7 @@ export default function NativeSMCChartOverlay({ state, timeframe = "5m", rightOf
   }), [onCandleSelect, state.candles, allCandles.length]);
   const live = state.live_display;
   return <div className="smc-chart-canvas" style={{ height }}>
-    <EChart option={presentation.option} height="100%" onEvents={events} preserveInteraction fitContentSignal={fitContentSignal} fitRange={fitWindow ?? { start: Math.max(0, ((labels - localWindowBars) / Math.max(1, labels)) * 100), end: 100 }} latestSignal={latestSignal} latestStart={newestWindow.start} focusWindow={focusWindow} onViewportChange={handleViewportChange} prependedData={prependedHistory ? { ...prependedHistory, total: labels } : null} onPriceAxisDrag={onPriceAxisDrag} onResetPriceScale={onResetPriceScale} onChartPointerDown={onChartPointerDown} maxZoomStart={maxZoomStart} style={{ borderRadius: 8 }} />
+    <EChart option={presentation.option} height="100%" onEvents={events} preserveInteraction fitContentSignal={fitContentSignal} fitRange={fitWindow ?? { start: Math.max(0, ((labels - localWindowBars) / Math.max(1, labels)) * 100), end: 100 }} latestSignal={latestSignal} latestStart={newestWindow.start} focusWindow={focusWindow} onViewportChange={handleViewportChange} viewport={presentation.viewport} prependedData={prependedHistory ? { ...prependedHistory, total: labels } : null} onPriceAxisDrag={onPriceAxisDrag} onResetPriceScale={onResetPriceScale} onChartPointerDown={onChartPointerDown} maxZoomStart={maxZoomStart} style={{ borderRadius: 8 }} />
     {inspectedCandle ? <div className={`smc-ohlc-readout ${inspectedCandle.close >= inspectedCandle.open ? "bullish" : "bearish"}`} aria-live="polite"><b>{compactCursorTime(inspectedCandle.timestamp)}</b><span>O {formatPrice(inspectedCandle.open)}</span><span>H {formatPrice(inspectedCandle.high)}</span><span>L {formatPrice(inspectedCandle.low)}</span><span>C {formatPrice(inspectedCandle.close)}</span><span>Vol {formatVolume(inspectedCandle.volume)}</span>{hoveredIndex !== null ? <em>CURSOR</em> : <em>LATEST</em>}</div> : null}
     {historyLoading ? <span className="smc-history-loading">Loading history…</span> : null}
     {historicalMode && onGoLive ? <button type="button" className="smc-go-live" onClick={onGoLive}>→ Live</button> : null}
