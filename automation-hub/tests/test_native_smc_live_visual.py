@@ -85,6 +85,26 @@ def test_live_price_direction_is_factual_and_never_interpolated():
     assert _price_direction(100.0, 100.0) == "unchanged"
 
 
+def test_mexc_three_minute_adapter_uses_only_complete_confirmed_one_minute_buckets():
+    from services.native_smc_live_visual import _aggregate_confirmed_one_minute_bars_to_three_minutes
+
+    start = datetime(2025, 3, 1, tzinfo=UTC)
+    source = [
+        Bar(start + timedelta(minutes=minute), 100 + minute, 102 + minute, 99 + minute, 101 + minute, 10 + minute)
+        for minute in range(7)
+        if minute != 4  # A missing exchange minute must not create a synthetic 3m bar.
+    ]
+
+    aggregated = _aggregate_confirmed_one_minute_bars_to_three_minutes(
+        source, now=start + timedelta(minutes=8),
+    )
+
+    assert len(aggregated) == 1
+    bar = aggregated[0]
+    assert bar.timestamp == start
+    assert (bar.open, bar.high, bar.low, bar.close, bar.volume) == (100, 104, 99, 103, 33)
+
+
 @pytest.mark.parametrize("timeframe", ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"])
 def test_live_visual_accepts_each_supported_comparison_timeframe(timeframe):
     # Validation is intentionally separated from fetching so every intended

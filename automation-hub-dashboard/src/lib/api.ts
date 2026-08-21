@@ -224,6 +224,11 @@ export function useLive<T>(path: string, intervalMs = 2500): LiveState<T> {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    // A changed path denotes a different symbol/timeframe/feed. Never keep
+    // rendering the previous response while the new one is loading or has
+    // failed: a 5m chart labelled 3m is worse than an honest loading state.
+    setData(null);
+    setError(null);
     setLoading(true);
     const sub: _Sub = {
       interval: intervalMs,

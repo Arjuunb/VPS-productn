@@ -92,6 +92,92 @@ def _validate(symbol: str, timeframe: str, venue: str) -> tuple[str, str, str]:
     return symbol, timeframe, venue
 
 
+def _aggregate_confirmed_one_minute_bars_to_three_minutes(
+    bars: list[Bar], *, now: datetime,
+) -> list[Bar]:
+    """Build honest three-minute display bars from confirmed MEXC one-minute bars.
+
+    MEXC perpetual exposes 1m and 5m contract candles but rejects its 3m
+    interval.  We therefore derive a 3m *display* bar only when all three
+    genuine, consecutive, already-closed 1m bars are available.  A missing
+    source minute drops the bucket rather than inventing a candle.  This path
+    remains visual/research-only; it does not alter native SMC execution.
+    """
+    minute_bars = valid_closed_bars(bars, 60, now=now)
+    buckets: dict[datetime, list[Bar]] = {}
+    for bar in minute_bars:
+        timestamp = bar.timestamp.astimezone(timezone.utc)
+        bucket = timestamp - timedelta(seconds=timestamp.second, microseconds=timestamp.microsecond)
+        bucket -= timedelta(minutes=bucket.minute % 3)
+        buckets.setdefault(bucket, []).append(bar)
+
+    result: list[Bar] = []
+    for bucket, group in sorted(buckets.items()):
+        group.sort(key=lambda bar: bar.timestamp)
+        expected = [bucket + timedelta(minutes=offset) for offset in range(3)]
+        if [bar.timestamp.astimezone(timezone.utc) for bar in group] != expected:
+            continue
+        result.append(Bar(
+            bucket,
+            float(group[0].open),
+            max(float(bar.high) for bar in group),
+            min(float(bar.low) for bar in group),
+            float(group[-1].close),
+            sum(float(bar.volume) for bar in group),
+        ))
+    return result
+
+
+def _fetch_mexc_three_minute_bars(exchange, market: str, limit: int, since_ms: int | None) -> list[Bar]:
+    """Fetch enough genuine MEXC 1m data to derive a 3m visual series."""
+    requested = max(1, int(limit))
+    source_needed = requested * 3 + 3
+    if since_ms is None:
+        start = datetime.now(timezone.utc) - timedelta(minutes=source_needed)
+        cursor = int(start.timestamp() * 1_000)
+    else:
+        cursor = int(since_ms)
+    # MEXC can return fewer than the requested maximum rows, so do not treat a
+    # short page as EOF.  Advance from the most recent source timestamp and
+    # deduplicate overlapping provider pages.
+    rows_by_timestamp: dict[int, list] = {}
+    max_pages = max(4, (source_needed + 799) // 800 + 2)
+    for _ in range(max_pages):
+        remaining = max(20, source_needed - len(rows_by_timestamp) + 3)
+        rows = exchange.fetch_ohlcv(market, timeframe="1m", limit=min(1_000, remaining), since=cursor)
+        if not rows:
+            break
+        for row in rows:
+            rows_by_timestamp[int(row[0])] = row
+        newest = max(int(row[0]) for row in rows)
+        next_cursor = newest + 60_000
+        if next_cursor <= cursor:
+            break
+        cursor = next_cursor
+        if len(rows_by_timestamp) >= source_needed:
+            break
+
+    raw = [
+        Bar(datetime.fromtimestamp(row[0] / 1_000, tz=timezone.utc), float(row[1]), float(row[2]),
+            float(row[3]), float(row[4]), float(row[5] or 0))
+        for _, row in sorted(rows_by_timestamp.items())
+    ]
+    bars = _aggregate_confirmed_one_minute_bars_to_three_minutes(raw, now=datetime.now(timezone.utc))
+    if not bars:
+        raise NativeSMCLiveDataUnavailable("MEXC returned no complete confirmed 3m buckets from its 1m feed")
+    return bars[-requested:]
+
+
+def _visual_source_metadata(timeframe: str, venue: str) -> dict[str, str | None]:
+    """Disclose any venue adapter rather than implying a provider-native feed."""
+    if venue == "mexc_perpetual" and timeframe == "3m":
+        return {
+            "source_timeframe": "1m",
+            "timeframe_aggregation": "3 consecutive confirmed MEXC perpetual 1m candles",
+        }
+    return {"source_timeframe": timeframe, "timeframe_aggregation": None}
+
+
 def fetch_venue_ohlcv(symbol: str, timeframe: str, venue: str, limit: int, *,
                       since_ms: int | None = None) -> list[Bar]:
     """Fetch raw live candles from the explicitly selected visual venue."""
@@ -100,9 +186,10 @@ def fetch_venue_ohlcv(symbol: str, timeframe: str, venue: str, limit: int, *,
         import ccxt
         exchange_class = getattr(ccxt, config["ccxt_id"])
         exchange = exchange_class({"enableRateLimit": True, "options": config["options"]})
-        rows = exchange.fetch_ohlcv(
-            config["market"](symbol), timeframe=timeframe, limit=limit, since=since_ms,
-        )
+        market = config["market"](symbol)
+        if venue == "mexc_perpetual" and timeframe == "3m":
+            return _fetch_mexc_three_minute_bars(exchange, market, limit, since_ms)
+        rows = exchange.fetch_ohlcv(market, timeframe=timeframe, limit=limit, since=since_ms)
     except Exception as exc:
         raise NativeSMCLiveDataUnavailable(
             f"{config['label']} did not provide {symbol} {timeframe}: {type(exc).__name__}: {exc}"
@@ -155,6 +242,7 @@ def live_visual_history(symbol: str = "BTCUSDT", timeframe: str = "5m", venue: s
             "market": LIVE_VENUES[venue]["market"](symbol),
             "symbol": symbol,
             "timeframe": timeframe,
+            **_visual_source_metadata(timeframe, venue),
             "observed_at": observed_at.isoformat(),
             "request_before": before.isoformat(),
             "closed_candles_returned": len(closed),
@@ -296,6 +384,7 @@ def live_visual_state(symbol: str = "BTCUSDT", timeframe: str = "5m", venue: str
         "market": LIVE_VENUES[venue]["market"](symbol),
         "symbol": symbol,
         "timeframe": timeframe,
+        **_visual_source_metadata(timeframe, venue),
         "observed_at": feed.last_observed_at.isoformat(),
         "raw_candles_received": feed.last_raw_count,
         "closed_candles_loaded": feed.loaded_closed_candles,
