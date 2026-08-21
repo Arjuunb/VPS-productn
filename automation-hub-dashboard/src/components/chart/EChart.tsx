@@ -81,7 +81,11 @@ export default function EChart({ option, height = "100%", className, style, onEv
   }, []);
 
   const readZoomRange = (): ZoomRange => {
-    const current = (chartRef.current?.getOption().dataZoom as Array<{ start?: number; end?: number }> | undefined)?.[0];
+    // The viewport synchronizer can run immediately after ECharts is created,
+    // before its first setOption call installs dataZoom.  Treat that first
+    // render as the default range rather than dereferencing an absent option.
+    const chartOption = chartRef.current?.getOption();
+    const current = (chartOption?.dataZoom as Array<{ start?: number; end?: number }> | undefined)?.[0];
     return {
       start: typeof current?.start === "number" ? current.start : zoomRangeRef.current.start,
       end: typeof current?.end === "number" ? current.end : zoomRangeRef.current.end,
