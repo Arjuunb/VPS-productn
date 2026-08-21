@@ -97,6 +97,61 @@ type ChartPresentation = {
   viewport: ChartTimeViewport;
 };
 
+type OverlayHistoryRow = {
+  id: string;
+  occurred_at?: string | null;
+  confirmed_at?: string | null;
+  timestamp?: string | null;
+  created_at?: string | null;
+  active?: boolean;
+};
+
+function overlayTimestamp(row: OverlayHistoryRow): number {
+  const value = row.confirmed_at ?? row.occurred_at ?? row.timestamp ?? row.created_at;
+  const parsed = value ? Date.parse(value) : Number.NaN;
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * The visual lab is a decision surface, not a raw object dump. Keep the
+ * current context readable while always retaining selected audit evidence.
+ * The full append-only history remains available through Review and Timeline.
+ */
+function contextualRows<T extends OverlayHistoryRow>(
+  rows: T[],
+  limit: number,
+  selectedObjectId: string | undefined,
+  highlightedIds: Set<string>,
+): T[] {
+  const pinned = rows.filter(
+    (row) => row.id === selectedObjectId || highlightedIds.has(row.id),
+  );
+  const pinnedIds = new Set(pinned.map((row) => row.id));
+  const remaining = rows
+    .filter((row) => !pinnedIds.has(row.id))
+    .sort((left, right) => {
+      const activeFirst = Number(Boolean(right.active)) - Number(Boolean(left.active));
+      return activeFirst || overlayTimestamp(right) - overlayTimestamp(left);
+    })
+    .slice(0, Math.max(0, limit - pinned.length));
+
+  return [...pinned, ...remaining].sort(
+    (left, right) => overlayTimestamp(left) - overlayTimestamp(right),
+  );
+}
+
+function visibleLabelIds<T extends { id: string }>(
+  rows: T[],
+  recentCount: number,
+  selectedObjectId: string | undefined,
+  highlightedIds: Set<string>,
+): Set<string> {
+  const ids = new Set(rows.slice(-recentCount).map((row) => row.id));
+  if (selectedObjectId) ids.add(selectedObjectId);
+  highlightedIds.forEach((id) => ids.add(id));
+  return ids;
+}
+
 /**
  * Keep a time window connected to actual candles, not just the planned
  * right-edge display slots. This is display-only: it never changes the
@@ -289,22 +344,34 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
   const spanStart = (value: string) => labelSet.has(value) ? value : first;
   const spanEnd = (value?: string | null) => value && labelSet.has(value) ? value : last;
 
-  const visiblePivots = filters.pivots ? state.pivots.filter((row) =>
+  const pivotCandidates = filters.pivots ? state.pivots.filter((row) =>
     inWindow(row.occurred_at) && (row.scope === "internal" ? filters.internal : filters.swing),
   ) : [];
-  const visibleEvents = state.events.filter((row) => {
+  const eventCandidates = state.events.filter((row) => {
     if (row.event_type) return filters.structure && (row.scope === "internal" ? filters.internal : filters.swing) && inWindow(eventAt(row));
     return filters.liquidity && inWindow(row.timestamp);
   });
-  const zones = filters.fvg ? state.fair_value_gaps.filter((row) => (filters.mitigated || !row.mitigated) && overlapsVisibleWindow(row.created_at, row.mitigation_at)) : [];
-  const orderBlocks = filters.orderBlocks ? state.order_blocks.filter((row) => (filters.mitigated || !row.mitigated) && overlapsVisibleWindow(row.created_at, row.mitigation_at)) : [];
+  const zoneCandidates = filters.fvg ? state.fair_value_gaps.filter((row) => (filters.mitigated || !row.mitigated) && overlapsVisibleWindow(row.created_at, row.mitigation_at)) : [];
+  const orderBlockCandidates = filters.orderBlocks ? state.order_blocks.filter((row) => (filters.mitigated || !row.mitigated) && overlapsVisibleWindow(row.created_at, row.mitigation_at)) : [];
+
+  // Keep the decision surface readable. The complete append-only object history
+  // remains available in Review and Timeline; selected/review-highlighted items
+  // are always retained here, alongside the most recent active context.
+  const visiblePivots = contextualRows(pivotCandidates, 12, selectedObjectId, highlightedIds);
+  const visibleEvents = contextualRows(eventCandidates, 12, selectedObjectId, highlightedIds);
+  const zones = contextualRows(zoneCandidates, 8, selectedObjectId, highlightedIds);
+  const orderBlocks = contextualRows(orderBlockCandidates, 8, selectedObjectId, highlightedIds);
+  const pivotLabelIds = visibleLabelIds(visiblePivots, 3, selectedObjectId, highlightedIds);
+  const eventLabelIds = visibleLabelIds(visibleEvents, 4, selectedObjectId, highlightedIds);
+  const fvgLabelIds = visibleLabelIds(zones, 1, selectedObjectId, highlightedIds);
+  const orderBlockLabelIds = visibleLabelIds(orderBlocks, 1, selectedObjectId, highlightedIds);
   const fvgAreas = zones.map((row) => [{
-    name: `${row.direction === "bullish" ? "Bull" : "Bear"} FVG`,
+    name: fvgLabelIds.has(row.id) ? `${row.direction === "bullish" ? "Bull" : "Bear"} FVG` : "",
     xAxis: spanStart(row.created_at), yAxis: row.bottom,
     itemStyle: { color: row.direction === "bullish" ? "rgba(34,197,94,.17)" : "rgba(239,91,91,.17)", borderColor: isHighlighted(row.id) ? "#ffffff" : undefined, borderWidth: isHighlighted(row.id) ? 2 : 0 },
   }, { xAxis: spanEnd(row.mitigation_at), yAxis: row.top }]);
   const obAreas = orderBlocks.map((row) => [{
-    name: `${row.direction === "bullish" ? "Bull" : "Bear"} OB`,
+    name: orderBlockLabelIds.has(row.id) ? `${row.direction === "bullish" ? "Bull" : "Bear"} OB` : "",
     xAxis: spanStart(row.created_at), yAxis: row.low,
     itemStyle: { color: row.direction === "bullish" ? "rgba(59,130,246,.14)" : "rgba(168,85,247,.14)", borderColor: isHighlighted(row.id) ? "#ffffff" : undefined, borderWidth: isHighlighted(row.id) ? 2 : 0 },
   }, { xAxis: spanEnd(row.mitigation_at), yAxis: row.high }]);
@@ -312,12 +379,14 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
     name: `${row.strength === "strong" ? "Strong" : "Weak"} ${row.kind === "high" ? "High" : "Low"}`,
     value: [row.occurred_at, row.price],
     itemStyle: { color: row.scope === "swing" ? "#eab54f" : "#69b9ff", borderColor: isHighlighted(row.id) ? "#ffffff" : undefined, borderWidth: isHighlighted(row.id) ? 2 : 0 },
+    showLabel: pivotLabelIds.has(row.id),
     metadata: `${row.id}\n${row.scope} ${row.kind} · ${row.strength}\nOccurred: ${timestamp(row.occurred_at)}\nConfirmed: ${timestamp(row.confirmed_at)}`,
   }));
   const structureData = visibleEvents.map((row) => ({
     name: row.event_type ? `${row.scope === "swing" ? "S" : "I"} ${row.event_type}` : `${row.direction === "bullish" ? "SSL swept" : "BSL swept"}`,
     value: [eventAt(row)!, row.level],
     itemStyle: { color: colorFor(row.direction), borderColor: isHighlighted(row.id) ? "#ffffff" : undefined, borderWidth: isHighlighted(row.id) ? 2 : 0 },
+    showLabel: eventLabelIds.has(row.id),
     metadata: `${row.id}\n${row.event_type ? `${row.scope} ${row.event_type}` : "Liquidity sweep"}\nLevel: ${row.level}\nConfirmed: ${timestamp(eventAt(row)!)}`,
   }));
   const rangeAreas = range ? [
@@ -438,8 +507,8 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
         ] },
       },
       { id: "smc-volume", type: "bar", name: "Volume", xAxisIndex: 1, yAxisIndex: 1, data: [...candles.map((row, index) => ({ value: row.volume, itemStyle: { color: row.close >= row.open ? "rgba(8,153,129,.70)" : "rgba(242,54,69,.70)", opacity: hasFormingCandle && index === candles.length - 1 ? 0.72 : 1 } })), ...futureSlots.map(() => "-")], barMaxWidth: 18 },
-      { id: "smc-pivots", type: "scatter", name: "Native pivots", xAxisIndex: 0, yAxisIndex: 0, data: pivotData as any[], symbolSize: 8, label: { show: filters.labels, formatter: (row: any) => row.data.name, color: "#d7deea", fontSize: 9, position: "top" }, z: 8 },
-      { id: "smc-structure", type: "scatter", name: "Native structure", xAxisIndex: 0, yAxisIndex: 0, data: structureData as any[], symbol: "diamond", symbolSize: 11, label: { show: filters.labels, formatter: (row: any) => row.data.name, color: "#d7deea", fontSize: 9, position: "bottom" }, z: 9 },
+      { id: "smc-pivots", type: "scatter", name: "Native pivots", xAxisIndex: 0, yAxisIndex: 0, data: pivotData as any[], symbolSize: 8, label: { show: filters.labels, formatter: (row: any) => row.data.showLabel ? row.data.name : "", color: "#d7deea", fontSize: 9, position: "top" }, z: 8 },
+      { id: "smc-structure", type: "scatter", name: "Native structure", xAxisIndex: 0, yAxisIndex: 0, data: structureData as any[], symbol: "diamond", symbolSize: 11, label: { show: filters.labels, formatter: (row: any) => row.data.showLabel ? row.data.name : "", color: "#d7deea", fontSize: 9, position: "bottom" }, z: 9 },
     ],
   } as EChartsOption, priceAxisRange, livePrice, liveDirection, viewport: activeViewport };
 }
