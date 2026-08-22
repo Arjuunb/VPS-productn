@@ -12,6 +12,10 @@ class Request(BaseModel):
     timeframe: str = "1h"
     period: str = "90d"
 
+class ConnectionTestRequest(BaseModel):
+    symbol: str = "BTCUSDT"
+    timeframe: str = "5m"
+
 def _call(fn):
     try: return fn()
     except Exception as exc: raise HTTPException(400, detail={"code": "market_data_error", "message": str(exc)}) from exc
@@ -30,6 +34,20 @@ def quality(symbol: str, timeframe: str = "1h"): return _call(lambda: _wa.v2_mar
 
 @router.get("/market-data/gaps")
 def gaps(symbol: str, timeframe: str = "1h"): return _call(lambda: {"symbol": symbol, "timeframe": timeframe, "gaps": _wa.v2_market_data.quality(symbol, timeframe)["gaps"]})
+
+@router.post("/market-data/test-connection")
+def test_connection(body: ConnectionTestRequest):
+    """Probe the configured Trading Instance spot provider with real candles.
+
+    This endpoint is read-only and deliberately returns no credentials or
+    provider configuration secrets. A timeout/provider error is reported as a
+    failure; cached data is never presented as a successful connection test.
+    """
+    def probe():
+        from data.forward_market_data import test_forward_connection
+        exchange = str(getattr(_wa.settings, "default_exchange", "binance") or "binance").lower()
+        return test_forward_connection(body.symbol, body.timeframe, exchange)
+    return _call(probe)
 
 @router.post("/market-data/download")
 def download(body: Request, x_webhook_secret: Optional[str] = Header(default=None)):

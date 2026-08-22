@@ -1,12 +1,10 @@
 import Logo from "../common/Logo";
 import {
   LayoutDashboard, CandlestickChart, Search, Layers, FlaskConical, RefreshCw, PlayCircle,
-  NotebookPen, Rocket, Wallet, BarChart3, Bot, ShieldAlert, Brain, ScrollText,
-  BookOpen, Activity, BadgeCheck, Settings, Lock, BrainCircuit, Gauge, Blocks, SquareTerminal, ListChecks, LayoutGrid, SlidersHorizontal, PieChart, GitCompareArrows, type LucideIcon,
+  NotebookPen, Rocket, Wallet, BarChart3, ShieldAlert, Brain,
+  BookOpen, Activity, BadgeCheck, Settings, Lock, Blocks, SquareTerminal, SlidersHorizontal, GitCompareArrows, type LucideIcon,
 } from "lucide-react";
 import { NAV_GROUPS } from "../../app-context";
-import { useLive, type RiskSummary, type PaperAccount } from "../../lib/api";
-import { signedMoney } from "../../lib/format";
 
 // Real icons (lucide), one per page — gold when active, sky on hover.
 const NAV_LUCIDE: Record<string, LucideIcon> = {
@@ -23,23 +21,14 @@ const NAV_LUCIDE: Record<string, LucideIcon> = {
   "Paper Account": NotebookPen,
   "Live Trading": Rocket,
   Portfolio: Wallet,
-  Allocation: PieChart,
   Analytics: BarChart3,
   "Forward Validation": GitCompareArrows,
   "Strategy Proof": BadgeCheck,
   "Strategy Studio": Blocks,
   "SMC Visual Lab": CandlestickChart,
-  "Fleet Manager": Bot,
-  "Grid & DCA": LayoutGrid,
-  "AI Intelligence": Gauge,
-  "AI Assistant": Bot,
-  "Risk Manager": ShieldAlert,
+  "Risk & Health": ShieldAlert,
   Evolution: Brain,
   Journal: BookOpen,
-  "Decision Archive": ListChecks,
-  Memory: BrainCircuit,
-  "Bot Health": Activity,
-  Logs: ScrollText,
   Settings: Settings,
   "Safety Center": Lock,
 };
@@ -50,12 +39,7 @@ interface SidebarProps {
   collapsed?: boolean;
 }
 
-const money = (n: number | undefined) => `$${(n ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
-
 export default function Sidebar({ active, onSelect, collapsed }: SidebarProps) {
-  const { data: r } = useLive<RiskSummary>("/risk/summary", 3000);
-  const { data: acct } = useLive<PaperAccount>("/paper/account", 3000);
-
   return (
     <aside className={`sidebar ${collapsed ? "collapsed" : ""}`}>
       <a
@@ -92,19 +76,15 @@ export default function Sidebar({ active, onSelect, collapsed }: SidebarProps) {
         ))}
       </nav>
 
-      <div className="account-card">
-        <div className="account-title">Current Equity</div>
-        <div className="account-equity">{acct ? money(acct.current_equity) : r ? money(r.equity) : "—"}</div>
-        <div className="account-row"><span>Initial capital</span><b>{acct ? money(acct.initial_capital) : "—"}</b></div>
-        <div className="account-row"><span>Realized P&amp;L</span>
-          <b className={(r?.realized_pnl ?? 0) >= 0 ? "pos" : "neg"}>{r ? signedMoney(r.realized_pnl) : "—"}</b></div>
-        <div className="account-row"><span>Open Positions</span><b>{r?.open_positions ?? 0}</b></div>
-        <div className="account-row"><span>Exposure</span><b>{r ? `${(r.exposure_pct * 100).toFixed(1)}%` : "—"}</b></div>
-        <button className="btn btn-soft full" type="button" onClick={() => onSelect("Backtesting")}>Performance</button>
-      </div>
-
-      <div className="market-status">
-        <span className={`dot ${r ? "warn" : "offline"}`} /> Mode: <b>Paper (simulation)</b>
+      <div className="sidebar-footer">
+        <button
+          className={`nav-item ${active === "Settings" ? "active" : ""}`}
+          onClick={() => onSelect("Settings")}
+          type="button"
+        >
+          <Settings size={18} strokeWidth={1.9} className="nav-ico" aria-hidden />
+          <span>Settings</span>
+        </button>
       </div>
     </aside>
   );

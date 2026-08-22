@@ -159,6 +159,24 @@ ALTER TABLE trading_instance_platform_settings
  ADD COLUMN IF NOT EXISTS max_global_risk_pct DOUBLE PRECISION NOT NULL DEFAULT 0.02;
 ALTER TABLE trading_instance_platform_settings
  ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE trading_instance_platform_settings
+ ADD COLUMN IF NOT EXISTS max_instance_risk_per_trade_pct DOUBLE PRECISION NOT NULL DEFAULT 0.05;
+ALTER TABLE trading_instance_platform_settings
+ ADD COLUMN IF NOT EXISTS default_symbol TEXT NOT NULL DEFAULT 'BTCUSDT';
+ALTER TABLE trading_instance_platform_settings
+ ADD COLUMN IF NOT EXISTS default_timeframe TEXT NOT NULL DEFAULT '5m';
+ALTER TABLE trading_instance_platform_settings
+ ADD COLUMN IF NOT EXISTS default_strategy TEXT NOT NULL DEFAULT 'brain';
+ALTER TABLE trading_instance_platform_settings
+ ADD COLUMN IF NOT EXISTS default_capital DOUBLE PRECISION NOT NULL DEFAULT 1000;
+ALTER TABLE trading_instance_platform_settings
+ ADD COLUMN IF NOT EXISTS default_risk_per_trade_pct DOUBLE PRECISION NOT NULL DEFAULT 0.005;
+ALTER TABLE trading_instance_platform_settings
+ ADD COLUMN IF NOT EXISTS default_max_open_positions INTEGER NOT NULL DEFAULT 3;
+ALTER TABLE trading_instance_platform_settings
+ ADD COLUMN IF NOT EXISTS default_entry_mode TEXT NOT NULL DEFAULT 'limit';
+ALTER TABLE trading_instance_platform_settings
+ ADD COLUMN IF NOT EXISTS default_fill_model TEXT NOT NULL DEFAULT 'RealisticFill';
 CREATE INDEX IF NOT EXISTS idx_instance_pair_strategy ON trading_instances(symbol, strategy_key, strategy_version);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_instance_market_state_owner ON instance_market_state(instance_id);
 CREATE INDEX IF NOT EXISTS idx_instance_trade ON paper_trades(instance_id, closed_at);

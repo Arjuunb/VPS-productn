@@ -10,7 +10,7 @@ type Metric = Record<string, any>;
 type MarketData = { market_data_mode?: string; market_data_status?: string; last_market_data_timestamp?: string; last_processed_candle_timestamp?: string; market_data_age_seconds?: number | null; warmup_bars?: number; duplicate_candles?: number; missing_candles?: number; out_of_order_candles?: number; reconnect_attempt?: number; data_source?: string; freshness_thresholds_seconds?: { healthy_under: number; disconnected_over: number } };
 type Instance = { id: string; symbol: string; strategy_key: string; strategy_label: string; strategy_version: string; timeframe: string; risk_per_trade_pct: number; capital_allocation: number; exchange?: string; effective_exchange?: string; instrument_type?: string; max_open_positions?: number; sizing_mode?: string; fixed_position_size?: number; fixed_quantity?: number; profit_reinvestment?: boolean; maximum_risk_amount?: number | null; minimum_equity?: number | null; starting_equity?: number; current_realized_equity?: number; entry_mode?: string; fill_model?: string; execution_mode?: string; market_data_mode?: string; mode: string; state: string; created_at: string; started_at?: string | null; stopped_at?: string | null; last_error?: string; metrics: Metric; performance?: Metric; execution?: Metric; risk?: Metric; engine?: Metric | null; market_data?: MarketData; current_position?: Metric | null; strategy_health?: Metric | null; last_decision?: Metric | null };
 type InstancesResponse = { instances: Instance[]; max_active_slots: number; active_slots: number; total_instances?: number; max_global_risk_pct: number; max_global_risk_amount: number; current_global_risk_amount: number; paper_account_capital?: number; total_allocated_capital?: number; total_current_equity?: number; available_paper_capital?: number; today_pnl?: number; today_trades?: number; total_open_positions?: number; global_risk_status?: string; market_data_status?: string; global_status?: string; instance_counts?: Record<string, number> };
-type Options = { symbols: string[]; timeframes: string[]; strategies: { key: string; label: string; versions: string[]; supported_timeframes?: string[] }[]; execution_defaults: { position_sizing_mode?: string; entry_mode?: string; fill_model?: string; exchange?: string; instrument_type?: string; leverage?: number | null; max_open_positions?: number }; exchanges?: { key: string; label: string }[]; sizing_modes?: { key: string; label: string; implemented: boolean }[]; fill_models?: { key: string; label: string; recommended?: boolean }[]; market_data_mode: string };
+type Options = { symbols: string[]; timeframes: string[]; strategies: { key: string; label: string; versions: string[]; supported_timeframes?: string[] }[]; execution_defaults: { position_sizing_mode?: string; entry_mode?: string; fill_model?: string; exchange?: string; instrument_type?: string; leverage?: number | null; max_open_positions?: number; symbol?: string; timeframe?: string; strategy?: string; capital?: number; risk_per_trade_pct?: number }; exchanges?: { key: string; label: string }[]; sizing_modes?: { key: string; label: string; implemented: boolean }[]; fill_models?: { key: string; label: string; recommended?: boolean }[]; market_data_mode: string };
 
 const noValue = (value: unknown) => value === undefined || value === null || value === "";
 const money = (value: unknown) => noValue(value) ? "—" : new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(Number(value));
@@ -82,13 +82,16 @@ export default function TradingInstancesPage({ instanceId }: { instanceId?: stri
   const [editForm, setEditForm] = useState({ strategy: "", strategy_version: "", timeframe: "", exchange: "inherit", risk: "", capital: "", max_open_positions: "", sizing_mode: "fixed_starting_equity_percent", fixed_quantity: "", profit_reinvestment: false, maximum_risk_amount: "", minimum_equity: "", entry_mode: "limit", fill_model: "RealisticFill" });
 
   useEffect(() => {
-    const firstStrategy = options.data?.strategies[0];
+    const firstStrategy = options.data?.strategies.find((row) => row.key === options.data?.execution_defaults.strategy) ?? options.data?.strategies[0];
     setForm((current) => ({ ...current,
-      symbol: current.symbol || options.data?.symbols[0] || "",
+      symbol: current.symbol || options.data?.execution_defaults.symbol || options.data?.symbols[0] || "",
       strategy: current.strategy || firstStrategy?.key || "",
       strategy_version: current.strategy_version || firstStrategy?.versions[0] || "",
-      timeframe: current.timeframe || options.data?.timeframes.find((x) => x === "5m") || options.data?.timeframes[0] || "",
+      timeframe: current.timeframe || options.data?.execution_defaults.timeframe || options.data?.timeframes[0] || "",
       exchange: current.exchange || options.data?.execution_defaults.exchange || "inherit",
+      risk: current.risk === "0.5" ? String((options.data?.execution_defaults.risk_per_trade_pct ?? 0.005) * 100) : current.risk,
+      capital: current.capital === "1000" ? String(options.data?.execution_defaults.capital ?? 1000) : current.capital,
+      max_open_positions: current.max_open_positions === "3" ? String(options.data?.execution_defaults.max_open_positions ?? 3) : current.max_open_positions,
       sizing_mode: current.sizing_mode || options.data?.execution_defaults.position_sizing_mode || "fixed_starting_equity_percent",
       fill_model: current.fill_model || options.data?.execution_defaults.fill_model || "RealisticFill",
     }));

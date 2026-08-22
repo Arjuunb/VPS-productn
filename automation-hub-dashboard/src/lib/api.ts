@@ -18,6 +18,9 @@ async function requestError(res: Response, path: string): Promise<Error> {
     const payload = await res.json();
     const detail = payload?.detail ?? payload?.error;
     if (typeof detail === "string" && detail) return new Error(`${path}: ${detail}`);
+    if (detail && typeof detail === "object" && typeof detail.message === "string") {
+      return new Error(`${path}: ${detail.field ? `${detail.field}: ` : ""}${detail.message}`);
+    }
   } catch { /* keep the safe HTTP status when the error has no JSON body */ }
   return new Error(`${path}: HTTP ${res.status}`);
 }

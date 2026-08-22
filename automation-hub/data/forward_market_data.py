@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import math
+import time
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Iterable, Optional
@@ -69,6 +70,21 @@ def fetch_forward_bars(symbol: str, timeframe: str, limit: int,
         detail = last_error(symbol) or "provider returned no OHLCV bars"
         raise ForwardMarketDataUnavailable(f"{symbol} {timeframe}: {detail}")
     return bars, f"live (ccxt:{exchange})"
+
+
+def test_forward_connection(symbol: str, timeframe: str, exchange: str, *, fetcher=None) -> dict:
+    """Perform one real provider probe and return secret-free evidence."""
+    fetcher = fetcher or fetch_forward_bars
+    started = time.monotonic()
+    bars, source = fetcher(symbol.upper(), timeframe, 3, exchange=exchange)
+    if not bars:
+        raise ForwardMarketDataUnavailable("provider returned no OHLCV bars")
+    latest = bars[-1]
+    return {
+        "ok": True, "provider": source, "market": "spot", "symbol": symbol.upper(),
+        "timeframe": timeframe, "latency_ms": round((time.monotonic() - started) * 1000, 2),
+        "last_price_timestamp": latest.timestamp.isoformat(), "last_price": float(latest.close),
+    }
 
 
 @lru_cache(maxsize=256)

@@ -248,7 +248,14 @@ CREATE TABLE IF NOT EXISTS trading_instance_platform_settings (
  id TEXT PRIMARY KEY, max_active_slots INTEGER NOT NULL DEFAULT 1,
  max_global_risk_pct REAL NOT NULL DEFAULT 0.02,
  max_global_daily_loss_pct REAL NOT NULL DEFAULT 0.05,
- paper_account_capital REAL NOT NULL DEFAULT 10000, updated_at TEXT NOT NULL
+ max_instance_risk_per_trade_pct REAL NOT NULL DEFAULT 0.05,
+ paper_account_capital REAL NOT NULL DEFAULT 10000,
+ default_symbol TEXT NOT NULL DEFAULT 'BTCUSDT', default_timeframe TEXT NOT NULL DEFAULT '5m',
+ default_strategy TEXT NOT NULL DEFAULT 'brain', default_capital REAL NOT NULL DEFAULT 1000,
+ default_risk_per_trade_pct REAL NOT NULL DEFAULT 0.005,
+ default_max_open_positions INTEGER NOT NULL DEFAULT 3,
+ default_entry_mode TEXT NOT NULL DEFAULT 'limit',
+ default_fill_model TEXT NOT NULL DEFAULT 'RealisticFill', updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_instance_symbol_strategy ON trading_instances(symbol, strategy_key, strategy_version);
 """
@@ -283,7 +290,11 @@ class InstanceStore:
         "instance_engine_logs": ("id", "instance_id", "ts", "level", "message"),
         "trading_instance_platform_settings": (
             "id", "max_active_slots", "max_global_risk_pct",
-            "max_global_daily_loss_pct", "paper_account_capital", "updated_at",
+            "max_global_daily_loss_pct", "max_instance_risk_per_trade_pct",
+            "paper_account_capital", "default_symbol", "default_timeframe",
+            "default_strategy", "default_capital", "default_risk_per_trade_pct",
+            "default_max_open_positions", "default_entry_mode", "default_fill_model",
+            "updated_at",
         ),
     }
 
@@ -330,6 +341,18 @@ class InstanceStore:
                 ledger._c.execute("UPDATE trading_instances SET risk_basis=capital_allocation WHERE risk_basis IS NULL")
                 ensure_column(ledger._c, "trading_instance_platform_settings",
                               "paper_account_capital", "REAL NOT NULL DEFAULT 10000")
+                for name, definition in (
+                    ("max_instance_risk_per_trade_pct", "REAL NOT NULL DEFAULT 0.05"),
+                    ("default_symbol", "TEXT NOT NULL DEFAULT 'BTCUSDT'"),
+                    ("default_timeframe", "TEXT NOT NULL DEFAULT '5m'"),
+                    ("default_strategy", "TEXT NOT NULL DEFAULT 'brain'"),
+                    ("default_capital", "REAL NOT NULL DEFAULT 1000"),
+                    ("default_risk_per_trade_pct", "REAL NOT NULL DEFAULT 0.005"),
+                    ("default_max_open_positions", "INTEGER NOT NULL DEFAULT 3"),
+                    ("default_entry_mode", "TEXT NOT NULL DEFAULT 'limit'"),
+                    ("default_fill_model", "TEXT NOT NULL DEFAULT 'RealisticFill'"),
+                ):
+                    ensure_column(ledger._c, "trading_instance_platform_settings", name, definition)
                 ensure_column(ledger._c, "instance_market_state",
                               "pending_orders_json", "TEXT NOT NULL DEFAULT '{}'")
                 ledger._c.commit()
@@ -564,7 +587,13 @@ class InstanceStore:
 
     def platform_settings(self) -> dict:
         defaults = {"max_active_slots": 1, "max_global_risk_pct": 0.02,
-                    "max_global_daily_loss_pct": 0.05, "paper_account_capital": None}
+                    "max_global_daily_loss_pct": 0.05,
+                    "max_instance_risk_per_trade_pct": 0.05,
+                    "paper_account_capital": None, "default_symbol": "BTCUSDT",
+                    "default_timeframe": "5m", "default_strategy": "brain",
+                    "default_capital": 1000.0, "default_risk_per_trade_pct": 0.005,
+                    "default_max_open_positions": 3, "default_entry_mode": "limit",
+                    "default_fill_model": "RealisticFill"}
         if self.remote:
             try:
                 rows = remote_call_with_retry(lambda: self._table("trading_instance_platform_settings")
@@ -579,19 +608,26 @@ class InstanceStore:
         return {**defaults, **(dict(row) if row else {})}
 
     def save_platform_settings(self, *, max_active_slots: int, max_global_risk_pct: float,
-                               max_global_daily_loss_pct: float, paper_account_capital: float) -> None:
+                               max_global_daily_loss_pct: float,
+                               max_instance_risk_per_trade_pct: float,
+                               paper_account_capital: float, defaults: dict) -> None:
         row = {"id": "default", "max_active_slots": max_active_slots,
                "max_global_risk_pct": max_global_risk_pct,
                "max_global_daily_loss_pct": max_global_daily_loss_pct,
-               "paper_account_capital": paper_account_capital, "updated_at": _now()}
+               "max_instance_risk_per_trade_pct": max_instance_risk_per_trade_pct,
+               "paper_account_capital": paper_account_capital, **defaults, "updated_at": _now()}
         if self.remote:
             remote_call_with_retry(lambda: self._table("trading_instance_platform_settings")
                                    .upsert(row).execute())
         else:
             with self.ledger._lock:
                 self.ledger._c.execute("""INSERT OR REPLACE INTO trading_instance_platform_settings
-                    (id,max_active_slots,max_global_risk_pct,max_global_daily_loss_pct,paper_account_capital,updated_at)
-                    VALUES (:id,:max_active_slots,:max_global_risk_pct,:max_global_daily_loss_pct,:paper_account_capital,:updated_at)""", row)
+                    (id,max_active_slots,max_global_risk_pct,max_global_daily_loss_pct,max_instance_risk_per_trade_pct,
+                     paper_account_capital,default_symbol,default_timeframe,default_strategy,default_capital,
+                     default_risk_per_trade_pct,default_max_open_positions,default_entry_mode,default_fill_model,updated_at)
+                    VALUES (:id,:max_active_slots,:max_global_risk_pct,:max_global_daily_loss_pct,:max_instance_risk_per_trade_pct,
+                     :paper_account_capital,:default_symbol,:default_timeframe,:default_strategy,:default_capital,
+                     :default_risk_per_trade_pct,:default_max_open_positions,:default_entry_mode,:default_fill_model,:updated_at)""", row)
                 self.ledger._c.commit()
 
 
@@ -638,8 +674,19 @@ class TradingInstanceManager:
         self.max_slots = min(3, max(1, int(configured.get("max_active_slots", max_slots))))
         self.max_global_risk_pct = min(1.0, max(0.001, float(configured.get("max_global_risk_pct", max_global_risk_pct))))
         self.max_global_daily_loss_pct = min(1.0, max(0.001, float(configured.get("max_global_daily_loss_pct", max_global_daily_loss_pct))))
+        self.max_instance_risk_per_trade_pct = min(0.05, max(0.001, float(configured.get("max_instance_risk_per_trade_pct", 0.05))))
         configured_capital = configured.get("paper_account_capital")
         self.paper_account_capital = max(1.0, float(configured_capital if configured_capital is not None else paper_account_capital))
+        self.instance_defaults = {
+            "default_symbol": str(configured.get("default_symbol") or "BTCUSDT").upper(),
+            "default_timeframe": str(configured.get("default_timeframe") or "5m"),
+            "default_strategy": str(configured.get("default_strategy") or "brain"),
+            "default_capital": float(configured.get("default_capital") or 1000),
+            "default_risk_per_trade_pct": float(configured.get("default_risk_per_trade_pct") or 0.005),
+            "default_max_open_positions": int(configured.get("default_max_open_positions") or 3),
+            "default_entry_mode": str(configured.get("default_entry_mode") or "limit"),
+            "default_fill_model": str(configured.get("default_fill_model") or "RealisticFill"),
+        }
         self._instances: dict[str, TradingInstance] = {i.id: i for i in self.store.list()}
         self._runtime: dict[str, tuple[AutoStrategyEngine, PaperExecutionEngine, SignalPipeline, TradingControl]] = {}
         self._metric_fingerprints: dict[str, tuple] = {}
@@ -668,6 +715,9 @@ class TradingInstanceManager:
                 raise ValueError("capital_allocation must be a finite value greater than zero")
             if not math.isfinite(risk_per_trade_pct) or not 0 < risk_per_trade_pct <= 0.05:
                 raise ValueError("risk_per_trade_pct must be a finite value in (0, 0.05]")
+            if risk_per_trade_pct > self.max_instance_risk_per_trade_pct:
+                raise ValueError(
+                    f"risk_per_trade_pct exceeds the platform ceiling of {self.max_instance_risk_per_trade_pct}")
             sizing_mode = normalize_sizing_mode(sizing_mode)
             quantity = float(fixed_quantity if fixed_quantity is not None else fixed_position_size)
             if sizing_mode not in SIZING_MODES:
@@ -1084,6 +1134,10 @@ class TradingInstanceManager:
                     and (not math.isfinite(float(risk_per_trade_pct))
                          or not 0 < float(risk_per_trade_pct) <= 0.05)):
                 raise ValueError("risk_per_trade_pct must be a finite value in (0, 0.05]")
+            if (risk_per_trade_pct is not None
+                    and float(risk_per_trade_pct) > self.max_instance_risk_per_trade_pct):
+                raise ValueError(
+                    f"risk_per_trade_pct exceeds the platform ceiling of {self.max_instance_risk_per_trade_pct}")
             candidate_mode = normalize_sizing_mode(sizing_mode if sizing_mode is not None else inst.sizing_mode)
             if candidate_mode not in SIZING_MODES:
                 raise ValueError(f"sizing_mode must be one of {', '.join(SIZING_MODES)}")
@@ -1204,34 +1258,51 @@ class TradingInstanceManager:
     def configure(self, *, max_active_slots: int | None = None,
                   max_global_risk_pct: float | None = None,
                   max_global_daily_loss_pct: float | None = None,
-                  paper_account_capital: float | None = None) -> dict:
-        if max_active_slots is not None:
-            if not 1 <= int(max_active_slots) <= 3:
-                raise ValueError("max_active_slots must be between 1 and 3")
-            running = sum(1 for key, r in self._runtime.items()
-                          if r[0].running and self._instances[key].mode == "trading")
-            if int(max_active_slots) < running:
-                raise ValueError("Stop or pause instances before reducing active slots below the running count")
-            self.max_slots = int(max_active_slots)
-        if max_global_risk_pct is not None:
-            if not 0.001 <= float(max_global_risk_pct) <= 1:
-                raise ValueError("max_global_risk_pct must be between 0.001 and 1")
-            self.max_global_risk_pct = float(max_global_risk_pct)
-        if max_global_daily_loss_pct is not None:
-            if not 0.001 <= float(max_global_daily_loss_pct) <= 1:
-                raise ValueError("max_global_daily_loss_pct must be between 0.001 and 1")
-            self.max_global_daily_loss_pct = float(max_global_daily_loss_pct)
-        if paper_account_capital is not None:
-            if float(paper_account_capital) <= 0:
-                raise ValueError("paper_account_capital must be greater than zero")
-            allocated = sum(item.capital_allocation for item in self._instances.values() if item.mode == "trading")
-            if float(paper_account_capital) < allocated:
-                raise ValueError("paper_account_capital cannot be below existing allocated capital")
-            self.paper_account_capital = float(paper_account_capital)
-        self.store.save_platform_settings(max_active_slots=self.max_slots,
-                                          max_global_risk_pct=self.max_global_risk_pct,
-                                          max_global_daily_loss_pct=self.max_global_daily_loss_pct,
-                                          paper_account_capital=self.paper_account_capital)
+                  max_instance_risk_per_trade_pct: float | None = None,
+                  paper_account_capital: float | None = None,
+                  defaults: dict | None = None) -> dict:
+        candidate_slots = self.max_slots if max_active_slots is None else int(max_active_slots)
+        candidate_global_risk = self.max_global_risk_pct if max_global_risk_pct is None else float(max_global_risk_pct)
+        candidate_daily_loss = self.max_global_daily_loss_pct if max_global_daily_loss_pct is None else float(max_global_daily_loss_pct)
+        candidate_ceiling = (self.max_instance_risk_per_trade_pct if max_instance_risk_per_trade_pct is None
+                             else float(max_instance_risk_per_trade_pct))
+        candidate_capital = self.paper_account_capital if paper_account_capital is None else float(paper_account_capital)
+        candidate_defaults = {**self.instance_defaults, **(defaults or {})}
+
+        if not 1 <= candidate_slots <= 3:
+            raise ValueError("max_active_slots must be between 1 and 3")
+        running = sum(1 for key, runtime in self._runtime.items()
+                      if runtime[0].running and self._instances[key].mode == "trading")
+        if candidate_slots < running:
+            raise ValueError("Stop or pause instances before reducing active slots below the running count")
+        if not math.isfinite(candidate_global_risk) or not 0.001 <= candidate_global_risk <= 1:
+            raise ValueError("max_global_risk_pct must be between 0.001 and 1")
+        if not math.isfinite(candidate_daily_loss) or not 0.001 <= candidate_daily_loss <= 1:
+            raise ValueError("max_global_daily_loss_pct must be between 0.001 and 1")
+        if not math.isfinite(candidate_ceiling) or not 0.001 <= candidate_ceiling <= 0.05:
+            raise ValueError("max_instance_risk_per_trade_pct must be between 0.001 and 0.05")
+        if any(item.risk_per_trade_pct > candidate_ceiling for item in self._instances.values()):
+            raise ValueError("Cannot lower the instance risk ceiling below an existing instance")
+        allocated = sum(item.capital_allocation for item in self._instances.values() if item.mode == "trading")
+        if not math.isfinite(candidate_capital) or candidate_capital <= 0:
+            raise ValueError("paper_account_capital must be greater than zero")
+        if candidate_capital < allocated:
+            raise ValueError("paper_account_capital cannot be below existing allocated capital")
+        if candidate_defaults["default_risk_per_trade_pct"] > candidate_ceiling:
+            raise ValueError("default_risk_per_trade_pct cannot exceed max_instance_risk_per_trade_pct")
+
+        self.store.save_platform_settings(max_active_slots=candidate_slots,
+                                          max_global_risk_pct=candidate_global_risk,
+                                          max_global_daily_loss_pct=candidate_daily_loss,
+                                          max_instance_risk_per_trade_pct=candidate_ceiling,
+                                          paper_account_capital=candidate_capital,
+                                          defaults=candidate_defaults)
+        self.max_slots = candidate_slots
+        self.max_global_risk_pct = candidate_global_risk
+        self.max_global_daily_loss_pct = candidate_daily_loss
+        self.max_instance_risk_per_trade_pct = candidate_ceiling
+        self.paper_account_capital = candidate_capital
+        self.instance_defaults = candidate_defaults
         return self.platform_status()
 
     def platform_status(self, runtime_states: list[dict] | None = None, *,
@@ -1294,6 +1365,17 @@ class TradingInstanceManager:
         return {"max_active_slots": self.max_slots, "active_slots": active,
                 "max_global_risk_pct": self.max_global_risk_pct,
                 "max_global_daily_loss_pct": self.max_global_daily_loss_pct,
+                "max_instance_risk_per_trade_pct": self.max_instance_risk_per_trade_pct,
+                "instance_defaults": dict(self.instance_defaults),
+                "settings_metadata": {
+                    "instance_defaults": {"scope": "platform", "source": "database",
+                                          "editable": True, "restart_required": False,
+                                          "applies_to": "new instances only"},
+                    "risk_ceilings": {"scope": "platform", "source": "database",
+                                      "editable": True, "restart_required": False},
+                    "paper_account_capital": {"scope": "platform", "source": "database",
+                                              "editable": True, "restart_required": False},
+                },
                 "max_global_risk_amount": round(allocated_capital * self.max_global_risk_pct, 2),
                 "current_global_risk_amount": round(used_risk, 2),
                 "total_open_positions": len(open_positions),

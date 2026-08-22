@@ -24,7 +24,8 @@ EDITABLE = ("risk_per_trade_pct", "exposure_limit_pct", "max_drawdown_pct",
             "min_quality_score", "streak_risk_scaling", "engine_symbols",
             "trading_mode", "engine_desired_running",
             "position_sizing_mode", "fixed_position_size",
-            "symbol_selection_mode", "manual_symbol", "auto_symbols")
+            "symbol_selection_mode", "manual_symbol", "auto_symbols",
+            "fill_model")
 _INT_KEYS = {"max_open_positions", "dedup_window_s", "session_start", "session_end",
              "max_trades_per_day", "max_consecutive_losses", "cooldown_after_loss_min",
              "trading_days_mask", "notify_trades", "notify_risk",
@@ -32,7 +33,7 @@ _INT_KEYS = {"max_open_positions", "dedup_window_s", "session_start", "session_e
              "engine_desired_running"}
 _STR_KEYS = {"engine_timeframe", "auto_strategy", "entry_mode", "engine_symbols",
              "trading_mode", "position_sizing_mode", "symbol_selection_mode",
-             "manual_symbol", "auto_symbols"}
+             "manual_symbol", "auto_symbols", "fill_model"}
 
 
 def _cast(key, value):

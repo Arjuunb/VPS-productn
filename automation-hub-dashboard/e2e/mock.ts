@@ -161,6 +161,27 @@ const MEM_ASK = { query: "show all losing BTC trades", kind: "filter",
 
 // exact shapes keyed by pathname substring (first match wins)
 const SHAPES: [string, unknown][] = [
+  ["/user/settings", { namespace: "settings-center", data: {
+    general: { density: "comfortable", sidebar_default: "expanded" },
+  } }],
+  ["/instances/options", {
+    symbols: ["BTCUSDT", "ETHUSDT"], timeframes: ["1m", "5m", "15m", "1h", "4h"],
+    strategies: [{ key: "brain", label: "Decision Brain", versions: ["1.0"] }],
+    fill_models: [{ key: "RealisticFill", label: "Realistic" }, { key: "PerfectFill", label: "Ideal" }],
+    execution_defaults: { max_open_positions: 3, max_quick_risk_pct: 0.01 },
+    platform_defaults: {
+      symbol: "BTCUSDT", timeframe: "5m", strategy: "brain", capital: 1000,
+      risk_per_trade_pct: 0.005, max_open_positions: 3, entry_mode: "limit", fill_model: "RealisticFill",
+    },
+  }],
+  ["/instances", {
+    instances: [], active_slots: 0, max_active_slots: 8, total_current_equity: 10000,
+    paper_account_capital: 10000, available_paper_capital: 10000,
+    current_global_risk_amount: 0, max_global_risk_amount: 500,
+    total_open_positions: 0, global_risk_status: "healthy",
+    global_risk_message: "Within configured limits", market_data_status: "idle",
+  }],
+  ["/controls/state", { state: "Active" }],
   // Trading modes + approvals (§7, §11) — GET shapes (POSTs auto-echo 200)
   ["/engine/mode", { mode: "semi", modes: ["full", "semi", "signal"], pending_approvals: 1 }],
   ["/approvals", { mode: "semi",

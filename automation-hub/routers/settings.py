@@ -110,7 +110,8 @@ def set_execution_fill_model(body: _wa.FillModelBody, x_webhook_secret: _wa.Opti
                                          partial_fill_prob=body.partial_fill_prob, reject_prob=body.reject_prob)
     else:
         _wa.paper.fill_model = PerfectFill()
-    _wa.ledger.log(level="info", stage="execution", message=f"Fill model set to {paper.fill_model.name}")
+    _wa.save_overrides(_wa.settings.settings_path, _wa._settings_snapshot())
+    _wa.ledger.log(level="info", stage="execution", message=f"Fill model set to {_wa.paper.fill_model.name}")
     return _wa.paper.fill_model.status()
 
 @router.get("/report/daily")
@@ -206,6 +207,14 @@ def get_settings():
             "broker_connected": False,
             "webhook_secret_set": bool(_wa.settings.webhook_secret),
             "telegram_configured": bool(_wa.settings.telegram_token),
+        },
+        "metadata": {
+            "editable": {"scope": "legacy", "source": "runtime override",
+                         "editable": True, "restart_required": False},
+            "readonly": {"scope": "environment", "source": "environment",
+                         "editable": False, "restart_required": True},
+            "warning": ("These settings control the legacy autonomous engine "
+                        "and do not configure Trading Instances."),
         },
     }
 

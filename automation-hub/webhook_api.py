@@ -451,6 +451,9 @@ def _apply_setting(key: str, value) -> None:
         pipeline.position_sizing_mode = "fixed" if str(value) == "fixed" else "auto"
     elif key == "fixed_position_size":
         pipeline.fixed_position_size = max(0.0, float(value))
+    elif key == "fill_model":
+        from services.fill_model import from_name
+        paper.fill_model = from_name(str(value))
     elif key == "symbol_selection_mode":
         engine.symbol_selection_mode = "manual" if str(value) == "manual" else "auto"
     elif key == "manual_symbol":
@@ -507,6 +510,7 @@ def _settings_snapshot() -> dict:
         "streak_risk_scaling": 1 if pipeline.streak_risk_scaling else 0,
         "position_sizing_mode": pipeline.position_sizing_mode,
         "fixed_position_size": pipeline.fixed_position_size,
+        "fill_model": type(paper.fill_model).__name__,
         "engine_symbols": ",".join(engine.symbols),
         "symbol_selection_mode": engine.symbol_selection_mode,
         "manual_symbol": engine.manual_symbol,

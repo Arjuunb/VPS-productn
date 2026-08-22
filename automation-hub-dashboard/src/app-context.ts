@@ -31,10 +31,11 @@ export const useApp = () => useContext(AppContext);
 // instead of a flat list of pages.
 export const NAV_GROUPS: { title: string | null; items: string[] }[] = [
   { title: null, items: ["Dashboard"] },
-  { title: "Trading", items: ["Trading Instances", "Strategy Studio", "SMC Visual Lab", "Fleet Manager", "Paper Trading", "Replay", "Backtesting", "Optimization Lab", "Grid & DCA", "Live Trading"] },
-  { title: "Performance", items: ["Portfolio", "Allocation", "Analytics", "Forward Validation", "AI Intelligence"] },
-  { title: "Records", items: ["Journal", "Decision Archive", "Memory"] },
-  { title: "System", items: ["Market Data", "Risk Manager", "Bot Health", "Logs", "Settings"] },
+  { title: "Trading", items: ["Trading Instances", "Strategy Studio", "SMC Visual Lab", "Paper Trading", "Live Trading"] },
+  { title: "Research", items: ["Replay", "Backtesting", "Optimization Lab", "Forward Validation"] },
+  { title: "Performance", items: ["Portfolio", "Analytics"] },
+  { title: "Records", items: ["Journal"] },
+  { title: "System", items: ["Market Data", "Risk & Health"] },
 ];
 
 export const NAV_LABELS: string[] = NAV_GROUPS.flatMap((g) => g.items);
@@ -47,18 +48,30 @@ export const NAV_LABELS: string[] = NAV_GROUPS.flatMap((g) => g.items);
 // Trading terminal, AI Assistant from AI Intelligence).
 const EXTRA_ROUTES = [
   "Alerts", "Symbols", "Markets", "Strategies", "Strategy Proof",
-  "Simulation", "Evolution", "Safety Center", "Paper Account", "AI Assistant",
+  "Simulation", "Evolution", "Safety Center", "Paper Account", "AI Assistant", "Settings",
 ] as const;
 
 // Old bookmarks / saved hashes keep working after the reorganisation.
 const LEGACY_SLUGS: Record<string, string> = {
   "overview": "Dashboard",
   "bot-terminal": "Paper Trading",   // the terminal IS the paper-trading page now
-  "decisions": "Decision Archive",
-  "bots": "Fleet Manager",           // the Bots page is now the Fleet Manager
+  "bots": "Trading Instances",
 };
 
-export const slug = (page: string) => page.toLowerCase().replace(/ /g, "-");
+export const LEGACY_REDIRECTS: Record<string, { page: string; tab: string }> = {
+  "fleet-manager": { page: "Trading Instances", tab: "fleet" },
+  "grid-dca": { page: "Strategy Studio", tab: "grid-dca" },
+  "allocation": { page: "Portfolio", tab: "allocation" },
+  "ai-intelligence": { page: "Analytics", tab: "ai" },
+  "decisions": { page: "Journal", tab: "decisions" },
+  "decision-archive": { page: "Journal", tab: "decisions" },
+  "memory": { page: "Journal", tab: "memory" },
+  "risk-manager": { page: "Risk & Health", tab: "risk" },
+  "bot-health": { page: "Risk & Health", tab: "health" },
+  "logs": { page: "Risk & Health", tab: "logs" },
+};
+
+export const slug = (page: string) => page.toLowerCase().replace(/&/g, "").trim().replace(/\s+/g, "-").replace(/-+/g, "-");
 
 export interface Route {
   page: string;
@@ -66,20 +79,29 @@ export interface Route {
   instanceId?: string;
   /** Deep-link target id — the decision cycle or trade to focus on arrival. */
   focusId?: string;
+  tab?: string;
+  redirectHash?: string;
 }
 
 export const parseHash = (): Route => {
-  const h = window.location.hash.replace(/^#\/?/, "").trim();
+  const raw = window.location.hash.replace(/^#\/?/, "").trim();
+  const [h, query = ""] = raw.split("?", 2);
+  const tab = new URLSearchParams(query).get("tab") ?? undefined;
   const bot = h.match(/^bot\/(.+)$/);
   if (bot) return { page: "BotDetail", botId: bot[1] };
   const instance = h.match(/^instance\/([a-zA-Z0-9_-]+)$/);
   if (instance) return { page: "Trading Instances", botId: "", instanceId: instance[1] };
   // shareable deep links to a single decision or trade (for audit/sharing)
   const dec = h.match(/^decision\/(.+)$/);
-  if (dec) return { page: "Decision Archive", botId: "", focusId: decodeURIComponent(dec[1]) };
+  if (dec) return { page: "Journal", botId: "", focusId: decodeURIComponent(dec[1]), tab: "decisions" };
   const trd = h.match(/^trade\/(.+)$/);
   if (trd) return { page: "Journal", botId: "", focusId: decodeURIComponent(trd[1]) };
+  const redirected = LEGACY_REDIRECTS[h];
+  if (redirected) {
+    const redirectHash = `/${slug(redirected.page)}?tab=${redirected.tab}`;
+    return { page: redirected.page, botId: "", tab: redirected.tab, redirectHash };
+  }
   if (LEGACY_SLUGS[h]) return { page: LEGACY_SLUGS[h], botId: "" };
   const found = [...NAV_LABELS, ...EXTRA_ROUTES].find((n) => slug(n) === h);
-  return { page: found ?? "Dashboard", botId: "" };
+  return { page: found ?? "Dashboard", botId: "", tab };
 };

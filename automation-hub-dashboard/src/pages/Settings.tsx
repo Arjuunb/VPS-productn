@@ -1,18 +1,59 @@
 import { useEffect, useState, type ChangeEvent, type ReactNode } from "react";
 import Card from "../components/common/Card";
-import ActionButton from "../components/common/ActionButton";
 import Icon from "../components/common/Icon";
 import { Badge, Field, PageHeader } from "../components/common/ui";
 import { useApp } from "../app-context";
-import { API_BASE, apiPost, apiPostJson, useLive, type BotSettings, type EngineStatus, type NotifStatus } from "../lib/api";
+import { API_BASE, apiPost, apiPostJson, useLive, type BotSettings, type EngineStatus } from "../lib/api";
+import SettingsNav, { SETTINGS_SECTIONS } from "../components/settings/SettingsNav";
+import GeneralSettings from "../components/settings/GeneralSettings";
+import TradingDefaultsSettings from "../components/settings/TradingDefaultsSettings";
+import MarketDataSettings from "../components/settings/MarketDataSettings";
+import PaperSettings from "../components/settings/PaperSettings";
+import LiveTradingSettings from "../components/settings/LiveTradingSettings";
+import RiskSettings from "../components/settings/RiskSettings";
+import NotificationSettings from "../components/settings/NotificationSettings";
+import SystemSettings from "../components/settings/SystemSettings";
+import SecuritySettings from "../components/settings/SecuritySettings";
+import AdvancedSettings from "../components/settings/AdvancedSettings";
 
 const DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const SESSIONS: Record<string, [number, number]> = { London: [7, 16], "New York": [12, 21], Asia: [0, 9], "24h": [0, 24] };
 
-// Real configuration. Risk/position params are editable, applied live, and
-// persisted on the backend (survive restart). Everything else is env-set and
-// shown read-only with real values — no fake fields.
 export default function SettingsPage() {
+  const readSection = () => {
+    const raw = window.location.hash.split("?", 2)[1] ?? "";
+    const candidate = new URLSearchParams(raw).get("section") ?? "general";
+    return SETTINGS_SECTIONS.some(([id]) => id === candidate) ? candidate : "general";
+  };
+  const [active, setActive] = useState(readSection);
+  const [search, setSearch] = useState("");
+  useEffect(() => { const onHash = () => setActive(readSection()); window.addEventListener("hashchange", onHash); return () => window.removeEventListener("hashchange", onHash); }, []);
+  const select = (id: string) => {
+    const path = window.location.hash.replace(/^#\/?/, "").split("?", 1)[0] || "settings";
+    window.location.hash = `/${path}?section=${id}`;
+  };
+  const labels = new Map<string, string>(SETTINGS_SECTIONS as readonly (readonly [string, string])[]);
+  const visible = search.trim() ? SETTINGS_SECTIONS.filter(([, label]) => label.toLowerCase().includes(search.trim().toLowerCase())) : SETTINGS_SECTIONS.filter(([id]) => id === active);
+  const render = (id: string) => id === "general" ? <GeneralSettings />
+    : id === "trading" ? <TradingDefaultsSettings />
+    : id === "market-data" ? <MarketDataSettings />
+    : id === "paper" ? <PaperSettings />
+    : id === "live" ? <LiveTradingSettings />
+    : id === "risk" ? <RiskSettings />
+    : id === "notifications" ? <NotificationSettings />
+    : id === "system" ? <SystemSettings />
+    : id === "security" ? <SecuritySettings />
+    : <AdvancedSettings><LegacyEngineSettings /></AdvancedSettings>;
+  return <>
+    <PageHeader title="Settings Centre" subtitle="User preferences, platform defaults, safety limits and truthful runtime status" />
+    <div className="settings-search"><input aria-label="Search settings" placeholder="Search settings…" value={search} onChange={(e) => setSearch(e.target.value)} /></div>
+    <div className="settings-layout"><SettingsNav active={active} onSelect={select} /><div className="settings-content">{visible.length ? visible.map(([id]) => <div key={id} aria-label={labels.get(id)}>{render(id)}</div>) : <div className="card dim">No settings section matches that search.</div>}</div></div>
+  </>;
+}
+
+// Real legacy configuration. Risk/position params are editable, applied live,
+// and persisted on the backend. It is intentionally isolated under Advanced.
+export function LegacyEngineSettings() {
   const app = useApp();
   const { data, error, refetch } = useLive<BotSettings>("/settings", 8000);
   const engine = useLive<EngineStatus>("/engine/status", 5000);
@@ -54,17 +95,6 @@ export default function SettingsPage() {
     } catch (error) { app.toast(error instanceof Error ? error.message : "Could not apply pair selection", "error"); }
   };
   const preset = (name: string) => { const [s, e] = SESSIONS[name]; setF((p) => ({ ...p, sstart: String(s), send: String(e) })); };
-
-  const notif = useLive<NotifStatus>("/notifications/status", 6000);
-  const toggleNotif = async (key: "notify_trades" | "notify_risk") => {
-    const cur = notif.data; if (!cur) return;
-    try { await apiPostJson("/notifications", { [key]: !cur[key] }); notif.refetch(); }
-    catch { app.toast("Update failed", "error"); }
-  };
-  const testNotif = async () => {
-    try { const r = await apiPost<{ sent: boolean; configured: boolean }>("/notifications/test"); app.toast(r.sent ? "Telegram test sent ✅" : (r.configured ? "Send failed (network?)" : "Telegram not configured"), r.sent ? "success" : "error"); }
-    catch { app.toast("Test failed", "error"); }
-  };
 
   useEffect(() => {
     if (data && Object.keys(f).length === 0) {
@@ -126,29 +156,16 @@ export default function SettingsPage() {
 
   return (
     <>
-      <PageHeader
-        title="Global Account Settings"
-        subtitle="account-level limits and provider settings · active trading configuration lives in Trading Instances"
-      />
-
       {error && !data && (
         <div className="card" style={{ borderColor: "#ef4444" }}>
           <Icon name="warning" size={15} className="neg" /> Backend not reachable — settings unavailable.
         </div>
       )}
 
-      <AccountCard />
-
-      <WorkspaceCard />
-
-      <InstancePlatformCard />
-
       <details className="card" style={{ marginTop: 14 }}>
         <summary style={{ cursor: "pointer", fontWeight: 700 }}>Legacy Autonomous Engine <span className="dim">— stopped by default; not used by Trading Instances</span></summary>
         <p className="dim" style={{ marginTop: 10 }}>These retained controls exist for backward-compatible diagnostics only. They do not override an active Trading Instance’s pair, strategy, timeframe, risk, sizing, entry mode, or market-data mode.</p>
         <button className="btn btn-soft" disabled={saving || !data} onClick={save}><Icon name="check" size={14} /> {saving ? "Saving…" : "Save legacy settings"}</button>
-        <PaperCapitalCard />
-
       <div className="grid-2-eq">
         <Card title="Legacy Risk Management" subtitle="legacy worker only · persisted">
           <div className="form-grid-2">
@@ -288,19 +305,6 @@ export default function SettingsPage() {
       </details>
 
       <div className="grid-2-eq">
-        <Card title="Notifications" subtitle="Telegram · editable" right={<ActionButton className="btn btn-soft" icon="external" busyLabel="Sending…" onAction={testNotif}>Send test</ActionButton>}>
-          <div className="risk-list">
-            <Ro k="Telegram" v={notif.data?.telegram_configured ? "configured" : "not configured"} badge={<Badge text={notif.data?.telegram_configured ? "ON" : "OFF"} tone={notif.data?.telegram_configured ? "green" : "default"} />} />
-            <Ro k="Email" v={notif.data?.email ?? "—"} />
-            <Ro k="Discord" v={notif.data?.discord ?? "—"} />
-          </div>
-          <div className="row-actions" style={{ justifyContent: "flex-start", gap: 6, marginTop: 10 }}>
-            <button className={`chip-btn ${notif.data?.notify_trades ? "active" : ""}`} onClick={() => toggleNotif("notify_trades")}>Trade alerts</button>
-            <button className={`chip-btn ${notif.data?.notify_risk ? "active" : ""}`} onClick={() => toggleNotif("notify_risk")}>Risk alerts</button>
-          </div>
-          <p className="dim" style={{ marginTop: 8 }}>Telegram needs TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID (env). In-app alerts are always on (Alert Center). Email/Discord need extra credentials.</p>
-        </Card>
-
         <Card title="Audit & Logs" subtitle="export the full trail">
           <p className="dim">Every settings change, strategy edit, deploy and engine event is recorded to the decision log.</p>
           <div className="row-actions" style={{ justifyContent: "flex-start", gap: 6, marginTop: 10 }}>
@@ -350,7 +354,7 @@ type InstancePlatform = {
   paper_account_capital: number; total_allocated_capital: number; available_paper_capital: number;
 };
 
-function InstancePlatformCard() {
+export function InstancePlatformCard() {
   const app = useApp();
   const platform = useLive<InstancePlatform>("/instances", 5000);
   const [form, setForm] = useState<Record<string, string>>({});
@@ -389,56 +393,7 @@ function InstancePlatformCard() {
   </Card>;
 }
 
-function PaperCapitalCard() {
-  const app = useApp();
-  const acct = useLive<import("../lib/api").PaperAccount>("/paper/account", 4000);
-  const [amount, setAmount] = useState("");
-  const [busy, setBusy] = useState(false);
-  const a = acct.data;
-  const money = (n?: number) => `$${(n ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
-
-  const apply = async () => {
-    const v = Number(amount);
-    if (!Number.isFinite(v) || v <= 0) { app.toast("Enter a positive amount", "error"); return; }
-    if (!window.confirm(`Set initial capital to ${money(v)}?\n\nThis RESETS the paper account: equity and P&L go back to ${money(v)} and paper trade history is cleared. It does not affect live trading (which stays locked).`)) return;
-    setBusy(true);
-    try {
-      const r = await apiPostJson<any>("/paper/initial-capital", { amount: v, confirm: true, reset_trades: true });
-      if (r?.error || r?.detail) app.toast(r.error || r.detail, "error");
-      else { app.toast(`Initial capital set to ${money(v)} — paper account reset`, "success"); setAmount(""); acct.refetch(); }
-    } catch { app.toast("Change needs the webhook secret", "error"); }
-    finally { setBusy(false); }
-  };
-
-  return (
-    <Card title="Legacy Paper Account" subtitle="backward-compatible account state · Trading Instance allocation is configured above">
-      {a?.persistent === false && a?.warning && (
-        <div className="card" style={{ marginBottom: 10, borderColor: "var(--gold)", background: "rgba(234,181,79,0.08)" }}>
-          <Icon name="warning" size={13} className="amber" /> <span className="dim">{a.warning}</span>
-        </div>
-      )}
-      <div className="risk-list" style={{ marginBottom: 10 }}>
-        <div className="risk-item"><span className="dim">Initial capital</span><b>{money(a?.initial_capital)}</b></div>
-        <div className="risk-item"><span className="dim">Current equity</span><b className={(a?.current_equity ?? 0) >= (a?.initial_capital ?? 0) ? "pos" : "neg"}>{money(a?.current_equity)}</b></div>
-        <div className="risk-item"><span className="dim">Available balance</span><b>{money(a?.available_balance)}</b></div>
-        <div className="risk-item"><span className="dim">Realized P&amp;L</span><b>{money(a?.realized_pnl)}</b></div>
-        <div className="risk-item"><span className="dim">Last updated</span><span className="dim" style={{ fontSize: 12 }}>{a?.last_updated ?? "—"}</span></div>
-      </div>
-      <div className="form-grid-2">
-        <Field label="Set new initial capital ($)"><input type="number" min={1} placeholder={String(a?.initial_capital ?? "")} value={amount}
-          onChange={(e) => setAmount(e.target.value)} /></Field>
-        <div style={{ display: "flex", alignItems: "flex-end" }}>
-          <button className="btn btn-warn" disabled={busy} onClick={apply}><Icon name="refresh" size={13} /> {busy ? "…" : "Set & reset paper account"}</button>
-        </div>
-      </div>
-      <p className="dim" style={{ fontSize: 11, marginTop: 6 }}>
-        Changing initial capital resets the paper account (equity + trade history) after an explicit confirmation. It never affects live trading — live stays locked.
-      </p>
-    </Card>
-  );
-}
-
-function WorkspaceCard() {
+export function WorkspaceCard() {
   const app = useApp();
   const [busy, setBusy] = useState(false);
   const reset = async () => {
@@ -462,7 +417,7 @@ function WorkspaceCard() {
   );
 }
 
-function AccountCard() {
+export function AccountCard() {
   const app = useApp();
   const auth = useLive<{ authenticated: boolean; user: string | null; signup_open: boolean }>("/auth/status", 30000);
   const [pw, setPw] = useState({ current: "", next: "", confirm: "" });
