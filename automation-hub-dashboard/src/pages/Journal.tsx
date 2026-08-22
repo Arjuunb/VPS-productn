@@ -13,7 +13,11 @@ import { useApp } from "../app-context";
 
 type JournalTrade = {
   trade_id: string; created_at: string; closed_at: string | null;
-  mode: string; symbol: string; side: string; strategy: string; timeframe: string;
+  mode: string; execution_mode: string; market_data_mode: string | null;
+  market_data_source: string | null; exchange: string | null;
+  instance_id: string | null; instance_name: string | null;
+  strategy_id: string | null; strategy_name: string; strategy_version: string | null;
+  position_id: string | null; symbol: string; side: string; strategy: string; timeframe: string;
   entry: number; exit: number | null; pnl: number | null;
   planned_rr: number | null; actual_rr: number | null;
   result: string | null; grade: string | null; status: string;
@@ -24,19 +28,18 @@ type EvoSetup = {
 };
 
 const money = (n: number | null | undefined) => `$${(n ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
-const gradeTone = (g?: string | null) =>
-  g === "A" || g === "B" ? "green" : g === "C" ? "amber" : g ? "red" : "default";
 const stageTone = (s: string) =>
   s === "evidence" ? "green" : s === "building" ? "amber" : "blue";
 
-const MODES = ["all", "paper", "live", "sim"] as const;
+const MODES = ["all", "paper", "live", "LEGACY / UNVERIFIED"] as const;
 const RESULTS = ["all", "win", "loss"] as const;
 
 export default function JournalPage({ focusId }: { focusId?: string } = {}) {
-  const { go } = useApp();
+  const { go, viewInstance } = useApp();
   const [mode, setMode] = usePref<(typeof MODES)[number]>("journal.mode", "all");
   const [result, setResult] = usePref<(typeof RESULTS)[number]>("journal.result", "all");
   const [query, setQuery] = useState("");
+  const [instanceId, setInstanceId] = usePref<string>("journal.instance", "all");
   const [open, setOpen] = useState<string | null>(focusId ?? null);
 
   // deep link (#/trade/<id>): expand the linked trade on arrival
@@ -45,15 +48,17 @@ export default function JournalPage({ focusId }: { focusId?: string } = {}) {
   const qs = new URLSearchParams({ limit: "200" });
   if (mode !== "all") qs.set("mode", mode);
   if (result !== "all") qs.set("result", result);
+  if (instanceId !== "all") qs.set("instance_id", instanceId);
 
   const trades = useLive<{ trades: JournalTrade[] }>(`/journal/trades?${qs.toString()}`, 4000);
+  const instances = useLive<{ instances: Array<{ id: string; symbol: string; strategy_label: string; timeframe: string }> }>("/instances", 10000);
   const evolution = useLive<{ setups: EvoSetup[] }>("/journal/evolution", 8000);
 
   const offline = trades.error && !trades.data;
   const rows = useMemo(() => {
     const all = trades.data?.trades ?? [];
     const q = query.trim().toUpperCase();
-    return q ? all.filter((t) => t.symbol.toUpperCase().includes(q) || t.strategy.toUpperCase().includes(q)) : all;
+    return q ? all.filter((t) => t.symbol.toUpperCase().includes(q) || t.strategy_name.toUpperCase().includes(q) || (t.instance_name ?? "").toUpperCase().includes(q)) : all;
   }, [trades.data, query]);
 
   const stats = useMemo(() => {
@@ -107,6 +112,12 @@ export default function JournalPage({ focusId }: { focusId?: string } = {}) {
             <input placeholder="Search symbol or strategy…" value={query} onChange={(e) => setQuery(e.target.value)} />
           </div>
           <div className="chips">
+            <select aria-label="Instance filter" value={instanceId} onChange={(e) => setInstanceId(e.target.value)}>
+              <option value="all">All instances</option>
+              {(instances.data?.instances ?? []).map((instance) => (
+                <option key={instance.id} value={instance.id}>{instance.symbol} · {instance.strategy_label} · {instance.timeframe}</option>
+              ))}
+            </select>
             {MODES.map((m) => (
               <button key={m} className={`chip-btn ${mode === m ? "active" : ""}`} onClick={() => setMode(m)} type="button">{m}</button>
             ))}
@@ -120,8 +131,9 @@ export default function JournalPage({ focusId }: { focusId?: string } = {}) {
           <table className="data-table">
             <thead>
               <tr>
-                <th>Trade</th><th>Mode</th><th>Symbol</th><th>Side</th><th>Strategy</th>
-                <th>Entry</th><th>Exit</th><th>P&amp;L</th><th>R:R</th><th>Result</th><th>Grade</th><th>Opened</th><th>Journal</th>
+                <th>Instance</th><th>Strategy</th><th>Symbol</th><th>Timeframe</th>
+                <th>Execution</th><th>Market Data</th><th>Exchange</th><th>Entry</th>
+                <th>Exit</th><th>P&amp;L</th><th>Status</th><th>Opened</th><th>Closed</th><th>Journal</th>
               </tr>
             </thead>
             <tbody>
@@ -130,18 +142,19 @@ export default function JournalPage({ focusId }: { focusId?: string } = {}) {
                 return (
                   <Fragment key={t.trade_id}>
                     <tr>
-                      <td className="mono dim">{t.trade_id.slice(0, 8)}</td>
-                      <td><Badge text={t.mode} tone="default" /></td>
+                      <td>{t.instance_id ? <button className="btn btn-ghost btn-sm" onClick={() => viewInstance(t.instance_id as string)}>{t.instance_name ?? t.instance_id.slice(0, 8)}</button> : <span className="dim">Legacy / unverified</span>}</td>
+                      <td><b>{t.strategy_name}</b>{t.strategy_version ? <span className="dim"> · {t.strategy_version}</span> : null}</td>
                       <td><b>{t.symbol}</b></td>
-                      <td><Badge text={t.side} tone={t.side === "long" ? "green" : "red"} /></td>
-                      <td className="dim">{t.strategy}</td>
+                      <td>{t.timeframe || "—"}</td>
+                      <td><Badge text={t.execution_mode.toUpperCase()} tone={t.execution_mode === "live" ? "red" : t.execution_mode === "paper" ? "blue" : "amber"} /></td>
+                      <td><Badge text={t.market_data_mode ? `${t.market_data_mode.toUpperCase()} DATA` : "UNKNOWN"} tone="default" />{t.market_data_source ? <div className="dim" style={{ fontSize: 11 }}>{t.market_data_source}</div> : null}</td>
+                      <td><Badge text={(t.exchange ?? "unknown").toUpperCase()} tone="default" /></td>
                       <td>{t.entry.toLocaleString()}</td>
                       <td>{t.exit != null ? t.exit.toLocaleString() : "—"}</td>
                       <td className={(t.pnl ?? 0) >= 0 ? "pos" : "neg"}>{t.pnl == null ? "—" : `${(t.pnl ?? 0) >= 0 ? "+" : ""}${money(t.pnl)}`}</td>
-                      <td>{t.actual_rr != null ? `${t.actual_rr.toFixed(2)}R` : t.planned_rr != null ? `${t.planned_rr.toFixed(2)}R plan` : "—"}</td>
-                      <td>{t.result ? <Badge text={t.result} tone={t.result === "win" ? "green" : t.result === "loss" ? "red" : "default"} /> : <span className="dim">open</span>}</td>
-                      <td>{t.grade ? <Badge text={t.grade} tone={gradeTone(t.grade) as any} /> : <span className="dim">—</span>}</td>
+                      <td><Badge text={t.status} tone={t.status === "open" ? "blue" : t.result === "win" ? "green" : t.result === "loss" ? "red" : "default"} /></td>
                       <td className="dim mono">{hhmmss(t.created_at)}</td>
+                      <td className="dim mono">{t.closed_at ? hhmmss(t.closed_at) : "—"}</td>
                       <td>
                         <button
                           className="btn btn-ghost btn-sm"
@@ -156,7 +169,7 @@ export default function JournalPage({ focusId }: { focusId?: string } = {}) {
                     </tr>
                     {isOpen && (
                       <tr>
-                        <td colSpan={13} style={{ background: "var(--surface-2, #121214)", padding: 0 }}>
+                        <td colSpan={14} style={{ background: "var(--surface-2, #121214)", padding: 0 }}>
                           <div style={{ display: "flex", justifyContent: "flex-end", padding: "6px 10px 0" }}>
                             <button className="chip-btn" title="Copy a shareable link to this trade"
                               onClick={() => { navigator.clipboard?.writeText(`${location.origin}${location.pathname}#/trade/${t.trade_id}`); }}>
@@ -171,7 +184,7 @@ export default function JournalPage({ focusId }: { focusId?: string } = {}) {
                 );
               })}
               {rows.length === 0 && (
-                <tr><td colSpan={13} className="dim ta-center" style={{ padding: 18 }}>
+                <tr><td colSpan={14} className="dim ta-center" style={{ padding: 18 }}>
                   {stats.total === 0 ? "No journaled trades yet — the journal fills as the engine opens and closes trades." : "No trades match the current filters."}
                 </td></tr>
               )}

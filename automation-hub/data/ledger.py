@@ -82,13 +82,15 @@ class Ledger(Protocol):
                                    target: Optional[float] = None,
                                    management: Optional[dict] = None,
                                    instance_id: str = "") -> int: ...
-    def close_position(self, position_id: str, *, exit_price: float, pnl: float) -> None: ...
+    def close_position(self, position_id: str, *, exit_price: float, pnl: float,
+                       instance_id: str = "") -> int: ...
     def get_positions(self, status: Optional[str] = None, instance_id: str = "") -> list[dict]: ...
     def record_paper_trade(self, trade: dict) -> str: ...
     def close_paper_trade(self, trade_id: str, *, exit_price: float, pnl: float, rr: float,
                           size: float | None = None, fees: float = 0.0,
                           realized_pnl: float | None = None,
-                          equity_after_close: float | None = None) -> None: ...
+                          equity_after_close: float | None = None,
+                          instance_id: str = "") -> int: ...
     def get_paper_trades(self, instance_id: str = "") -> list[dict]: ...
     # logs / alerts
     def log(self, *, level: str, stage: str, message: str, symbol: str = "", instance_id: str = "") -> None: ...
@@ -192,11 +194,16 @@ class SqliteLedger:
             self._c.commit()
         return pid
 
-    def close_position(self, position_id, *, exit_price, pnl):
+    def close_position(self, position_id, *, exit_price, pnl, instance_id=""):
         with self._lock:
-            self._c.execute("UPDATE positions SET status='closed', pnl=?, closed_at=? WHERE id=?",
-                            (pnl, _now(), position_id))
+            query = "UPDATE positions SET status='closed', pnl=?, closed_at=? WHERE id=?"
+            args = [pnl, _now(), position_id]
+            if instance_id:
+                query += " AND instance_id=?"
+                args.append(instance_id)
+            cur = self._c.execute(query, args)
             self._c.commit()
+            return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
     def get_positions(self, status=None, instance_id=""):
         q = "SELECT * FROM positions"
@@ -262,24 +269,30 @@ class SqliteLedger:
         return tid
 
     def close_paper_trade(self, trade_id, *, exit_price, pnl, rr, size=None,
-                          fees=0.0, realized_pnl=None, equity_after_close=None):
+                          fees=0.0, realized_pnl=None, equity_after_close=None,
+                          instance_id=""):
         with self._lock:
             values = (exit_price, pnl, rr, fees,
                       pnl if realized_pnl is None else realized_pnl,
                       equity_after_close, _now())
             if size is None:
-                self._c.execute(
+                query = (
                     "UPDATE paper_trades SET status='closed', exit=?, pnl=?, rr=?, fees=?, "
-                    "realized_pnl=?, equity_after_close=?, closed_at=? WHERE id=?",
-                    (*values, trade_id))
+                    "realized_pnl=?, equity_after_close=?, closed_at=? WHERE id=?")
+                args = [*values, trade_id]
             else:
                 # M-9: a partial close records the ACTUALLY-closed size on the
                 # closed row (not the original full size), so per-trade R is right.
-                self._c.execute(
+                query = (
                     "UPDATE paper_trades SET status='closed', exit=?, pnl=?, rr=?, fees=?, "
-                    "realized_pnl=?, equity_after_close=?, size=?, closed_at=? WHERE id=?",
-                    (*values[:-1], size, values[-1], trade_id))
+                    "realized_pnl=?, equity_after_close=?, size=?, closed_at=? WHERE id=?")
+                args = [*values[:-1], size, values[-1], trade_id]
+            if instance_id:
+                query += " AND instance_id=?"
+                args.append(instance_id)
+            cur = self._c.execute(query, args)
             self._c.commit()
+            return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
     def get_paper_trades(self, instance_id=""):
         query = "SELECT * FROM paper_trades"
@@ -413,9 +426,13 @@ class SupabaseLedger:
         self._t("positions").insert(row).execute()
         return pid
 
-    def close_position(self, position_id, *, exit_price, pnl):  # pragma: no cover
-        self._t("positions").update({"status": "closed", "pnl": pnl, "closed_at": _now()})\
-            .eq("id", position_id).execute()
+    def close_position(self, position_id, *, exit_price, pnl, instance_id=""):  # pragma: no cover
+        q = self._t("positions").update({"status": "closed", "pnl": pnl, "closed_at": _now()})\
+            .eq("id", position_id)
+        if instance_id:
+            q = q.eq("instance_id", instance_id)
+        result = q.execute()
+        return len(result.data or [])
 
     def get_positions(self, status=None, instance_id=""):  # pragma: no cover
         def query():
@@ -467,13 +484,18 @@ class SupabaseLedger:
         return tid
 
     def close_paper_trade(self, trade_id, *, exit_price, pnl, rr, size=None,
-                          fees=0.0, realized_pnl=None, equity_after_close=None):  # pragma: no cover
+                          fees=0.0, realized_pnl=None, equity_after_close=None,
+                          instance_id=""):  # pragma: no cover
         patch = {"status": "closed", "exit": exit_price, "pnl": pnl, "rr": rr,
                  "fees": fees, "realized_pnl": pnl if realized_pnl is None else realized_pnl,
                  "equity_after_close": equity_after_close, "closed_at": _now()}
         if size is not None:
             patch["size"] = size   # M-9: closed row shows the actually-closed size
-        self._t("paper_trades").update(patch).eq("id", trade_id).execute()
+        q = self._t("paper_trades").update(patch).eq("id", trade_id)
+        if instance_id:
+            q = q.eq("instance_id", instance_id)
+        result = q.execute()
+        return len(result.data or [])
 
     def get_paper_trades(self, instance_id=""):  # pragma: no cover
         def query():

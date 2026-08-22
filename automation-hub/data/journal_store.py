@@ -59,6 +59,16 @@ class JournalStore:
                 stage TEXT, note TEXT);
             CREATE INDEX IF NOT EXISTS idx_evt_trade ON trade_decision_events(trade_id);
             """)
+            existing = {row[1] for row in self._c.execute("PRAGMA table_info(trade_decision_journal)")}
+            for column in (
+                "instance_id TEXT", "instance_name TEXT", "strategy_id TEXT",
+                "strategy_name TEXT", "strategy_version TEXT", "execution_mode TEXT",
+                "market_data_mode TEXT", "market_data_source TEXT", "exchange TEXT",
+                "position_id TEXT",
+            ):
+                if column.split()[0] not in existing:
+                    self._c.execute(f"ALTER TABLE trade_decision_journal ADD COLUMN {column}")
+            self._c.execute("CREATE INDEX IF NOT EXISTS idx_journal_instance ON trade_decision_journal(instance_id)")
             for _t in ("trade_decision_journal", "trade_decision_events", "evolution_memory"):
                 ensure_tenant_column(self._c, _t)   # Phase C-3: schema-only, additive
             self._c.commit()
@@ -70,16 +80,22 @@ class JournalStore:
         risk_check)."""
         with self._lock:
             self._c.execute(
-                """INSERT OR REPLACE INTO trade_decision_journal
+                """INSERT INTO trade_decision_journal
                 (trade_id, created_at, mode, symbol, side, strategy, timeframe,
                  entry, stop, target, size, risk_amount, planned_rr, confidence,
-                 brain_score, regime, status, sections_json)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?)""",
+                 brain_score, regime, status, sections_json, instance_id, instance_name,
+                 strategy_id, strategy_name, strategy_version, execution_mode,
+                 market_data_mode, market_data_source, exchange, position_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?,?,?,?,?,?,?,?,?,?,?)""",
                 (j["trade_id"], _now(), j.get("mode", "paper"), j.get("symbol"),
                  j.get("side"), j.get("strategy"), j.get("timeframe"), j.get("entry"),
                  j.get("stop"), j.get("target"), j.get("size"), j.get("risk_amount"),
                  j.get("planned_rr"), j.get("confidence"), j.get("brain_score"),
-                 j.get("regime"), json.dumps(j.get("sections", {}))))
+                 j.get("regime"), json.dumps(j.get("sections", {})), j.get("instance_id"),
+                 j.get("instance_name"), j.get("strategy_id"), j.get("strategy_name"),
+                 j.get("strategy_version"), j.get("execution_mode"),
+                 j.get("market_data_mode"), j.get("market_data_source"),
+                 j.get("exchange"), j.get("position_id")))
             self._c.commit()
 
     def add_event(self, trade_id: str, kind: str, detail: str = "",
@@ -92,33 +108,52 @@ class JournalStore:
 
     # ------------------------------------------------------------- close
     def close_trade(self, trade_id: str, *, exit: float, pnl: float, actual_rr: float,
-                    result: str, grade: str, extra_sections: dict) -> None:
+                    result: str, grade: str, extra_sections: dict,
+                    instance_id: str = "") -> bool:
         with self._lock:
             row = self._c.execute(
-                "SELECT sections_json FROM trade_decision_journal WHERE trade_id=?",
-                (trade_id,)).fetchone()
+                "SELECT sections_json FROM trade_decision_journal WHERE trade_id=?"
+                + (" AND instance_id=?" if instance_id else ""),
+                (trade_id, instance_id) if instance_id else (trade_id,)).fetchone()
             if row is None:
-                return
+                return False
             sections = json.loads(row["sections_json"] or "{}")
             sections.update(extra_sections)          # exit_decision / review / evolution
             self._c.execute(
                 """UPDATE trade_decision_journal SET closed_at=?, exit=?, pnl=?,
                    actual_rr=?, result=?, grade=?, status='closed', sections_json=?
-                   WHERE trade_id=?""",
+                   WHERE trade_id=?""" + (" AND instance_id=?" if instance_id else ""),
                 (_now(), exit, pnl, actual_rr, result, grade,
-                 json.dumps(sections), trade_id))
+                 json.dumps(sections), trade_id, *([instance_id] if instance_id else [])))
             self._c.commit()
+            return True
 
     # ------------------------------------------------------------- queries
     def _row(self, r: sqlite3.Row) -> dict:
         d = dict(r)
         d["sections"] = json.loads(d.pop("sections_json") or "{}")
+        provenance = d["sections"].get("provenance") or {}
+        # Existing rows are not guessed. Only explicit captured provenance is
+        # promoted; otherwise execution truth remains visibly unverified.
+        for key in ("instance_id", "instance_name", "strategy_id", "strategy_name",
+                    "strategy_version", "market_data_mode", "market_data_source",
+                    "exchange", "position_id"):
+            if d.get(key) is None and provenance.get(key) is not None:
+                d[key] = provenance[key]
+        d["strategy_name"] = d.get("strategy_name") or d.get("strategy")
+        d["execution_mode"] = (d.get("execution_mode") or provenance.get("execution_mode")
+                               or "LEGACY / UNVERIFIED")
+        d["mode"] = d["execution_mode"]
         return d
 
-    def get(self, trade_id: str) -> Optional[dict]:
+    def get(self, trade_id: str, instance_id: Optional[str] = None) -> Optional[dict]:
         with self._lock:
-            r = self._c.execute("SELECT * FROM trade_decision_journal WHERE trade_id=?",
-                                (trade_id,)).fetchone()
+            query = "SELECT * FROM trade_decision_journal WHERE trade_id=?"
+            args = [trade_id]
+            if instance_id:
+                query += " AND instance_id=?"
+                args.append(instance_id)
+            r = self._c.execute(query, args).fetchone()
             if r is None:
                 return None
             j = self._row(r)
@@ -128,15 +163,27 @@ class JournalStore:
             return j
 
     def list(self, limit: int = 100, mode: Optional[str] = None,
-             symbol: Optional[str] = None, result: Optional[str] = None) -> list[dict]:
+             symbol: Optional[str] = None, result: Optional[str] = None,
+             instance_id: Optional[str] = None, strategy: Optional[str] = None,
+             timeframe: Optional[str] = None) -> list[dict]:
         q = "SELECT * FROM trade_decision_journal"
         cond, args = [], []
         if mode:
-            cond.append("mode=?"); args.append(mode)
+            if mode.upper() == "LEGACY / UNVERIFIED":
+                cond.append("(execution_mode IS NULL OR execution_mode='')")
+            else:
+                cond.append("LOWER(execution_mode)=?"); args.append(mode.lower())
         if symbol:
             cond.append("symbol=?"); args.append(symbol.upper())
         if result:
             cond.append("result=?"); args.append(result)
+        if instance_id:
+            cond.append("instance_id=?"); args.append(instance_id)
+        if strategy:
+            cond.append("(strategy_id=? OR strategy_name=? OR strategy=?)")
+            args.extend((strategy, strategy, strategy))
+        if timeframe:
+            cond.append("timeframe=?"); args.append(timeframe)
         if cond:
             q += " WHERE " + " AND ".join(cond)
         q += " ORDER BY created_at DESC LIMIT ?"

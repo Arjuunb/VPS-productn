@@ -67,12 +67,16 @@ def skipped_summary():
 
 @router.get("/journal/trades")
 def journal_trades(limit: int = 100, mode: _wa.Optional[str] = None,
-                   symbol: _wa.Optional[str] = None, result: _wa.Optional[str] = None):
+                   symbol: _wa.Optional[str] = None, result: _wa.Optional[str] = None,
+                   instance_id: _wa.Optional[str] = None,
+                   strategy: _wa.Optional[str] = None,
+                   timeframe: _wa.Optional[str] = None):
     """List trades that have a decision journal (newest first), with summary +
     grade. Filter by mode / symbol / result. The full journal is at
     GET /journal/{trade_id}."""
-    return {"trades": _wa.decision_journal_store.list(limit=max(1, min(limit, 500)), mode=mode,
-                                                  symbol=symbol, result=result)}
+    return {"trades": _wa.decision_journal_store.list(
+        limit=max(1, min(limit, 500)), mode=mode, symbol=symbol, result=result,
+        instance_id=instance_id, strategy=strategy, timeframe=timeframe)}
 
 @router.get("/journal/evolution")
 def journal_evolution():

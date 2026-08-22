@@ -1559,6 +1559,7 @@ class AutoStrategyEngine:
             "open_trades": len(self.paper.positions()),
             "timestamp": signal.timestamp.isoformat(),
             "instance_id": self.instance_id or getattr(self.ledger, "instance_id", "") or "",
+            "market_data_source": self.last_source or "",
             "decision_identity": decision_identity or self._decision_identity(sym, signal.timestamp),
         }
         # Maker entry: when FLAT, park a resting limit instead of paying the

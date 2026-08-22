@@ -388,6 +388,8 @@ class SignalPipeline:
         # payload later reused by another instance or caller.
         payload = dict(payload)
         payload["journal_execution"] = dict(self.journal_context)
+        if payload.get("market_data_source"):
+            payload["journal_execution"]["market_data_source"] = payload["market_data_source"]
         symbol = payload["symbol"]
         side = str(payload["side"]).upper()
         entry = float(payload["entry"])
@@ -478,6 +480,7 @@ class SignalPipeline:
                         # slippage. Journal the executed price, never the
                         # requested trigger price.
                         trade_id=_open_tid, exit_price=fill.price, pnl=fill.pnl,
+                        instance_id=str(self.journal_context.get("instance_id") or ""),
                         exit_reason=payload.get("exit_reason")
                         or ("opposite-signal" if side not in _CLOSE_SIDES else "manual-close"),
                         mfe_r=payload.get("mfe_r"), mae_r=payload.get("mae_r"))
@@ -880,7 +883,8 @@ class SignalPipeline:
                     timeframe=payload.get("timeframe", ""), entry=entry, stop=stop,
                     target=payload.get("target"), size=size, equity=realized_equity,
                     confidence=confidence, brain_score=payload.get("brain_score"),
-                    regime=payload.get("regime", ""), steps=steps, payload=payload)
+                    regime=payload.get("regime", ""), steps=steps, payload=payload,
+                    position_id=fill.position_id)
             except Exception:  # noqa: BLE001 — journaling must never block trading
                 pass
         # remember entry context so the learning loop can study this trade later

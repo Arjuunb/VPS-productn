@@ -216,7 +216,7 @@ class DecisionJournal:
                      strategy: str, timeframe: str, entry: float, stop: float,
                      target: Optional[float], size: float, equity: float,
                      confidence: float, brain_score: Optional[float], regime: str,
-                     steps: list, payload: dict) -> None:
+                     steps: list, payload: dict, position_id: str = "") -> None:
         risk_dist = abs(entry - stop) if stop else 0.0
         planned_rr = (abs((target or 0) - entry) / risk_dist) if (target and risk_dist) else None
         risk_amount = round(risk_dist * size, 2)
@@ -260,20 +260,37 @@ class DecisionJournal:
             },
             "provenance": {
                 "instance_id": provenance.get("instance_id"),
+                "instance_name": provenance.get("instance_name"),
+                "strategy_id": provenance.get("strategy_id"),
+                "strategy_name": provenance.get("strategy_name") or strategy,
                 "strategy_version": provenance.get("strategy_version"),
                 "market_data_mode": provenance.get("market_data_mode") or "unknown",
+                "market_data_source": provenance.get("market_data_source") or "unknown",
                 "fill_model": provenance.get("fill_model") or "unknown",
                 "execution_mode": provenance.get("execution_mode") or mode,
                 "exchange": provenance.get("exchange") or "unknown",
                 "instrument_type": provenance.get("instrument_type") or "unknown",
+                "position_id": position_id or provenance.get("position_id"),
             },
         }
         self.store.record_entry({
-            "trade_id": trade_id, "mode": mode, "symbol": symbol, "side": side,
+            "trade_id": trade_id,
+            "mode": provenance.get("execution_mode") or mode,
+            "symbol": symbol, "side": side,
             "strategy": strategy, "timeframe": timeframe, "entry": entry, "stop": stop,
             "target": target, "size": size, "risk_amount": risk_amount,
             "planned_rr": planned_rr, "confidence": confidence,
             "brain_score": brain_score, "regime": regime, "sections": sections,
+            "instance_id": provenance.get("instance_id"),
+            "instance_name": provenance.get("instance_name"),
+            "strategy_id": provenance.get("strategy_id"),
+            "strategy_name": provenance.get("strategy_name") or strategy,
+            "strategy_version": provenance.get("strategy_version"),
+            "execution_mode": provenance.get("execution_mode") or mode,
+            "market_data_mode": provenance.get("market_data_mode"),
+            "market_data_source": provenance.get("market_data_source"),
+            "exchange": provenance.get("exchange"),
+            "position_id": position_id or provenance.get("position_id"),
         })
         t = payload.get("timestamp")
         self.store.add_event(trade_id, "setup-detected", f"{strategy} setup on {symbol} {timeframe}", t)
@@ -288,8 +305,9 @@ class DecisionJournal:
                     exit_reason: str, quality_score: Optional[float] = None,
                     risk_ok: bool = True, followed_strategy: bool = True,
                     mfe_r: Optional[float] = None,
-                    mae_r: Optional[float] = None) -> Optional[dict]:
-        j = self.store.get(trade_id)
+                    mae_r: Optional[float] = None,
+                    instance_id: str = "") -> Optional[dict]:
+        j = self.store.get(trade_id, instance_id=instance_id or None)
         if j is None:
             return None
         entry, stop = j.get("entry"), j.get("stop")
@@ -327,7 +345,8 @@ class DecisionJournal:
         self.store.close_trade(trade_id, exit=exit_price, pnl=pnl, actual_rr=actual_rr,
                                result=result, grade=review["grade"],
                                extra_sections={"exit_decision": exit_decision,
-                                               "review": review, "evolution": evolution})
+                                               "review": review, "evolution": evolution},
+                               instance_id=instance_id)
         self.store.add_event(trade_id, "exit-triggered", f"{exit_reason} @ {exit_price}")
         self.store.add_event(trade_id, "trade-closed",
                              f"{result} · {actual_rr:+.2f}R · PnL {pnl:+.2f}")

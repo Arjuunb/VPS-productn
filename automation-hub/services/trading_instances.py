@@ -173,12 +173,19 @@ class InstanceLedger:
             symbol=symbol, stop=stop, target=target, management=management,
             instance_id=self.instance_id)
 
+    def close_position(self, position_id, *, exit_price, pnl):
+        return self._ledger.close_position(
+            position_id, exit_price=exit_price, pnl=pnl, instance_id=self.instance_id)
+
     def record_paper_trade(self, trade):
         row = dict(trade); row["instance_id"] = self.instance_id
         return self._ledger.record_paper_trade(row)
 
     def get_paper_trades(self):
         return self._ledger.get_paper_trades(instance_id=self.instance_id)
+
+    def close_paper_trade(self, trade_id, **kw):
+        return self._ledger.close_paper_trade(trade_id, **kw, instance_id=self.instance_id)
 
     def log(self, *, level, stage, message, symbol=""):
         return self._ledger.log(level=level, stage=stage, message=message, symbol=symbol,
@@ -868,8 +875,12 @@ class TradingInstanceManager:
             pipeline.learning = LearningBook(learning_path)
             pipeline.journal_context = {
                 "instance_id": inst.id,
+                "instance_name": f"{inst.symbol} {inst.strategy_label} {inst.timeframe} #{inst.id[:6].upper()}",
+                "strategy_id": inst.strategy_key,
+                "strategy_name": inst.strategy_label,
                 "strategy_version": inst.strategy_version,
-                "market_data_mode": inst.market_data_mode,
+                "market_data_mode": "live" if inst.mode == "trading" else "replay",
+                "market_data_source": None,
                 "fill_model": inst.fill_model,
                 "execution_mode": inst.execution_mode,
                 "exchange": inst.exchange,
