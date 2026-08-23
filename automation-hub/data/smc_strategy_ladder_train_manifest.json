@@ -1,10 +1,10 @@
 {
   "research_id": "SMC_NATIVE_V1_RESEARCH",
   "ladder_id": "SMC_STRATEGY_LADDER_V1",
-  "version": "SMC_STRATEGY_LADDER_DRAFT_PRE_VERIFICATION",
-  "status": "DRAFT_PRE_VERIFICATION",
-  "visual_state_verification": "VISUAL_STATE_VERIFICATION_PARTIAL",
-  "blocked_by": "VISUAL_STATE_VERIFICATION",
+  "version": "SMC_STRATEGY_LADDER_V1.0.0-research",
+  "status": "PENDING_TRAIN_UNIVERSE_APPROVAL",
+  "visual_state_verification": "VISUAL_STATE_VERIFICATION_PASSED",
+  "blocked_by": "TRAIN_UNIVERSE_APPROVAL",
   "execution_allowed": false,
   "purpose": "Pre-registered future TRAIN harness only. No dataset has been opened, fetched, read, or evaluated by this manifest.",
   "candidate_ids": [

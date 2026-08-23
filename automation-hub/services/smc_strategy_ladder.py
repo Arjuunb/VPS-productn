@@ -1,12 +1,12 @@
-"""Draft-only SMC strategy ladder, blocked on native visual verification.
+"""Frozen research-only SMC strategy ladder after native visual verification.
 
 This module deliberately *consumes* :mod:`services.native_smc` objects.  It
 does not calculate pivots, breaks, liquidity, gaps, order blocks, or dealing
 ranges itself, and it has no execution or position-management capability.
 
-The candidate definitions are deliberately *not frozen*.  They may only be
-frozen by a separate V1.0.0 release after the native SMC visual-state gate has
-passed.  This module must never authorize performance research or execution.
+The candidate definitions are frozen as V1.0.0-research.  Their original draft
+fingerprints are preserved byte-for-byte through promotion; this module still
+cannot authorize performance research or execution.
 """
 from __future__ import annotations
 
@@ -31,11 +31,12 @@ from services.native_smc import (
 EXECUTION_ALLOWED = False
 RESEARCH_FAMILY = "SMC_NATIVE_V1_RESEARCH"
 LADDER_ID = "SMC_STRATEGY_LADDER_V1"
-LADDER_VERSION = "SMC_STRATEGY_LADDER_DRAFT_PRE_VERIFICATION"
-RESEARCH_STATUS = "DRAFT_PRE_VERIFICATION"
-DEFINITION_STATUS = "DRAFT_PRE_VERIFICATION"
+LADDER_VERSION = "SMC_STRATEGY_LADDER_V1.0.0-research"
+RESEARCH_STATUS = "PASSED"
+DEFINITION_STATUS = "PASSED"
+CANDIDATE_FINGERPRINT_VERSION = "SMC_STRATEGY_LADDER_DRAFT_PRE_VERIFICATION"
 VISUAL_STATE_VERIFICATION_REQUIRED = "VISUAL_STATE_VERIFICATION_PASSED"
-_VISUAL_STATE_MANIFEST_PATH = Path(__file__).resolve().parents[1] / "data" / "native_smc_visual_verification.json"
+_VISUAL_STATE_MANIFEST_PATH = Path(__file__).resolve().parents[1] / "data" / "native_smc_visual_verification_final.json"
 
 # These are pre-registered event lifetimes, not tuned values.  They preserve
 # the existing native ten-bar setup expiry and the reference's eight-bar CHoCH
@@ -191,7 +192,7 @@ _CANDIDATES = {candidate.strategy_id: candidate for candidate in SMC_STRATEGY_LA
 
 
 def candidate_registry() -> tuple[CandidateDefinition, ...]:
-    """Return draft research definitions; this is never a production registry."""
+    """Return frozen research definitions; this is never a production registry."""
     return SMC_STRATEGY_LADDER
 
 
@@ -219,7 +220,9 @@ def visual_state_verification_status() -> str:
 def candidate_configuration_hash(candidate: CandidateDefinition) -> str:
     return _canonical_hash(
         {
-            "version": LADDER_VERSION,
+            # Promotion cannot change the six already-reviewed candidate
+            # fingerprints. The release version is recorded separately.
+            "version": CANDIDATE_FINGERPRINT_VERSION,
             "event_age_bars": EVENT_AGE_BARS,
             "shared_trade_mechanics": {
                 "atr_length": ATR_LENGTH,
@@ -232,15 +235,15 @@ def candidate_configuration_hash(candidate: CandidateDefinition) -> str:
 
 
 def manifest_payload() -> dict:
-    """Machine-readable draft record with no outcomes or performance metrics."""
+    """Machine-readable frozen definition with no performance metrics."""
     return {
         "research_id": RESEARCH_FAMILY,
         "ladder_id": LADDER_ID,
         "version": LADDER_VERSION,
         "status": DEFINITION_STATUS,
         "visual_state_verification": visual_state_verification_status(),
-        "blocked_by": "VISUAL_STATE_VERIFICATION",
-        "freeze_allowed": False,
+        "blocked_by": None,
+        "freeze_allowed": True,
         "execution_allowed": False,
         "performance_research": "NOT_RUN",
         "event_age_bars": EVENT_AGE_BARS,

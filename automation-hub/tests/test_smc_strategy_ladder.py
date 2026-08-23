@@ -5,6 +5,9 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 
+import pytest
+
+from bot.data.indicators import atr
 from bot.types import Bar
 from services.native_smc import (
     DealingRange,
@@ -73,7 +76,7 @@ def trace(result, direction: str = "bullish"):
     return next(row for row in result.direction_traces if row.direction == direction)
 
 
-def test_registry_is_complete_draft_blocked_and_non_executable():
+def test_registry_is_complete_frozen_and_non_executable():
     assert [row.strategy_id for row in candidate_registry()] == [
         "SMC_S1_PIVOT_REVERSAL", "SMC_S2_STRUCTURE", "SMC_S3_LIQUIDITY_STRUCTURE",
         "SMC_S4_FVG_RETEST", "SMC_S5_ORDER_BLOCK_RETEST", "SMC_S6_FULL_SMC",
@@ -81,17 +84,18 @@ def test_registry_is_complete_draft_blocked_and_non_executable():
     assert all("research" in row.strategy_id.lower() or row.strategy_id.startswith("SMC_S") for row in candidate_registry())
     payload = manifest_payload()
     assert payload["version"] == LADDER_VERSION
-    assert payload["status"] == "DRAFT_PRE_VERIFICATION"
-    assert payload["visual_state_verification"] == "VISUAL_STATE_VERIFICATION_PARTIAL"
-    assert payload["blocked_by"] == "VISUAL_STATE_VERIFICATION"
-    assert payload["freeze_allowed"] is False
-    assert visual_state_verification_status() != "VISUAL_STATE_VERIFICATION_PASSED"
+    assert payload["version"] == "SMC_STRATEGY_LADDER_V1.0.0-research"
+    assert payload["status"] == "PASSED"
+    assert payload["visual_state_verification"] == "VISUAL_STATE_VERIFICATION_PASSED"
+    assert payload["blocked_by"] is None
+    assert payload["freeze_allowed"] is True
+    assert visual_state_verification_status() == "VISUAL_STATE_VERIFICATION_PASSED"
     assert payload["execution_allowed"] is False
     assert payload["performance_research"] == "NOT_RUN"
     assert all(row["execution_allowed"] is False for row in payload["candidates"])
 
 
-def test_checked_in_manifest_matches_the_draft_runtime_definition():
+def test_checked_in_manifest_matches_the_frozen_runtime_definition():
     manifest_path = Path(__file__).resolve().parents[1] / "data" / "smc_strategy_ladder_v1_manifest.json"
     checked_in = json.loads(manifest_path.read_text(encoding="utf-8"))
     runtime = manifest_payload()
@@ -100,7 +104,7 @@ def test_checked_in_manifest_matches_the_draft_runtime_definition():
     assert checked_in["status"] == runtime["status"]
     assert checked_in["visual_state_verification"] == runtime["visual_state_verification"]
     assert checked_in["blocked_by"] == runtime["blocked_by"]
-    assert checked_in["freeze_allowed"] is False
+    assert checked_in["freeze_allowed"] is True
     assert checked_in["native_engine_source_sha256"] == runtime["native_engine_source_hash"]
     assert checked_in["event_age_bars"] == EVENT_AGE_BARS
     assert checked_in["common_trade_mechanics"]["atr_length"] == ATR_LENGTH
@@ -110,6 +114,14 @@ def test_checked_in_manifest_matches_the_draft_runtime_definition():
     assert checked_in_hashes == {
         candidate.strategy_id: candidate_configuration_hash(candidate)
         for candidate in candidate_registry()
+    }
+    assert checked_in_hashes == {
+        "SMC_S1_PIVOT_REVERSAL": "aa978381bd6a00becaa2d76eb6cf98b57e070946d167528d98681042b6807939",
+        "SMC_S2_STRUCTURE": "e39a272421c92db48be43d1164ada1c54fa6bc5416a0304bb54b2e5a0798b9eb",
+        "SMC_S3_LIQUIDITY_STRUCTURE": "8d21fe7f67f839677fbb2dd0705e5c2bb5fbcb99a91ad36783803eacd28c8f8a",
+        "SMC_S4_FVG_RETEST": "361a1b5f7314abdf77ef84f761ef00f77d6787a0c79b9741df10b2bfad646da9",
+        "SMC_S5_ORDER_BLOCK_RETEST": "1f4c63adbfc846837e688f1f0a35140a1b892691f05edc8c853aaacc3ff8da79",
+        "SMC_S6_FULL_SMC": "dc00f37b4f68b0be20aa0e93c95daf4cdb855311432948a056f44645ad69e18a",
     }
 
 
@@ -180,3 +192,33 @@ def test_evaluation_is_read_only_and_proposal_id_is_deterministic():
     public = evaluate_ladder(engine)
     assert public["execution_allowed"] is False
     assert len(public["candidates"]) == 6
+
+
+def test_future_native_objects_cannot_change_a_historical_trace():
+    engine = seeded_engine()
+    historical_at = engine.bars[68].timestamp
+    before = evaluate_candidate(engine, "SMC_S6_FULL_SMC", candle_at=historical_at)
+    future_at = engine.bars[69].timestamp
+    engine.pivots["future-pivot"] = PivotPoint("future-pivot", "low", 90.0, future_at, future_at, 69, "internal")
+    engine.events["future-sweep"] = LiquiditySweep("future-sweep", "BTCUSDT", "5m", "bullish", 90.0, future_at, 69)
+    engine.events["future-structure"] = StructureEvent(
+        "future-structure", "BTCUSDT", "5m", "internal", "CHOCH", "bullish", 101.0,
+        future_at, future_at, "future-pivot", 102.0,
+    )
+    engine.fvgs["future-fvg"] = FairValueGap("future-fvg", "bullish", 101.0, 100.0, future_at, (future_at, future_at, future_at))
+    engine.obs["future-ob"] = OrderBlock("future-ob", "bullish", 101.0, 100.0, "future-pivot", "future-structure", future_at)
+    assert evaluate_candidate(engine, "SMC_S6_FULL_SMC", candle_at=historical_at) == before
+
+
+def test_entry_stop_and_target_match_the_frozen_formulas_exactly():
+    engine = seeded_engine()
+    proposal = trace(evaluate_candidate(engine, "SMC_S4_FVG_RETEST")).proposal
+    assert proposal is not None
+    current = engine.bars[-1]
+    expected_atr = atr(engine.bars, ATR_LENGTH)
+    expected_stop = current.low - expected_atr * ATR_STOP_MULTIPLIER
+    expected_target = current.close + (current.close - expected_stop) * TARGET_RR
+    assert proposal.entry == current.close
+    assert proposal.stop == pytest.approx(expected_stop)
+    assert proposal.target == pytest.approx(expected_target)
+    assert proposal.rr_ratio == TARGET_RR

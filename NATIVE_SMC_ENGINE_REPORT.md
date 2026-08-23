@@ -1,6 +1,6 @@
 # Native SMC Market Structure & Execution Engine
 
-Status: **NATIVE_ENGINE_BUILD_PARTIAL**
+Status: **SMC_NATIVE_V1_VISUALLY_VERIFIED_FROZEN**
 Research ID: `SMC_NATIVE_V1_RESEARCH`
 Execution authority: **false**
 
@@ -74,6 +74,7 @@ recovery, UI/state separation, and execution isolation.
 
 ## Remaining risks and next stage
 
-No forward worker has been attached; no visual state has been human-verified;
-no performance data has been opened. The only authorized next stage is
-`VISUAL_STATE_VERIFICATION`.
+No forward worker has been attached and no performance data has been opened.
+The frozen 82-item visual sample is verified through a retrospective human bulk
+attestation, with all non-performance technical gates passing. The only
+authorized next stage is `TRAIN_UNIVERSE_APPROVAL`; execution remains disabled.

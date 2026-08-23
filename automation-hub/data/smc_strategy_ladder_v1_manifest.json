@@ -1,11 +1,12 @@
 {
   "research_id": "SMC_NATIVE_V1_RESEARCH",
   "ladder_id": "SMC_STRATEGY_LADDER_V1",
-  "version": "SMC_STRATEGY_LADDER_DRAFT_PRE_VERIFICATION",
-  "status": "DRAFT_PRE_VERIFICATION",
-  "visual_state_verification": "VISUAL_STATE_VERIFICATION_PARTIAL",
-  "blocked_by": "VISUAL_STATE_VERIFICATION",
-  "freeze_allowed": false,
+  "version": "SMC_STRATEGY_LADDER_V1.0.0-research",
+  "promoted_from": "SMC_STRATEGY_LADDER_DRAFT_PRE_VERIFICATION",
+  "status": "PASSED",
+  "visual_state_verification": "VISUAL_STATE_VERIFICATION_PASSED",
+  "blocked_by": null,
+  "freeze_allowed": true,
   "execution_allowed": false,
   "performance_research": "NOT_RUN",
   "native_engine_source": "services/native_smc.py",
@@ -43,7 +44,7 @@
   "candidates": [
     {
       "strategy_id": "SMC_S1_PIVOT_REVERSAL",
-      "status": "DRAFT_PRE_VERIFICATION",
+      "status": "PASSED",
       "objects": ["PivotPoint", "PriceAction", "SMCMarketSnapshot"],
       "long_sequence": ["confirmed pivot low", "bullish rejection"],
       "short_sequence": ["confirmed pivot high", "bearish rejection"],
@@ -53,7 +54,7 @@
     },
     {
       "strategy_id": "SMC_S2_STRUCTURE",
-      "status": "DRAFT_PRE_VERIFICATION",
+      "status": "PASSED",
       "objects": ["PivotPoint", "StructureEvent", "PriceAction", "SMCMarketSnapshot"],
       "long_sequence": ["pivot low", "bullish BOS/CHOCH after pivot", "bullish rejection"],
       "short_sequence": ["pivot high", "bearish BOS/CHOCH after pivot", "bearish rejection"],
@@ -63,7 +64,7 @@
     },
     {
       "strategy_id": "SMC_S3_LIQUIDITY_STRUCTURE",
-      "status": "DRAFT_PRE_VERIFICATION",
+      "status": "PASSED",
       "objects": ["PivotPoint", "LiquiditySweep", "StructureEvent", "PriceAction", "SMCMarketSnapshot"],
       "long_sequence": ["low-side native reference", "sell-side sweep", "bullish BOS/CHOCH after sweep", "bullish rejection"],
       "short_sequence": ["high-side native reference", "buy-side sweep", "bearish BOS/CHOCH after sweep", "bearish rejection"],
@@ -73,7 +74,7 @@
     },
     {
       "strategy_id": "SMC_S4_FVG_RETEST",
-      "status": "DRAFT_PRE_VERIFICATION",
+      "status": "PASSED",
       "objects": ["LiquiditySweep", "StructureEvent", "FairValueGap", "PriceAction", "SMCMarketSnapshot"],
       "long_sequence": ["sell-side sweep", "bullish BOS/CHOCH", "same-direction FVG created after structure", "exact FVG retest", "bullish rejection"],
       "short_sequence": ["buy-side sweep", "bearish BOS/CHOCH", "same-direction FVG created after structure", "exact FVG retest", "bearish rejection"],
@@ -83,7 +84,7 @@
     },
     {
       "strategy_id": "SMC_S5_ORDER_BLOCK_RETEST",
-      "status": "DRAFT_PRE_VERIFICATION",
+      "status": "PASSED",
       "objects": ["LiquiditySweep", "StructureEvent", "OrderBlock", "PriceAction", "SMCMarketSnapshot"],
       "long_sequence": ["sell-side sweep", "bullish BOS/CHOCH", "same-shift bullish order block", "exact order-block retest", "bullish rejection"],
       "short_sequence": ["buy-side sweep", "bearish BOS/CHOCH", "same-shift bearish order block", "exact order-block retest", "bearish rejection"],
@@ -93,7 +94,7 @@
     },
     {
       "strategy_id": "SMC_S6_FULL_SMC",
-      "status": "DRAFT_PRE_VERIFICATION",
+      "status": "PASSED",
       "objects": ["LiquiditySweep", "StructureEvent", "FairValueGap", "OrderBlock", "DealingRange", "PriceAction", "SMCMarketSnapshot"],
       "long_sequence": ["HTF bullish", "discount", "sell-side sweep", "bullish BOS/CHOCH", "bullish FVG OR OB", "exact native POI retest", "bullish rejection", "native active session"],
       "short_sequence": ["HTF bearish", "premium", "buy-side sweep", "bearish BOS/CHOCH", "bearish FVG OR OB", "exact native POI retest", "bearish rejection", "native active session"],

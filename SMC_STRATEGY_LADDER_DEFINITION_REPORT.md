@@ -1,17 +1,23 @@
-# SMC Strategy Ladder Definition Report — Blocked Draft
+# SMC Strategy Ladder Definition Report — Frozen Research Definition
 
 ## Scope and status
 
 - Research family: `SMC_NATIVE_V1_RESEARCH`
 - Ladder: `SMC_STRATEGY_LADDER_V1`
-- Draft version: `SMC_STRATEGY_LADDER_DRAFT_PRE_VERIFICATION`
-- Definition status: **DRAFT_PRE_VERIFICATION**
-- Candidate status: **DRAFT_PRE_VERIFICATION**
-- Blocked by: **VISUAL_STATE_VERIFICATION**
+- Version: `SMC_STRATEGY_LADDER_V1.0.0-research`
+- Promoted from: `SMC_STRATEGY_LADDER_DRAFT_PRE_VERIFICATION`
+- Definition status: **PASSED**
+- Candidate status: **PASSED**
+- Visual prerequisite: **VISUAL_STATE_VERIFICATION_PASSED**
 - `execution_allowed`: **false** for every candidate, trace, and proposal
 - Performance research: **NOT RUN**
 
-The authoritative native verification record is `VISUAL_STATE_VERIFICATION_PARTIAL`, not passed. Therefore this is a draft-only architecture layer: it is not a frozen V1.0.0 definition, a backtest, a strategy-selection report, a forward-paper recommendation, or an execution release. No TRAIN, validation, walk-forward, or untouched-test dataset was opened while these definitions were created.
+The frozen 82-item visual sample, human retrospective bulk attestation, and
+non-performance technical gates passed. The six existing draft fingerprints
+matched exactly and were promoted without changing a strategy rule. This is a
+frozen research definition, not a backtest, strategy-selection report,
+forward-paper recommendation, or execution release. No TRAIN, validation,
+walk-forward, or untouched-test dataset was opened during promotion.
 
 ## Preserved boundaries
 
@@ -64,14 +70,15 @@ Expired components cannot be recombined with newer components. A native opposite
 
 | ID | Strict ordered sequence | POI rule | Status |
 | --- | --- | --- | --- |
-| `SMC_S1_PIVOT_REVERSAL` | confirmed pivot low/high, then same-side native rejection | none | DRAFT_PRE_VERIFICATION |
-| `SMC_S2_STRUCTURE` | pivot, same-side native BOS/CHoCH after pivot, rejection | none | DRAFT_PRE_VERIFICATION |
-| `SMC_S3_LIQUIDITY_STRUCTURE` | native liquidity reference, sweep, same-side BOS/CHoCH after sweep, rejection | none | DRAFT_PRE_VERIFICATION |
-| `SMC_S4_FVG_RETEST` | sweep, structure, same-direction FVG after structure, exact FVG retest, rejection | exact FVG only | DRAFT_PRE_VERIFICATION |
-| `SMC_S5_ORDER_BLOCK_RETEST` | sweep, structure, same-shift order block, exact OB retest, rejection | exact same-shift OB only | DRAFT_PRE_VERIFICATION |
-| `SMC_S6_FULL_SMC` | completed HTF, location, sweep, structure, POI, retest, rejection, native session | **FVG_OR_OB** | DRAFT_PRE_VERIFICATION |
+| `SMC_S1_PIVOT_REVERSAL` | confirmed pivot low/high, then same-side native rejection | none | PASSED |
+| `SMC_S2_STRUCTURE` | pivot, same-side native BOS/CHoCH after pivot, rejection | none | PASSED |
+| `SMC_S3_LIQUIDITY_STRUCTURE` | native liquidity reference, sweep, same-side native BOS/CHoCH after sweep, rejection | none | PASSED |
+| `SMC_S4_FVG_RETEST` | sweep, structure, same-direction FVG after structure, exact FVG retest, rejection | exact FVG only | PASSED |
+| `SMC_S5_ORDER_BLOCK_RETEST` | sweep, structure, same-shift order block, exact OB retest, rejection | exact same-shift OB only | PASSED |
+| `SMC_S6_FULL_SMC` | completed HTF, location, sweep, structure, POI, retest, rejection, native session | **FVG_OR_OB** | PASSED |
 
-Long and short definitions are mirrored. The provisional S6 `FVG_OR_OB` interpretation is present only for visual state review; it is not immutable until the prerequisite passes and an explicit freeze step creates `SMC_STRATEGY_LADDER_V1.0.0-research`.
+Long and short definitions are mirrored. The S6 `FVG_OR_OB` interpretation is
+frozen in `SMC_STRATEGY_LADDER_V1.0.0-research`.
 
 ## Traceability and visual review
 
@@ -92,15 +99,17 @@ Definition-level tests passed without reading a market dataset:
 
 No profitability claim, performance metric, ranking, optimization, candidate selection, or forward-paper authorization exists.
 
-## Required gate before freezing
+## Completed freeze gate
 
-1. Complete independent human review of the native objects and attain `VISUAL_STATE_VERIFICATION_PASSED`.
-2. Rerun the ladder-definition freeze as a separately versioned release.
+1. Frozen sample and engine fingerprints matched the reviewed run.
+2. The retrospective bulk attestation recorded 82 CORRECT, 0 INCORRECT, and 0 AMBIGUOUS.
+3. All non-performance technical gates passed.
+4. S1-S6 fingerprints remained unchanged during promotion.
 
 ## Later research requires separate authorization
 
-1. Approve and register authoritative historical exchange-data manifest(s).
-2. Run only the pre-registered TRAIN harness.
+1. Complete `TRAIN_UNIVERSE_APPROVAL` and register authoritative historical exchange-data manifest(s).
+2. Run only the pre-registered TRAIN harness after separate authorization.
 3. Define one shared realistic fill, cost, risk, and sizing model.
 4. Report candidates independently without tuning or selection.
 
