@@ -53,16 +53,19 @@ class PriceActionConfig:
     zone_min_bps: float = 6.0
     zone_expiry_bars: int = 300
     event_memory_bars: int = 8
+    confusion_candles: int = 3
     setup_expiry_bars: int = 12
     entry_expiry_bars: int = 3
     rr_ratio: float = 2.5
     wick_body_ratio: float = 1.5
     commission_bps: float = 4.0
+    spread_bps: float = 2.0
     slippage_bps: float = 3.0
     entry_model: str = "confirmation"
     stop_model: str = "rejection_extreme"
     equal_inside_boundaries: bool = True
     first_touch_only: bool = False
+    trigger_filter: str = "generic_rejection"
     zone_timeframe_scope: str = "same_timeframe"
     higher_timeframe_minutes: int = 240
     execution_allowed: bool = False
@@ -144,6 +147,7 @@ class PriceActionSetup:
     missing_conditions: list[str]
     invalidation_reason: str | None = None
     transitions: list[SetupTransition] = field(default_factory=list)
+    pattern_metadata: list[dict] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -183,9 +187,11 @@ class ResearchTrade:
     created_at: datetime
     valid_until_index: int
     filled_at: datetime | None = None
+    raw_fill_price: float | None = None
     fill_price: float | None = None
     closed_at: datetime | None = None
     exit_price: float | None = None
+    raw_exit_price: float | None = None
     gross_r: float | None = None
     costs_r: float | None = None
     net_r: float | None = None
@@ -263,6 +269,10 @@ class NativePriceActionEngine:
             raise ValueError("unsupported Price Action entry model")
         if config.stop_model not in {"rejection_extreme", "pattern", "structural_zone"}:
             raise ValueError("unsupported Price Action stop model")
+        if config.trigger_filter not in {"generic_rejection", "pin_bar_only"}:
+            raise ValueError("trigger_filter must be generic_rejection or pin_bar_only")
+        if not 0 <= config.confusion_candles <= 3:
+            raise ValueError("confusion_candles must be between zero and three")
         self.config = config
         self.bars: list[Bar] = []
         self.processed: set[datetime] = set()
@@ -640,7 +650,8 @@ class NativePriceActionEngine:
         for strategy in STRATEGIES:
             for direction in ("bullish", "bearish"):
                 matching = [row for row in self.events.values()
-                            if row.direction == direction and 0 <= index - row.bar_index <= self.config.event_memory_bars]
+                            if row.direction == direction and
+                            0 <= index - row.bar_index <= self.config.confusion_candles]
                 zone_event = next((row for row in matching if row.zone_id), None)
                 zone = self.zones.get(zone_event.zone_id) if zone_event and zone_event.zone_id else None
                 if strategy == "PA1_SR_REJECTION":
@@ -673,6 +684,18 @@ class NativePriceActionEngine:
                         self._condition("reversal_close", trigger is not None, "reversal is confirmed only by the closing price", trigger.id if trigger else None),
                     ]
                     next_event = "Wait for a failed breakout and closed-candle reclaim"
+                trigger_patterns = []
+                if trigger is not None:
+                    trigger_patterns = self._patterns(self.bars[trigger.bar_index], trigger.bar_index)
+                if self.config.trigger_filter == "pin_bar_only" and strategy in {
+                        "PA1_SR_REJECTION", "PA2_TREND_PULLBACK"}:
+                    pin = next((row for row in trigger_patterns
+                                if row["name"] in {"bullish_pin_bar", "bearish_pin_bar"}
+                                and row["direction"] == direction), None)
+                    conditions.append(self._condition(
+                        "pin_bar_only", pin is not None,
+                        "isolated experiment requires the generic rejection candle to classify as a directional pin bar",
+                    ))
                 if self.config.first_touch_only:
                     conditions.append(self._condition(
                         "first_touch_only", bool(zone and zone.touch_count <= 1),
@@ -695,7 +718,8 @@ class NativePriceActionEngine:
                             phase=SetupPhase.ENTRY_READY if not missing else SetupPhase.WAITING_FOR_CONFIRMATION,
                             created_at=bar.timestamp, created_index=index, zone_id=trigger.zone_id,
                             trigger_event_id=trigger.id, expires_index=index + self.config.setup_expiry_bars,
-                            reasons=[row["detail"] for row in conditions], missing_conditions=[],
+                            reasons=[row["detail"] for row in conditions], missing_conditions=list(missing),
+                            pattern_metadata=trigger_patterns,
                         )
                         chain = (
                             (SetupPhase.WATCHING_LOCATION, SetupPhase.LOCATION_REACHED,
@@ -783,7 +807,7 @@ class NativePriceActionEngine:
 
     def _advance_research_trades(self, bar: Bar, index: int) -> None:
         """Advance normalized research orders with conservative OHLC rules."""
-        slip = self.config.slippage_bps / 10_000
+        slip = (self.config.slippage_bps + self.config.spread_bps / 2) / 10_000
         fee = self.config.commission_bps / 10_000
         for trade in self.research_trades.values():
             if trade.status == "PENDING":
@@ -812,6 +836,7 @@ class NativePriceActionEngine:
                 else:
                     raw = (max(bar.open, trade.requested_entry) if trade.direction == "bullish"
                            else min(bar.open, trade.requested_entry))
+                trade.raw_fill_price = raw
                 trade.fill_price = raw * (1 + slip if trade.direction == "bullish" else 1 - slip)
                 risk_from_fill = abs(trade.fill_price - trade.stop)
                 trade.target = trade.fill_price + risk_from_fill * self.config.rr_ratio * \
@@ -841,6 +866,7 @@ class NativePriceActionEngine:
             else:
                 raw_exit = trade.target
                 outcome = "TARGET"
+            trade.raw_exit_price = raw_exit
             trade.exit_price = raw_exit * (1 - slip if trade.direction == "bullish" else 1 + slip)
             risk = abs(trade.fill_price - trade.stop)
             signed = (trade.exit_price - trade.fill_price if trade.direction == "bullish"

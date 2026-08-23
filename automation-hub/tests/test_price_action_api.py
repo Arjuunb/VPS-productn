@@ -96,3 +96,32 @@ def test_comparison_api_refuses_different_execution_assumptions(monkeypatch, tmp
     })
     assert response.status_code == 409
     assert "assumptions differ" in response.json()["detail"]
+
+
+def test_historical_funding_download_is_protected_and_smc_normalization_is_read_only(monkeypatch):
+    class Market:
+        def download_usdm_funding_history(self, symbol, *, start_ms, end_ms):
+            return {"symbol": symbol, "start_ms": start_ms, "end_ms": end_ms,
+                    "coverage": {"state": "HISTORICAL_FUNDING_AVAILABLE"}}
+
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+    monkeypatch.setattr(webhook_api, "v2_market_data", Market())
+    payload = {"symbol": "BTCUSDT", "start": "2026-01-01T00:00:00Z",
+               "end": "2026-01-02T00:00:00Z"}
+    assert client.post("/research/price-action/funding/download", json=payload).status_code == 401
+    headers = {"x-webhook-secret": webhook_api.settings.admin_key}
+    downloaded = client.post("/research/price-action/funding/download",
+                             headers=headers, json=payload)
+    assert downloaded.status_code == 200
+    assert downloaded.json()["coverage"]["state"] == "HISTORICAL_FUNDING_AVAILABLE"
+
+    normalized = client.post("/research/price-action/smc-normalization", headers=headers, json={
+        "source": {"proposals": [{"id": "smc-proposal"}]},
+        "assumptions": {}, "experiment_configuration": {},
+    })
+    assert normalized.status_code == 200
+    body = normalized.json()
+    assert body["read_only"] is True and body["execution_allowed"] is False
+    assert body["normalization"]["fair_comparison_allowed"] is False

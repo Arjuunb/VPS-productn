@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import sqlite3
 import threading
 import time
@@ -62,7 +63,7 @@ def normalize_symbol(symbol: str) -> str:
 
 
 def _iso(ms: Optional[int]) -> Optional[str]:
-    return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat() if ms else None
+    return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat() if ms is not None else None
 
 
 class MarketDataService:
@@ -137,6 +138,13 @@ class MarketDataService:
             PRIMARY KEY(timeframe, open_time))""")
         c.execute("""CREATE TABLE IF NOT EXISTS metadata (
             key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS funding_rates (
+            funding_time INTEGER PRIMARY KEY,
+            funding_rate REAL NOT NULL,
+            mark_price REAL,
+            provider TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            source_quality TEXT NOT NULL)""")
         # Additive migration from V2 cache schema 2: provenance exists both in
         # dataset metadata and alongside every persisted candle.
         for column, kind in (("provider", "TEXT"), ("market_type", "TEXT"), ("is_closed", "INTEGER"),
@@ -189,11 +197,24 @@ class MarketDataService:
                               [(timeframe, *r, provider, asset, 1, received, "verified") for r in valid])
                 report = self._integrity_conn(c, timeframe, asset)
                 checksum = self._checksum_conn(c, timeframe)
+                meta = self._meta(c)
+                checksums = dict(meta.get("checksums_by_timeframe") or {})
+                versions = dict(meta.get("dataset_versions_by_timeframe") or {})
+                qualities = dict(meta.get("quality_by_timeframe") or {})
+                missing = dict(meta.get("missing_ranges_by_timeframe") or {})
+                checksums[timeframe] = checksum
+                versions[timeframe] = f"v4:{checksum[:16]}"
+                qualities[timeframe] = report["status"]
+                missing[timeframe] = report["missing_ranges"]
                 self._set_meta(c, symbol=normalize_symbol(symbol), canonical_symbol=canonical.value, asset_class=asset,
                                provider=provider, downloaded_at=datetime.now(timezone.utc).isoformat(),
                                last_updated=datetime.now(timezone.utc).isoformat(),
-                               missing_ranges=report["missing_ranges"], schema_version=3, checksum=checksum,
-                               dataset_version=f"v3:{checksum[:16]}", quality_status=report["status"])
+                               missing_ranges=report["missing_ranges"], schema_version=4, checksum=checksum,
+                               dataset_version=f"v4:{checksum[:16]}", quality_status=report["status"],
+                               checksums_by_timeframe=checksums,
+                               dataset_versions_by_timeframe=versions,
+                               quality_by_timeframe=qualities,
+                               missing_ranges_by_timeframe=missing)
                 c.commit()
             finally:
                 c.close()
@@ -267,11 +288,17 @@ class MarketDataService:
             integrity = self._integrity_conn(c, timeframe, asset)
             last = c.execute("SELECT MAX(open_time) FROM candles WHERE timeframe=?", (timeframe,)).fetchone()[0]
             checksum = self._checksum_conn(c, timeframe)
+            timeframe_count = c.execute(
+                "SELECT COUNT(DISTINCT timeframe) FROM candles").fetchone()[0]
         finally:
             c.close()
-        checksum_ok = bool(meta.get("checksum")) and meta.get("checksum") == checksum
+        expected_checksum = (meta.get("checksums_by_timeframe") or {}).get(timeframe)
+        if expected_checksum is None and timeframe_count == 1:
+            # Backward-compatible read of the schema-v3 single-timeframe cache.
+            expected_checksum = meta.get("checksum")
+        checksum_ok = bool(expected_checksum) and expected_checksum == checksum
         quarantined = None
-        if not checksum_ok:
+        if not checksum_ok and (expected_checksum is not None or integrity["candles"] > 0):
             # Never keep a checksum-invalid SQLite file in the active cache.
             # It is moved aside for forensic inspection; a subsequent explicit
             # download rebuilds the dataset from the recorded provider.
@@ -288,6 +315,169 @@ class MarketDataService:
                 "quarantined_cache": quarantined, "needs_download": not checksum_ok,
                 "quality_score": 100 if checksum_ok and not stale and integrity["status"] == "healthy" else 60 if checksum_ok else 0,
                 "metadata": meta, "integrity": integrity}
+
+    def upsert_funding(self, symbol: str, rows: list[dict], *, provider: str,
+                       requested_start_ms: int | None = None,
+                       requested_end_ms: int | None = None) -> dict:
+        """Persist verified public funding events with deterministic deduplication."""
+        key = normalize_symbol(symbol)
+        if not key.endswith("USDT"):
+            raise ValueError("historical funding requires a USDT perpetual symbol")
+        received = datetime.now(timezone.utc).isoformat()
+        normalized: dict[int, tuple] = {}
+        rejected = 0
+        for row in rows:
+            try:
+                stamp = int(row["fundingTime"])
+                rate = float(row["fundingRate"])
+                raw_mark = row.get("markPrice")
+                mark = float(raw_mark) if raw_mark not in (None, "") else None
+                if stamp < 0 or not math.isfinite(rate) or (mark is not None and
+                                                            (not math.isfinite(mark) or mark <= 0)):
+                    raise ValueError("invalid funding row")
+            except (KeyError, TypeError, ValueError, OverflowError):
+                rejected += 1
+                continue
+            normalized[stamp] = (stamp, rate, mark, provider, received, "verified_public_provider")
+        if not normalized:
+            raise ValueError("provider returned no valid historical funding records")
+        with self._lock:
+            c = self._conn(key, "crypto")
+            try:
+                before = c.execute("SELECT COUNT(*) FROM funding_rates").fetchone()[0]
+                c.executemany(
+                    "INSERT OR REPLACE INTO funding_rates(funding_time,funding_rate,mark_price,provider,received_at,source_quality) VALUES (?,?,?,?,?,?)",
+                    [normalized[stamp] for stamp in sorted(normalized)],
+                )
+                after = c.execute("SELECT COUNT(*) FROM funding_rates").fetchone()[0]
+                coverage = self._funding_status_conn(
+                    c, requested_start_ms=requested_start_ms, requested_end_ms=requested_end_ms)
+                meta = self._meta(c)
+                requests = list(meta.get("funding_requests") or [])[-19:]
+                requests.append({"requested_start": _iso(requested_start_ms),
+                                 "requested_end": _iso(requested_end_ms),
+                                 "received_at": received, "provider": provider,
+                                 "coverage_state": coverage["state"]})
+                self._set_meta(c, funding_provider=provider,
+                               funding_last_updated=received, funding_requests=requests)
+                c.commit()
+            finally:
+                c.close()
+        return {"symbol": key, "received": len(rows), "valid": len(normalized),
+                "rejected": rejected, "inserted": after - before,
+                "duplicates_or_updates": len(normalized) - (after - before),
+                "coverage": coverage, "provider": provider}
+
+    @staticmethod
+    def _funding_status_conn(c: sqlite3.Connection, *, requested_start_ms: int | None,
+                             requested_end_ms: int | None,
+                             intentionally_disabled: bool = False) -> dict:
+        if intentionally_disabled:
+            return {"state": "FUNDING_INTENTIONALLY_DISABLED", "available": False,
+                    "complete": False, "records": 0, "warnings": []}
+        clauses, params = [], []
+        if requested_start_ms is not None:
+            clauses.append("funding_time>=?"); params.append(int(requested_start_ms))
+        if requested_end_ms is not None:
+            clauses.append("funding_time<=?"); params.append(int(requested_end_ms))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = c.execute(
+            "SELECT funding_time,funding_rate,mark_price,provider,source_quality FROM funding_rates" +
+            where + " ORDER BY funding_time", params).fetchall()
+        if not rows:
+            return {"state": "HISTORICAL_FUNDING_UNAVAILABLE", "available": False,
+                    "complete": False, "records": 0,
+                    "requested_start": _iso(requested_start_ms),
+                    "requested_end": _iso(requested_end_ms),
+                    "warnings": ["No historical funding records cover the requested interval; funding is unknown, not zero."]}
+        stamps = [int(row[0]) for row in rows]
+        eight_hours = 8 * 60 * 60 * 1000
+        gaps = [{"from": _iso(left), "to": _iso(right), "hours": round((right - left) / 3_600_000, 3)}
+                for left, right in zip(stamps, stamps[1:]) if right - left > eight_hours * 1.5]
+        starts_late = requested_start_ms is not None and stamps[0] > requested_start_ms + eight_hours
+        ends_early = requested_end_ms is not None and stamps[-1] < requested_end_ms - eight_hours
+        complete = not starts_late and not ends_early and not gaps
+        state = "HISTORICAL_FUNDING_AVAILABLE" if complete else "HISTORICAL_FUNDING_PARTIALLY_AVAILABLE"
+        warnings = []
+        if not complete:
+            warnings.append("Historical funding coverage is incomplete; uncovered holding periods remain unknown.")
+        if any(row[2] is None for row in rows):
+            warnings.append("Some funding events do not include provider mark price; trade entry price is used only for notional conversion and is disclosed per trade.")
+        return {"state": state, "available": True, "complete": complete,
+                "records": len(rows), "first": _iso(stamps[0]), "last": _iso(stamps[-1]),
+                "requested_start": _iso(requested_start_ms),
+                "requested_end": _iso(requested_end_ms), "missing_ranges": gaps,
+                "starts_late": starts_late, "ends_early": ends_early,
+                "provider": rows[-1][3], "source_quality": rows[-1][4],
+                "warnings": warnings}
+
+    def funding_status(self, symbol: str, *, start_ms: int | None = None,
+                       end_ms: int | None = None, intentionally_disabled: bool = False) -> dict:
+        c = self._conn(symbol, "crypto")
+        try:
+            return {"symbol": normalize_symbol(symbol), **self._funding_status_conn(
+                c, requested_start_ms=start_ms, requested_end_ms=end_ms,
+                intentionally_disabled=intentionally_disabled)}
+        finally:
+            c.close()
+
+    def funding_history(self, symbol: str, *, start_ms: int | None = None,
+                        end_ms: int | None = None) -> list[dict]:
+        c = self._conn(symbol, "crypto")
+        try:
+            clauses, params = [], []
+            if start_ms is not None:
+                clauses.append("funding_time>=?"); params.append(int(start_ms))
+            if end_ms is not None:
+                clauses.append("funding_time<=?"); params.append(int(end_ms))
+            where = " WHERE " + " AND ".join(clauses) if clauses else ""
+            rows = c.execute(
+                "SELECT funding_time,funding_rate,mark_price,provider,source_quality FROM funding_rates" +
+                where + " ORDER BY funding_time", params).fetchall()
+        finally:
+            c.close()
+        return [{"symbol": normalize_symbol(symbol), "funding_time": _iso(row[0]),
+                 "funding_time_ms": row[0], "funding_rate": row[1], "mark_price": row[2],
+                 "provider": row[3], "source_quality": row[4]} for row in rows]
+
+    def download_usdm_funding_history(self, symbol: str, *, start_ms: int,
+                                      end_ms: int) -> dict:
+        """Page Binance's public funding history endpoint and persist the result."""
+        key = normalize_symbol(symbol)
+        if start_ms < 0 or end_ms < start_ms:
+            raise ValueError("funding time range is invalid")
+        cursor, collected = int(start_ms), {}
+        while cursor <= end_ms:
+            payload = self._requesters["binance-futures"](
+                _FUTURES_HOSTS[0] + "/fapi/v1/fundingRate",
+                {"symbol": key, "startTime": cursor, "endTime": int(end_ms), "limit": 1000})
+            if not isinstance(payload, list) or not payload:
+                break
+            valid_stamps = []
+            for row in payload:
+                try:
+                    stamp = int(row["fundingTime"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if start_ms <= stamp <= end_ms:
+                    collected[stamp] = row
+                    valid_stamps.append(stamp)
+            if not valid_stamps:
+                break
+            next_cursor = max(valid_stamps) + 1
+            if next_cursor <= cursor or len(payload) < 1000:
+                break
+            cursor = next_cursor
+            time.sleep(0.05)
+        if not collected:
+            # Persist nothing and report the truth without manufacturing zero-rate rows.
+            return {"symbol": key, "received": 0, "valid": 0, "inserted": 0,
+                    "coverage": self.funding_status(key, start_ms=start_ms, end_ms=end_ms),
+                    "provider": "binance-usdt-perpetual-public-funding"}
+        return self.upsert_funding(
+            key, [collected[stamp] for stamp in sorted(collected)],
+            provider="binance-usdt-perpetual-public-funding",
+            requested_start_ms=start_ms, requested_end_ms=end_ms)
 
     def quality(self, symbol: str, timeframe: str = "1h") -> dict:
         state = self.status(symbol, timeframe)

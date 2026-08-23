@@ -121,6 +121,22 @@ def test_public_stream_dedupes_closed_candles_and_marks_gaps_unreliable():
     assert status["duplicate_events"] >= 1
 
 
+def test_public_stream_rest_reconciles_a_missing_closed_candle_once():
+    history = [bar(0), bar(1), bar(2)]
+    stream = PriceActionPublicStream(lambda *_args, **_kwargs: history, stale_after_seconds=60)
+    stream.bootstrap("BTCUSDT", "5m")
+    stream._bars.remove(history[1])
+    stream.missing_candles += 1
+    stream.last_update = datetime.now(timezone.utc)
+    stream._set_state("DELAYED", "controlled test gap")
+
+    assert asyncio.run(stream.reconcile()) == 1
+    assert [row.timestamp for row in stream.snapshot()["closed_bars"]] == [
+        row.timestamp for row in history]
+    assert stream.status()["reliable"] is True
+    assert asyncio.run(stream.reconcile()) == 0
+
+
 def test_pattern_combinations_are_metadata_and_generic_rejection_has_no_pattern_gate():
     engine = NativePriceActionEngine(PriceActionConfig(symbol="BTCUSDT", swing_left=1, swing_right=1))
     mother = bar(0, 100, 110, 90, 105)

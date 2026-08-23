@@ -14,12 +14,41 @@ from data.market_data_v2 import TIMEFRAMES
 from services.native_price_action import RESEARCH_ID, STRATEGIES, PriceActionConfig
 from services.price_action_lab import PaperExecutionConfig, replay_state
 from services.price_action_research import controlled_pa_smc_report
+from services.price_action_reference_study import run_reference_study
+from services.research_funding import HistoricalFundingSeries
+from services.smc_research_adapter import FrozenSMCNormalizationAdapter
 
 router = APIRouter(prefix="/research/price-action", tags=["research-price-action"])
 
 
 def _bad(exc: Exception, status: int = 400):
     raise HTTPException(status, str(exc)) from exc
+
+
+def _utc_ms(value: str) -> int:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return int(parsed.timestamp() * 1000)
+    except ValueError as exc:
+        raise HTTPException(422, "timestamp must be ISO-8601 UTC") from exc
+
+
+def _cached_funding(datasets: dict[tuple[str, str], list], *, disabled: bool = False):
+    by_symbol = {}
+    for (symbol, _timeframe), rows in datasets.items():
+        if rows:
+            by_symbol.setdefault(symbol, []).extend((rows[0].timestamp, rows[-1].timestamp))
+    result = {}
+    for symbol, stamps in by_symbol.items():
+        start, end = min(stamps), max(stamps)
+        records = _wa.v2_market_data.funding_history(
+            symbol, start_ms=int(start.timestamp() * 1000), end_ms=int(end.timestamp() * 1000))
+        result[symbol] = HistoricalFundingSeries.build(
+            symbol, records, requested_start=start, requested_end=end,
+            intentionally_disabled=disabled)
+    return result
 
 
 @router.get("/manifest")
@@ -398,7 +427,9 @@ class ExperimentBody(BaseModel):
     entry_model: str = "confirmation"
     stop_model: str = "rejection_extreme"
     commission_bps: float = Field(default=4, ge=0, le=100)
+    spread_bps: float = Field(default=2, ge=0, le=100)
     slippage_bps: float = Field(default=3, ge=0, le=100)
+    funding_intentionally_disabled: bool = False
     walk_forward_folds: int = Field(default=4, ge=1, le=20)
     cost_multipliers: list[float] = Field(default_factory=lambda: [1, 1.5, 2])
 
@@ -422,11 +453,15 @@ def run_experiment(body: ExperimentBody, x_webhook_secret: Optional[str] = Heade
             symbol=body.symbols[0].upper(), timeframe=body.timeframes[0],
             swing_left=body.swing_sensitivity, swing_right=body.swing_sensitivity,
             entry_model=body.entry_model, stop_model=body.stop_model,
-            commission_bps=body.commission_bps, slippage_bps=body.slippage_bps,
+            commission_bps=body.commission_bps, spread_bps=body.spread_bps,
+            slippage_bps=body.slippage_bps,
         )
         return _wa.price_action_research.run(
             datasets, config, walk_forward_folds=body.walk_forward_folds,
-            cost_multipliers=body.cost_multipliers)
+            cost_multipliers=body.cost_multipliers,
+            funding_series=_cached_funding(
+                datasets, disabled=body.funding_intentionally_disabled),
+            funding_intentionally_disabled=body.funding_intentionally_disabled)
     except ValueError as exc:
         _bad(exc, 409)
 
@@ -443,3 +478,79 @@ def compare_smc(body: ComparisonBody, x_webhook_secret: Optional[str] = Header(d
         return controlled_pa_smc_report(body.price_action, body.smc)
     except ValueError as exc:
         _bad(exc, 409)
+
+
+class FundingDownloadBody(BaseModel):
+    symbol: str
+    start: str
+    end: str
+
+
+@router.post("/funding/download")
+def download_funding(body: FundingDownloadBody,
+                     x_webhook_secret: Optional[str] = Header(default=None)):
+    _wa._check_secret(x_webhook_secret)
+    try:
+        return _wa.v2_market_data.download_usdm_funding_history(
+            body.symbol, start_ms=_utc_ms(body.start), end_ms=_utc_ms(body.end))
+    except (ValueError, RuntimeError) as exc:
+        _bad(exc, 503)
+
+
+@router.get("/funding/{symbol}")
+def funding_coverage(symbol: str, start: str, end: str):
+    return _wa.v2_market_data.funding_status(
+        symbol, start_ms=_utc_ms(start), end_ms=_utc_ms(end))
+
+
+class SMCNormalizeBody(BaseModel):
+    source: dict
+    assumptions: dict
+    experiment_configuration: dict = Field(default_factory=dict)
+
+
+@router.post("/smc-normalization")
+def normalize_smc(body: SMCNormalizeBody,
+                  x_webhook_secret: Optional[str] = Header(default=None)):
+    _wa._check_secret(x_webhook_secret)
+    return FrozenSMCNormalizationAdapter().normalize(
+        body.source, assumptions=body.assumptions,
+        experiment_configuration=body.experiment_configuration)
+
+
+class ReferenceStudyBody(BaseModel):
+    bars: int = Field(default=3000, ge=500, le=10_000)
+
+
+@router.post("/reference-study")
+def reference_study(body: ReferenceStudyBody,
+                    x_webhook_secret: Optional[str] = Header(default=None)):
+    _wa._check_secret(x_webhook_secret)
+    from services.price_action_reference_study import REFERENCE_TIMEFRAMES, REFERENCE_UNIVERSE
+    datasets = {}
+    try:
+        for symbol in REFERENCE_UNIVERSE:
+            for timeframe in REFERENCE_TIMEFRAMES:
+                rows = _wa.v2_market_data.bars(symbol, timeframe, limit=body.bars)
+                if len(rows) < body.bars:
+                    raise ValueError(
+                        f"verified cache has {len(rows)}/{body.bars} candles for {symbol} {timeframe}")
+                datasets[(symbol, timeframe)] = rows
+        return run_reference_study(
+            _wa.price_action_research, datasets, _cached_funding(datasets), save=True)
+    except ValueError as exc:
+        _bad(exc, 409)
+
+
+@router.get("/research-artifacts")
+def list_research_artifacts():
+    return {"artifacts": _wa.price_action_experiments.list_artifacts(),
+            "research_only": True, "real_execution_allowed": False}
+
+
+@router.get("/research-artifacts/{artifact_id}")
+def get_research_artifact(artifact_id: str):
+    try:
+        return _wa.price_action_experiments.get_artifact(artifact_id)
+    except KeyError as exc:
+        _bad(exc, 404)
