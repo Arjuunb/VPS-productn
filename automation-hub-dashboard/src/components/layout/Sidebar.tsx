@@ -26,6 +26,7 @@ const NAV_LUCIDE: Record<string, LucideIcon> = {
   "Strategy Proof": BadgeCheck,
   "Strategy Studio": Blocks,
   "SMC Visual Lab": CandlestickChart,
+  "Price Action Lab": Activity,
   "Risk & Health": ShieldAlert,
   Evolution: Brain,
   Journal: BookOpen,

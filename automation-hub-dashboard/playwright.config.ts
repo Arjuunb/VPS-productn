@@ -1,5 +1,8 @@
 import { defineConfig } from "@playwright/test";
 
+const bundledChromium = "/opt/pw-browsers/chromium_headless_shell-1194/chrome-linux/headless_shell";
+const localChrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+
 // E2E clickability audit. Serves the production build via `vite preview` and
 // drives it with a fully mocked backend (see e2e/mock.ts), so no API/auth is
 // needed. Chromium is the environment's pre-installed browser.
@@ -18,7 +21,8 @@ export default defineConfig({
     // expects a different revision; do not download).
     launchOptions: {
       executablePath: process.env.PW_CHROMIUM
-        || "/opt/pw-browsers/chromium_headless_shell-1194/chrome-linux/headless_shell",
+        || (process.platform === "darwin" ? localChrome : bundledChromium),
+      args: process.platform === "darwin" ? ["--headless=new"] : [],
     },
   },
   webServer: {

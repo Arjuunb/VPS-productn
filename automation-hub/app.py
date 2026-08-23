@@ -507,6 +507,12 @@ def _start_auto_engine() -> None:
               f"(auto_engine={settings.auto_engine}, desired_running="
               f"{webhook_api.engine.autostart_enabled})", flush=True)
 
+
+@app.on_event("shutdown")
+def _stop_price_action_stream() -> None:
+    """Close the public Price Action WebSocket and its worker thread cleanly."""
+    webhook_api.price_action_runtime.stop()
+
 # Phase 8: process-wide event hub for the live (SSE) dashboard.
 from dashboard.stream import HubEventHub, sse_format  # noqa: E402
 hub_events = HubEventHub()

@@ -31,8 +31,8 @@ export const useApp = () => useContext(AppContext);
 // instead of a flat list of pages.
 export const NAV_GROUPS: { title: string | null; items: string[] }[] = [
   { title: null, items: ["Dashboard"] },
-  { title: "Trading", items: ["Trading Instances", "Strategy Studio", "SMC Visual Lab", "Paper Trading", "Live Trading"] },
-  { title: "Research", items: ["Replay", "Backtesting", "Optimization Lab", "Forward Validation"] },
+  { title: "Trading", items: ["Trading Instances", "Strategy Studio", "Paper Trading", "Live Trading"] },
+  { title: "Research", items: ["Price Action Lab", "SMC Visual Lab", "Replay", "Backtesting", "Optimization Lab", "Forward Validation"] },
   { title: "Performance", items: ["Portfolio", "Analytics"] },
   { title: "Records", items: ["Journal"] },
   { title: "System", items: ["Market Data", "Risk & Health"] },

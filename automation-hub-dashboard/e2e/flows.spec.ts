@@ -30,6 +30,28 @@ test("top bar icons navigate", async ({ page }) => {
   await expect(page).toHaveURL(/#\/settings$/);
 });
 
+test("Price Action Visual Lab — public stream truth and protected paper modes", async ({ page }) => {
+  await mockApi(page);
+  await page.goto("/#/price-action-lab");
+  await expect(page.getByRole("heading", { name: "Price Action Visual Lab" })).toBeVisible();
+  await expect(page.getByText("PAPER ONLY")).toBeVisible();
+  await expect(page.getByText("REAL ORDERS DISABLED")).toBeVisible();
+  await expect(page.getByText(/Binance · CONNECTED/)).toBeVisible();
+  await expect(page.getByText(/PAPER · NO LIVE EXECUTION PATH/)).toBeVisible();
+
+  await page.getByLabel("Paper operating mode").selectOption("automatic");
+  const [request] = await Promise.all([
+    page.waitForRequest((row) => row.url().includes("/research/price-action/sessions/current/configuration") && row.method() === "POST"),
+    page.getByRole("button", { name: "Apply paper configuration" }).click(),
+  ]);
+  expect(request.postDataJSON().operating_mode).toBe("automatic");
+  await expect(page.locator(".toast.success")).toBeVisible();
+
+  await page.getByRole("button", { name: /connection/i }).click();
+  await expect(page.getByText("CLOSED BARS ONLY")).toBeVisible();
+  await expect(page.getByText("DISABLED", { exact: true })).toBeVisible();
+});
+
 test("Settings > Save Settings shows a success toast", async ({ page }) => {
   await mockApi(page);
   await page.goto("/#/settings");

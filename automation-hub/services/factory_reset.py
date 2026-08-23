@@ -206,6 +206,15 @@ class FactoryResetService:
         ttl_cache.clear()
         r.market_store.clear()
         r.paper_broker_v2.factory_reset(r.settings.starting_cash)
+        # The Visual Lab ledger is deliberately independent from the general
+        # paper broker, so the global Factory Reset must clear it explicitly.
+        # Its reset creates a fresh 10,000 USDT research session while keeping
+        # the account incapable of reaching any live execution path.
+        if hasattr(r, "price_action_runtime"):
+            r.price_action_runtime.stop()
+        r.price_action_paper.factory_reset()
+        if hasattr(r, "price_action_experiments"):
+            r.price_action_experiments.clear()
         r.account_store.set_initial_capital(r.settings.starting_cash, reset_account=True)
         r.paper.starting_balance = r.settings.starting_cash
         r.paper._invalidate_history()
@@ -269,7 +278,7 @@ class FactoryResetService:
         return [
             "instances/positions/orders/sessions/trades", "journal/decisions/memory",
             "research/backtests/optimization/forward-validation", "alerts/logs",
-            "watchlists/preferences/settings", "paper accounts/runtime caches",
+            "watchlists/preferences/settings", "paper accounts/price-action session/runtime caches",
         ]
 
     def _clear_backups(self) -> None:

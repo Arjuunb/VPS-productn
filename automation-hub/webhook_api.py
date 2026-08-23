@@ -959,9 +959,16 @@ backfill_job = BackfillJob(market_store)
 # remains the compatibility path until callers opt into /paper-v2.
 from data.market_data_v2 import MarketDataService, MarketDataUpdateJob  # noqa: E402
 from execution.paper_broker_v2 import PaperBrokerV2  # noqa: E402
+from services.price_action_lab import PriceActionLabRuntime, PriceActionPaperAccount  # noqa: E402
+from services.price_action_research import PriceActionExperimentRunner, PriceActionExperimentStore  # noqa: E402
 v2_market_data = MarketDataService(settings.market_data_v2_dir)
 paper_broker_v2 = PaperBrokerV2(settings.paper_broker_v2_db,
                                 starting_balance=settings.starting_cash)
+price_action_paper = PriceActionPaperAccount(settings.price_action_paper_db,
+                                              starting_balance=10_000.0)
+price_action_runtime = PriceActionLabRuntime(v2_market_data, price_action_paper)
+price_action_experiments = PriceActionExperimentStore(settings.price_action_research_db)
+price_action_research = PriceActionExperimentRunner(price_action_experiments)
 v2_market_update_job = MarketDataUpdateJob(v2_market_data)
 
 # ------------------------------------------------- market-context providers
@@ -1221,6 +1228,7 @@ import routers.market_data  # noqa: E402
 import routers.instances  # noqa: E402
 import routers.forward_validation  # noqa: E402
 import routers.native_smc  # noqa: E402
+import routers.price_action  # noqa: E402
 import routers.factory_reset  # noqa: E402
 router.include_router(routers.analytics.router)
 router.include_router(routers.bots.router)
@@ -1238,6 +1246,7 @@ router.include_router(routers.market_data.router)
 router.include_router(routers.instances.router)
 router.include_router(routers.forward_validation.router)
 router.include_router(routers.native_smc.router)
+router.include_router(routers.price_action.router)
 router.include_router(routers.factory_reset.router)
 
 

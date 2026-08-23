@@ -78,6 +78,17 @@ class PaperBrokerV2:
             """)
             self._c.execute("INSERT OR IGNORE INTO v2_account(id,starting_balance,balance,updated_at) VALUES (1,?,?,?)",
                             (float(starting_balance), float(starting_balance), _now()))
+            columns = {row[1] for row in self._c.execute("PRAGMA table_info(v2_account)")}
+            for name, ddl in (
+                ("realized_pnl", "REAL NOT NULL DEFAULT 0"),
+                ("peak_equity", "REAL NOT NULL DEFAULT 0"),
+                ("max_drawdown", "REAL NOT NULL DEFAULT 0"),
+            ):
+                if name not in columns:
+                    self._c.execute(f"ALTER TABLE v2_account ADD COLUMN {name} {ddl}")
+            self._c.execute(
+                "UPDATE v2_account SET peak_equity=CASE WHEN peak_equity<=0 THEN balance ELSE peak_equity END WHERE id=1"
+            )
             self._c.commit()
 
     @staticmethod
@@ -119,16 +130,34 @@ class PaperBrokerV2:
             unrealized += sign * (float(mark) - p["entry_price"]) * p["size"]
             used += p["entry_price"] * p["size"] / self.leverage
         equity = a["balance"] + unrealized
+        peak = max(float(a["peak_equity"]), equity)
+        drawdown = max(float(a["max_drawdown"]), peak - equity)
+        with self._lock:
+            self._c.execute("UPDATE v2_account SET peak_equity=?,max_drawdown=? WHERE id=1", (peak, drawdown))
+            self._c.commit()
         return {"starting_balance": a["starting_balance"], "balance": round(a["balance"], 8),
                 "equity": round(equity, 8), "unrealized_pnl": round(unrealized, 8),
+                "realized_pnl": round(float(a["realized_pnl"]), 8),
                 "used_margin": round(used, 8), "margin": round(used, 8),
                 "free_margin": round(equity - used, 8), "buying_power": round(max(0.0, equity - used) * self.leverage, 8),
                 "fees_paid": round(a["fees_paid"], 8), "funding_paid": round(a["funding_paid"], 8),
+                "peak_equity": round(peak, 8), "max_drawdown": round(drawdown, 8),
                 "leverage": self.leverage, "positions": len(positions)}
 
     def positions(self) -> list[dict]:
         with self._lock:
-            return [dict(r) for r in self._c.execute("SELECT * FROM v2_positions ORDER BY opened_at")]
+            rows = [dict(r) for r in self._c.execute("SELECT * FROM v2_positions ORDER BY opened_at")]
+        maintenance = 0.005
+        for row in rows:
+            if self.leverage <= 1:
+                liquidation = None
+            elif row["side"] == "long":
+                liquidation = row["entry_price"] * (1 - 1 / self.leverage + maintenance)
+            else:
+                liquidation = row["entry_price"] * (1 + 1 / self.leverage - maintenance)
+            row["estimated_liquidation_price"] = liquidation
+            row["liquidation_model"] = "isolated estimate; mark-price trigger"
+        return rows
 
     def orders(self, *, status: Optional[str] = None) -> list[dict]:
         with self._lock:
@@ -154,8 +183,8 @@ class PaperBrokerV2:
                 self._c.execute("DELETE FROM v2_orders")
                 self._c.execute("DELETE FROM v2_positions")
                 self._c.execute(
-                    "UPDATE v2_account SET starting_balance=?,balance=?,fees_paid=0,funding_paid=0,updated_at=? WHERE id=1",
-                    (amount, amount, _now()))
+                    "UPDATE v2_account SET starting_balance=?,balance=?,fees_paid=0,funding_paid=0,realized_pnl=0,peak_equity=?,max_drawdown=0,updated_at=? WHERE id=1",
+                    (amount, amount, amount, _now()))
                 self._c.commit()
             except Exception:
                 self._c.rollback()
@@ -245,7 +274,7 @@ class PaperBrokerV2:
             return None
         return None
 
-    def process_candle(self, symbol: str, candle) -> dict:
+    def process_candle(self, symbol: str, candle, *, protections: Optional[dict[str, dict]] = None) -> dict:
         """Advance open orders and protective stops using one verified candle."""
         symbol, bar = (symbol or "").upper().replace("/", ""), self._candle(candle)
         events: list[dict] = []
@@ -269,6 +298,12 @@ class PaperBrokerV2:
                     continue
                 if price is not None:
                     self._fill(order, order["side"], price, bar, events, bool(order["reduce_only"]))
+                    protection = (protections or {}).get(order["id"])
+                    if protection and any(event.get("order_id") == order["id"] for event in events):
+                        self._c.execute(
+                            "UPDATE v2_positions SET stop_loss=?,take_profit=? WHERE symbol=?",
+                            (protection.get("stop_loss"), protection.get("take_profit"), symbol),
+                        )
             events.extend(self._process_protection(symbol, bar))
             self._c.commit()
         return {"symbol": symbol, "events": events, "account": self.account({symbol: bar["close"]})}
@@ -319,8 +354,9 @@ class PaperBrokerV2:
             return
         pnl = self._apply_position(order["symbol"], side, quantity, price, reduce_only)
         account = self._account_row()
-        self._c.execute("UPDATE v2_account SET balance=?,fees_paid=?,updated_at=? WHERE id=1",
-                        (account["balance"] + pnl - fee, account["fees_paid"] + fee, _now()))
+        self._c.execute("UPDATE v2_account SET balance=?,fees_paid=?,realized_pnl=?,updated_at=? WHERE id=1",
+                        (account["balance"] + pnl - fee, account["fees_paid"] + fee,
+                         account["realized_pnl"] + pnl, _now()))
         fid = _id()
         self._c.execute("INSERT INTO v2_fills VALUES (?,?,?,?,?,?,?,?,?)",
                         (fid, order["id"], order["symbol"], side, quantity, price, fee, pnl, _now()))
@@ -386,3 +422,80 @@ class PaperBrokerV2:
                             (a["balance"] - amount, a["funding_paid"] + amount, _now()))
             self._c.commit()
         return {"applied": True, "symbol": symbol.upper(), "funding": amount}
+
+    def process_mark(self, symbol: str, mark_price: float) -> dict:
+        """Apply the documented, conservative paper liquidation estimate."""
+        symbol, mark = symbol.upper(), float(mark_price)
+        if mark <= 0:
+            raise ValueError("mark price must be positive")
+        with self._lock:
+            position = next((row for row in self.positions() if row["symbol"] == symbol), None)
+            if not position or position["estimated_liquidation_price"] is None:
+                return {"liquidated": False, "symbol": symbol}
+            boundary = float(position["estimated_liquidation_price"])
+            hit = mark <= boundary if position["side"] == "long" else mark >= boundary
+            if not hit:
+                return {"liquidated": False, "symbol": symbol, "estimated_liquidation_price": boundary}
+            side = "sell" if position["side"] == "long" else "buy"
+            events: list[dict] = []
+            order = {"id": "liquidation-" + _id(), "symbol": symbol,
+                     "remaining": position["size"], "filled": 0.0,
+                     "quantity": position["size"], "reduce_only": 1,
+                     "type": "market", "side": side}
+            self._fill(order, side, mark,
+                       {"open": mark, "high": mark, "low": mark, "close": mark,
+                        "volume": max(position["size"] / max(self.participation_rate, 1e-9), position["size"])},
+                       events, True, persisted=False)
+            self._c.commit()
+            return {"liquidated": True, "symbol": symbol,
+                    "estimated_liquidation_price": boundary, "mark_price": mark,
+                    "model": "isolated maintenance estimate; not Binance account liquidation", "events": events}
+
+    def export_state(self) -> dict:
+        """Return a complete JSON-safe snapshot used by resumable PA sessions."""
+        with self._lock:
+            return {
+                "account": dict(self._account_row()),
+                "positions": [dict(row) for row in self._c.execute("SELECT * FROM v2_positions")],
+                "orders": [dict(row) for row in self._c.execute("SELECT * FROM v2_orders")],
+                "fills": [dict(row) for row in self._c.execute("SELECT * FROM v2_fills")],
+                "leverage": self.leverage,
+                "costs": {"fee_rate": self.fee_rate, "spread_bps": self.spread_bps,
+                          "slippage_bps": self.slippage_bps,
+                          "participation_rate": self.participation_rate},
+            }
+
+    def restore_state(self, snapshot: dict) -> None:
+        """Atomically restore a previously exported state without changing schema."""
+        required = {"account", "positions", "orders", "fills"}
+        if not required.issubset(snapshot):
+            raise ValueError("incomplete paper broker snapshot")
+        with self._lock:
+            try:
+                self._c.execute("BEGIN IMMEDIATE")
+                for table in ("v2_fills", "v2_orders", "v2_positions"):
+                    self._c.execute(f"DELETE FROM {table}")
+                account = snapshot["account"]
+                self._c.execute(
+                    "UPDATE v2_account SET starting_balance=?,balance=?,fees_paid=?,funding_paid=?,realized_pnl=?,peak_equity=?,max_drawdown=?,updated_at=? WHERE id=1",
+                    (account["starting_balance"], account["balance"], account["fees_paid"],
+                     account["funding_paid"], account.get("realized_pnl", 0),
+                     account.get("peak_equity", account["balance"]), account.get("max_drawdown", 0), _now()),
+                )
+                for row in snapshot["positions"]:
+                    keys = ("symbol", "side", "size", "entry_price", "stop_loss", "take_profit",
+                            "trailing_offset", "peak_price", "opened_at")
+                    self._c.execute("INSERT INTO v2_positions VALUES (?,?,?,?,?,?,?,?,?)", tuple(row.get(k) for k in keys))
+                for row in snapshot["orders"]:
+                    keys = ("id", "symbol", "side", "type", "quantity", "remaining", "filled",
+                            "average_price", "limit_price", "stop_price", "trailing_offset", "reduce_only",
+                            "status", "reason", "created_at", "updated_at", "triggered_at")
+                    self._c.execute("INSERT INTO v2_orders VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", tuple(row.get(k) for k in keys))
+                for row in snapshot["fills"]:
+                    keys = ("id", "order_id", "symbol", "side", "quantity", "price", "fee", "realized_pnl", "timestamp")
+                    self._c.execute("INSERT INTO v2_fills VALUES (?,?,?,?,?,?,?,?,?)", tuple(row.get(k) for k in keys))
+                self.leverage = max(1.0, float(snapshot.get("leverage", 1)))
+                self._c.commit()
+            except Exception:
+                self._c.rollback()
+                raise

@@ -6,8 +6,8 @@ export type Direction = "bullish" | "bearish" | "neutral";
 
 export interface NativeCandle { timestamp: string; open: number; high: number; low: number; close: number; volume: number }
 export interface NativePivot { id: string; scope: "internal" | "swing"; kind: "high" | "low"; price: number; occurred_at: string; confirmed_at: string; strength: "strong" | "weak" }
-export interface NativeEvent { id: string; direction: Direction; event_type?: string; scope?: string; level: number; occurred_at?: string; confirmed_at?: string; timestamp?: string; source_pivot_id?: string }
-export interface NativeZone { id: string; direction: Direction; top?: number; bottom?: number; high?: number; low?: number; created_at: string; active: boolean; mitigated: boolean; mitigation_at?: string | null; source_pivot_id?: string; source_structure_id?: string }
+export interface NativeEvent { id: string; direction: Direction; event_type?: string; scope?: string; label?: string; level: number; occurred_at?: string; confirmed_at?: string; timestamp?: string; source_pivot_id?: string }
+export interface NativeZone { id: string; direction: Direction; label?: string; top?: number; bottom?: number; high?: number; low?: number; created_at: string; active: boolean; mitigated: boolean; mitigation_at?: string | null; source_pivot_id?: string; source_structure_id?: string }
 export interface NativeProposal { id: string; setup_id: string; snapshot_id: string; direction: Direction; entry: number; stop: number; target: number; rr_ratio: number; execution_allowed: false; risk_status: string }
 export interface NativeSnapshot {
   id: string; candle_open: string; candle_close: string; htf_bias: number; htf_ema: number | null;
@@ -27,6 +27,8 @@ export interface NativeSMCChartState {
     is_forming: boolean; observed_at: string; refresh_interval_seconds: number;
     candle_closes_at: string | null; last_price: number;
     price_direction?: "up" | "down" | "unchanged";
+    bid?: number; ask?: number; mark?: number; funding_rate?: number | null;
+    last_funding_time?: string | null; next_funding_time?: string | null; connection_state?: string; new_entries_paused?: boolean;
     price_updated_at?: string; source_mode?: "exchange_ohlcv_live_poll";
     execution_uses_closed_bars_only: true;
   };
@@ -81,6 +83,8 @@ interface Props {
   lightMode?: boolean;
   /** A failed feed freezes the last confirmed display price instead of inventing movement. */
   liveDataStale?: boolean;
+  /** Neutral wording for consumers that reuse the closed-candle chart shell. */
+  modelLabel?: string;
   height?: number | string;
 }
 
@@ -210,7 +214,7 @@ function futureChartSlots(lastTimestamp: string | undefined, timeframe: string, 
   return Array.from({ length: count }, (_, index) => new Date(start + step * (index + 1)).toISOString());
 }
 
-function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetBars: number, initialVisibleBars: number, filters: NativeSMCOverlayFilters, selectedObjectId?: string, highlightedObjectIds: string[] = [], lightMode = false, priceViewport?: ChartPriceViewport, viewport?: ChartTimeViewport | null, liveDataStale = false): ChartPresentation {
+function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetBars: number, initialVisibleBars: number, filters: NativeSMCOverlayFilters, selectedObjectId?: string, highlightedObjectIds: string[] = [], lightMode = false, priceViewport?: ChartPriceViewport, viewport?: ChartTimeViewport | null, liveDataStale = false, modelLabel = "native SMC"): ChartPresentation {
   const closedCandles = state.candles;
   // The display candle intentionally remains outside the native model's
   // snapshots. It makes the chart feel live without turning an unclosed bar
@@ -259,12 +263,12 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
   const zones = filters.fvg ? state.fair_value_gaps.filter((row) => (filters.mitigated || !row.mitigated) && overlapsVisibleWindow(row.created_at, row.mitigation_at)) : [];
   const orderBlocks = filters.orderBlocks ? state.order_blocks.filter((row) => (filters.mitigated || !row.mitigated) && overlapsVisibleWindow(row.created_at, row.mitigation_at)) : [];
   const fvgAreas = zones.map((row) => [{
-    name: `${row.direction === "bullish" ? "Bull" : "Bear"} FVG`,
+    name: row.label ?? `${row.direction === "bullish" ? "Bull" : "Bear"} FVG`,
     xAxis: spanStart(row.created_at), yAxis: row.bottom,
     itemStyle: { color: row.direction === "bullish" ? "rgba(34,197,94,.17)" : "rgba(239,91,91,.17)", borderColor: isHighlighted(row.id) ? "#ffffff" : undefined, borderWidth: isHighlighted(row.id) ? 2 : 0 },
   }, { xAxis: spanEnd(row.mitigation_at), yAxis: row.top }]);
   const obAreas = orderBlocks.map((row) => [{
-    name: `${row.direction === "bullish" ? "Bull" : "Bear"} OB`,
+    name: row.label ?? `${row.direction === "bullish" ? "Bull" : "Bear"} OB`,
     xAxis: spanStart(row.created_at), yAxis: row.low,
     itemStyle: { color: row.direction === "bullish" ? "rgba(59,130,246,.14)" : "rgba(168,85,247,.14)", borderColor: isHighlighted(row.id) ? "#ffffff" : undefined, borderWidth: isHighlighted(row.id) ? 2 : 0 },
   }, { xAxis: spanEnd(row.mitigation_at), yAxis: row.high }]);
@@ -275,7 +279,7 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
     metadata: `${row.id}\n${row.scope} ${row.kind} · ${row.strength}\nOccurred: ${timestamp(row.occurred_at)}\nConfirmed: ${timestamp(row.confirmed_at)}`,
   }));
   const structureData = visibleEvents.map((row) => ({
-    name: row.event_type ? `${row.scope === "swing" ? "S" : "I"} ${row.event_type}` : `${row.direction === "bullish" ? "SSL swept" : "BSL swept"}`,
+    name: row.label ?? (row.event_type ? `${row.scope === "swing" ? "S" : "I"} ${row.event_type}` : `${row.direction === "bullish" ? "SSL swept" : "BSL swept"}`),
     value: [eventAt(row)!, row.level],
     itemStyle: { color: colorFor(row.direction), borderColor: isHighlighted(row.id) ? "#ffffff" : undefined, borderWidth: isHighlighted(row.id) ? 2 : 0 },
     metadata: `${row.id}\n${row.event_type ? `${row.scope} ${row.event_type}` : "Liquidity sweep"}\nLevel: ${row.level}\nConfirmed: ${timestamp(eventAt(row)!)}`,
@@ -347,7 +351,7 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
         if (custom?.data?.metadata) return custom.data.metadata.split("\n").join("<br/>");
         const candle = (params as any[]).find((row) => row.seriesName === "Market candles");
         const value = Array.isArray(candle?.data) ? candle.data : candle?.data?.value as number[] | undefined;
-        const status = candle?.data?.forming ? "FORMING · visual only" : "CLOSED · native SMC eligible";
+        const status = candle?.data?.forming ? "FORMING · visual only" : `CLOSED · ${modelLabel} eligible`;
         return value ? `${candle.axisValue}<br/><b>${status}</b><br/>O ${value[0]} · H ${value[3]} · L ${value[2]} · C ${value[1]}` : "";
       },
     },
@@ -394,6 +398,9 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
             // ECharts' own label off avoids two conflicting price readouts.
             label: { show: false },
           }] : []),
+          ...(state.live_display?.bid ? [{ yAxis: state.live_display.bid, name: "Bid", lineStyle: { color: "#21c77a", width: 1, opacity: .55, type: "dotted" }, label: { show: false } }] : []),
+          ...(state.live_display?.ask ? [{ yAxis: state.live_display.ask, name: "Ask", lineStyle: { color: "#ef5b5b", width: 1, opacity: .55, type: "dotted" }, label: { show: false } }] : []),
+          ...(state.live_display?.mark ? [{ yAxis: state.live_display.mark, name: "Mark", lineStyle: { color: "#eab54f", width: 1, opacity: .65, type: "dashed" }, label: { show: false } }] : []),
           ...proposalLines,
         ] },
       },
@@ -404,8 +411,8 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
   } as EChartsOption, priceAxisRange, livePrice, liveDirection };
 }
 
-export default function NativeSMCChartOverlay({ state, timeframe = "5m", rightOffsetBars = 12, initialVisibleBars = 120, filters, selectedObjectId, highlightedObjectIds, onCandleSelect, fitContentSignal, latestSignal, centerTimestamp, priceViewport, viewport, onViewportChange, onHistoryNearStart, historyLoading = false, hasMoreHistory = true, historicalMode = false, onGoLive, prependedHistory, onPriceAxisDrag, onResetPriceScale, onChartPointerDown, lightMode = false, liveDataStale = false, height = 700 }: Props) {
-  const presentation = useMemo(() => chartOption(state, timeframe, rightOffsetBars, initialVisibleBars, filters, selectedObjectId, highlightedObjectIds, lightMode, priceViewport, viewport, liveDataStale), [state, timeframe, rightOffsetBars, initialVisibleBars, filters, selectedObjectId, highlightedObjectIds, lightMode, priceViewport, viewport, liveDataStale]);
+export default function NativeSMCChartOverlay({ state, timeframe = "5m", rightOffsetBars = 12, initialVisibleBars = 120, filters, selectedObjectId, highlightedObjectIds, onCandleSelect, fitContentSignal, latestSignal, centerTimestamp, priceViewport, viewport, onViewportChange, onHistoryNearStart, historyLoading = false, hasMoreHistory = true, historicalMode = false, onGoLive, prependedHistory, onPriceAxisDrag, onResetPriceScale, onChartPointerDown, lightMode = false, liveDataStale = false, modelLabel = "native SMC", height = 700 }: Props) {
+  const presentation = useMemo(() => chartOption(state, timeframe, rightOffsetBars, initialVisibleBars, filters, selectedObjectId, highlightedObjectIds, lightMode, priceViewport, viewport, liveDataStale, modelLabel), [state, timeframe, rightOffsetBars, initialVisibleBars, filters, selectedObjectId, highlightedObjectIds, lightMode, priceViewport, viewport, liveDataStale, modelLabel]);
   const labels = state.candles.length + (state.forming_candle ? 1 : 0) + Math.max(0, rightOffsetBars);
   const localWindowBars = Math.min(labels, Math.max(24, initialVisibleBars + rightOffsetBars));
   const currentSpanBars = viewport ? Math.max(24, Math.round(((viewport.end - viewport.start) / 100) * labels)) : localWindowBars;

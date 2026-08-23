@@ -60,6 +60,35 @@ const WALK_FORWARD = {
   folds: [{ train_net_r: 8, test_net_r: 2 }, { train_net_r: 6, test_net_r: 1.5 },
           { train_net_r: 7, test_net_r: 3 }, { train_net_r: 5, test_net_r: -0.1 }],
 };
+const PA_CANDLES = Array.from({ length: 80 }, (_, index) => ({
+  timestamp: new Date(Date.UTC(2026, 0, 1, 0, index * 5)).toISOString(),
+  open: 100 + index * .1, high: 101 + index * .1, low: 99 + index * .1,
+  close: 100.5 + index * .1, volume: 1000,
+}));
+const PA_CHART = {
+  research_id: "PRICE_ACTION_NATIVE_V1_RESEARCH", research_only: true,
+  execution_allowed: false, paper_execution_allowed: true, symbol: "BTCUSDT", timeframe: "5m",
+  candles: PA_CANDLES, swings: [], zones: [], events: [], setups: [], proposals: [], orders: [], trades: [],
+  metrics: { closed: 0, wins: 0, losses: 0, unfilled: 0, net_r: 0, costs_r: 0 },
+  snapshot: { candle_open: PA_CANDLES.at(-1)?.timestamp, candle_close: PA_CANDLES.at(-1)?.timestamp,
+    structure_bias: "neutral", pattern: null, proposal_ids: [], strategy_traces: [] },
+  selected_snapshot: null, forming_candle: { ...PA_CANDLES.at(-1), close: 109 },
+  live_display: { is_forming: true, observed_at: "2026-01-01T07:00:00Z", last_update: "2026-01-01T07:00:00Z",
+    refresh_interval_seconds: 0, candle_closes_at: "2026-01-01T07:05:00Z", last_price: 109,
+    bid: 108.9, ask: 109.1, mark: 109, funding_rate: .0001, next_funding_time: "2026-01-01T08:00:00Z",
+    connection_state: "CONNECTED", new_entries_paused: false, execution_uses_closed_bars_only: true },
+  data_provenance: { exchange: "Binance USDⓈ-M Futures", closed_candles_used: 80 },
+};
+const PA_PAPER = {
+  account_scope: "PRICE_ACTION_VISUAL_LAB_ONLY", currency: "USDT", execution_mode: "PAPER",
+  real_funds: false, live_execution_allowed: false,
+  session: { id: "pa-session-1", started_at: "2026-01-01T00:00:00Z", status: "active",
+    starting_balance: 10000, symbol: "BTCUSDT", timeframe: "5m", operating_mode: "signals_only",
+    execution_config: { strategy_id: "PA1_SR_REJECTION", risk_pct: .5 } },
+  account: { starting_balance: 10000, balance: 10000, equity: 10000, unrealized_pnl: 0,
+    fees_paid: 0, free_margin: 10000, leverage: 1 }, positions: [], orders: [], trades: [],
+  candidates: [], activity: [],
+};
 
 const JOURNAL_FULL = {
   trade_id: "t1234567abcdef", mode: "paper", symbol: "BTCUSDT", side: "long",
@@ -161,6 +190,11 @@ const MEM_ASK = { query: "show all losing BTC trades", kind: "filter",
 
 // exact shapes keyed by pathname substring (first match wins)
 const SHAPES: [string, unknown][] = [
+  ["/research/price-action/live-chart", PA_CHART],
+  ["/research/price-action/contracts", { exchange: "Binance USDⓈ-M Futures", contracts: ["BTCUSDT", "ETHUSDT"], timeframes: ["5m"], real_execution_allowed: false }],
+  ["/research/price-action/sessions/current/configuration", PA_PAPER],
+  ["/research/price-action/sessions", { sessions: [PA_PAPER.session], real_execution_allowed: false }],
+  ["/research/price-action/paper", PA_PAPER],
   ["/user/settings", { namespace: "settings-center", data: {
     general: { density: "comfortable", sidebar_default: "expanded" },
   } }],

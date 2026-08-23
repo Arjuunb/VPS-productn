@@ -78,6 +78,7 @@ class MarketDataService:
         self.request_json = request_json or self._request_json
         self._lock = threading.RLock()
         self._perpetuals: tuple[float, list[str]] = (0.0, [])
+        self._usdm_rules: tuple[float, dict[str, dict]] = (0.0, {})
         self.registry = ProviderRegistry()
         self._requesters = {p: ResilientRequester(self.request_json, self.registry, p)
                             for p in self.registry.providers}
@@ -321,6 +322,51 @@ class MarketDataService:
                 error = exc
         raise RuntimeError(f"Binance USDT perpetual data unavailable: {error}")
 
+    def public_usdm_window(self, symbol: str, timeframe: str, *, limit: int = 1000,
+                           end_ms: Optional[int] = None) -> list[Bar]:
+        """Return a bounded public Binance USD-M Futures OHLCV window.
+
+        Unlike :meth:`bars`, this read-through method does not require a
+        downloaded cache.  Callers must still separate the current forming
+        candle before passing rows to any closed-candle decision engine.
+        """
+        key = normalize_symbol(symbol)
+        if timeframe not in TIMEFRAMES:
+            raise ValueError(f"unsupported timeframe '{timeframe}'")
+        if not key.endswith("USDT"):
+            raise ValueError("Binance USD-M visual data requires a USDT perpetual symbol")
+        bounded = max(50, min(int(limit), 1500))
+        rows = self._crypto_rows(key, timeframe, start_ms=None, end_ms=end_ms, limit=bounded)
+        return [Bar(datetime.fromtimestamp(r[0] / 1000, timezone.utc), *map(float, r[1:])) for r in rows]
+
+    def public_usdm_quote(self, symbol: str) -> dict:
+        """Return factual public bid/ask/mark/funding data for one contract."""
+        key = normalize_symbol(symbol)
+        book = self._requesters["binance-futures"](
+            _FUTURES_HOSTS[0] + "/fapi/v1/ticker/bookTicker", {"symbol": key})
+        premium = self._requesters["binance-futures"](
+            _FUTURES_HOSTS[0] + "/fapi/v1/premiumIndex", {"symbol": key})
+        funding_rows = self._requesters["binance-futures"](
+            _FUTURES_HOSTS[0] + "/fapi/v1/fundingRate", {"symbol": key, "limit": 1})
+        try:
+            funding = funding_rows[-1]
+            return {
+                "symbol": key,
+                "bid": float(book["bidPrice"]),
+                "ask": float(book["askPrice"]),
+                "mark": float(premium["markPrice"]),
+                "index": float(premium["indexPrice"]),
+                "funding_rate": float(funding["fundingRate"]),
+                "last_funding_time": datetime.fromtimestamp(
+                    int(funding["fundingTime"]) / 1000, timezone.utc).isoformat(),
+                "next_funding_time": datetime.fromtimestamp(
+                    int(premium["nextFundingTime"]) / 1000, timezone.utc).isoformat(),
+                "provider_time": datetime.fromtimestamp(
+                    int(premium.get("time") or book.get("time")) / 1000, timezone.utc).isoformat(),
+            }
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Binance USD-M returned malformed public quote data: {exc}") from exc
+
     def _crypto_history(self, symbol: str, timeframe: str, candles: int) -> list[tuple]:
         """Page backwards through real Binance Futures candles without overlap."""
         rows: list[tuple] = []
@@ -428,6 +474,42 @@ class MarketDataService:
             self._perpetuals = (time.time(), pairs)
         return pairs
 
+    def usdm_contract_rules(self, symbol: str, *, ttl_seconds: int = 3600) -> dict:
+        """Return provider-declared tick, quantity, and notional constraints."""
+        key = normalize_symbol(symbol)
+        with self._lock:
+            cached_at, cached = self._usdm_rules
+            if cached and time.time() - cached_at < ttl_seconds and key in cached:
+                return dict(cached[key])
+        payload = self._requesters["binance-futures"](
+            _FUTURES_HOSTS[0] + "/fapi/v1/exchangeInfo", {})
+        rules: dict[str, dict] = {}
+        for contract in payload.get("symbols", []):
+            if (contract.get("status") != "TRADING" or contract.get("quoteAsset") != "USDT"
+                    or contract.get("contractType") != "PERPETUAL"):
+                continue
+            filters = {row.get("filterType"): row for row in contract.get("filters", [])}
+            price = filters.get("PRICE_FILTER", {})
+            lot = filters.get("LOT_SIZE", {})
+            notional = filters.get("MIN_NOTIONAL", {})
+            rules[contract["symbol"]] = {
+                "symbol": contract["symbol"],
+                "tick_size": float(price.get("tickSize") or 0),
+                "min_price": float(price.get("minPrice") or 0),
+                "quantity_step": float(lot.get("stepSize") or 0),
+                "min_quantity": float(lot.get("minQty") or 0),
+                "max_quantity": float(lot.get("maxQty") or 0),
+                "min_notional": float(notional.get("notional") or notional.get("minNotional") or 0),
+                "price_precision": int(contract.get("pricePrecision") or 0),
+                "quantity_precision": int(contract.get("quantityPrecision") or 0),
+                "max_lab_leverage": 20,
+            }
+        with self._lock:
+            self._usdm_rules = (time.time(), rules)
+        if key not in rules:
+            raise ValueError(f"active Binance USD-M perpetual metadata unavailable for '{key}'")
+        return dict(rules[key])
+
     def verify_binance_usdm(self) -> dict:
         """Perform a real Binance USD-M Futures metadata health check.
 
@@ -459,6 +541,7 @@ class MarketDataService:
                 resolved.unlink(missing_ok=True)
                 removed += 1
             self._perpetuals = (0.0, [])
+            self._usdm_rules = (0.0, {})
         return removed
 
     def update(self, symbol: str, timeframe: str = "1h") -> dict:

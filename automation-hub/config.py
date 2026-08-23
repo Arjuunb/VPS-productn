@@ -132,6 +132,12 @@ class Settings:
         "HUB_MARKET_DATA_DIR", str(DATA_DIR / "market_data")))
     paper_broker_v2_db: str = field(default_factory=lambda: os.environ.get(
         "HUB_PAPER_BROKER_V2_DB", str(DATA_DIR / "paper_broker_v2.db")))
+    # Price Action Visual Lab has its own virtual USDT ledger.  It never shares
+    # positions, orders, or balance with the general paper account.
+    price_action_paper_db: str = field(default_factory=lambda: os.environ.get(
+        "HUB_PRICE_ACTION_PAPER_DB", str(DATA_DIR / "price_action_paper.db")))
+    price_action_research_db: str = field(default_factory=lambda: os.environ.get(
+        "HUB_PRICE_ACTION_RESEARCH_DB", str(DATA_DIR / "price_action_research.db")))
     # Decision-journal database (full explainable record of every trade)
     journal_db: str = field(default_factory=lambda: os.environ.get(
         "HUB_JOURNAL_DB", str(DATA_DIR / "journal.db")))

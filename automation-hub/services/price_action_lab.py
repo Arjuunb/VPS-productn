@@ -1,0 +1,842 @@
+"""Binance visual feed and isolated virtual account for the Price Action Lab."""
+from __future__ import annotations
+
+import json
+import math
+import sqlite3
+import threading
+import uuid
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Literal
+
+from bot.types import Bar
+from data.market_data_v2 import TF_MS, MarketDataService, normalize_symbol
+from execution.paper_broker_v2 import PaperBrokerV2
+from services.native_price_action import STRATEGIES, NativePriceActionEngine, PriceActionConfig
+from services.price_action_stream import PriceActionPublicStream
+
+
+def _iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _candle(row: Bar) -> dict:
+    return {"timestamp": row.timestamp.isoformat(), "open": row.open, "high": row.high,
+            "low": row.low, "close": row.close, "volume": row.volume}
+
+
+OPERATING_MODES = {"signals_only", "manual_approval", "automatic"}
+
+
+@dataclass(frozen=True)
+class PaperExecutionConfig:
+    operating_mode: Literal["signals_only", "manual_approval", "automatic"] = "signals_only"
+    strategy_id: str = "PA1_SR_REJECTION"
+    risk_pct: float = 0.5
+    max_risk_pct: float = 1.0
+    max_concurrent_risk_pct: float = 2.0
+    target_r: float = 2.5
+
+    def validated(self) -> "PaperExecutionConfig":
+        if self.operating_mode not in OPERATING_MODES:
+            raise ValueError("operating mode must be signals_only, manual_approval or automatic")
+        if not 0 < self.risk_pct <= self.max_risk_pct <= 5:
+            raise ValueError("risk must be positive and no greater than the configured maximum")
+        if self.max_concurrent_risk_pct < self.risk_pct:
+            raise ValueError("maximum concurrent risk cannot be below risk per trade")
+        if abs(self.target_r - 2.5) > 1e-9:
+            raise ValueError("Price Action V1 automatic paper target is fixed at 2.5R")
+        if self.strategy_id not in STRATEGIES:
+            raise ValueError("unknown Price Action strategy")
+        return self
+
+
+class PriceActionPaperAccount:
+    """Persistent, Price-Action-only paper ledger with durable sessions."""
+
+    def __init__(self, path: str | Path, *, starting_balance: float = 10_000.0):
+        self.path = str(path)
+        self.starting_balance = float(starting_balance)
+        self.broker = PaperBrokerV2(self.path, starting_balance=self.starting_balance)
+        self._lock = threading.RLock()
+        # Metadata and the broker share one SQLite file but use separate
+        # connections. Autocommit prevents a metadata write lock from being
+        # held while the broker performs its own atomic ledger transaction.
+        self._db = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
+        self._db.row_factory = sqlite3.Row
+        with self._db:
+            self._db.executescript("""
+              CREATE TABLE IF NOT EXISTS pa_sessions(
+                id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT,
+                starting_balance REAL NOT NULL, status TEXT NOT NULL,
+                end_reason TEXT);
+              CREATE TABLE IF NOT EXISTS pa_activity(
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL,
+                symbol TEXT, strategy_id TEXT, object_id TEXT, created_at TEXT NOT NULL,
+                payload TEXT NOT NULL DEFAULT '{}');
+              CREATE TABLE IF NOT EXISTS pa_funding_events(
+                session_id TEXT NOT NULL, symbol TEXT NOT NULL,
+                funding_time TEXT NOT NULL, funding_rate REAL NOT NULL,
+                mark_price REAL NOT NULL, applied INTEGER NOT NULL,
+                amount REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY(session_id,symbol,funding_time));
+              CREATE TABLE IF NOT EXISTS pa_settings(
+                id INTEGER PRIMARY KEY CHECK(id=1), leverage REAL NOT NULL);
+              CREATE TABLE IF NOT EXISTS pa_order_meta(
+                order_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                proposal_id TEXT NOT NULL, setup_id TEXT NOT NULL,
+                zone_id TEXT NOT NULL, direction TEXT NOT NULL,
+                strategy_id TEXT NOT NULL, config_json TEXT NOT NULL,
+                status TEXT NOT NULL, reason TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                valid_until_index INTEGER NOT NULL,
+                UNIQUE(session_id,zone_id,direction));
+              CREATE TABLE IF NOT EXISTS pa_candidates(
+                proposal_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                source_proposal_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL, payload TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+            """)
+            session_columns = {row[1] for row in self._db.execute("PRAGMA table_info(pa_sessions)")}
+            for name, ddl in (
+                ("mode", "TEXT NOT NULL DEFAULT 'LIVE_PAPER'"),
+                ("symbol", "TEXT NOT NULL DEFAULT 'BTCUSDT'"),
+                ("timeframe", "TEXT NOT NULL DEFAULT '5m'"),
+                ("replay_cursor", "INTEGER NOT NULL DEFAULT 0"),
+                ("operating_mode", "TEXT NOT NULL DEFAULT 'signals_only'"),
+                ("strategy_config_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("execution_config_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("state_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("metrics_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("updated_at", "TEXT"),
+            ):
+                if name not in session_columns:
+                    self._db.execute(f"ALTER TABLE pa_sessions ADD COLUMN {name} {ddl}")
+            candidate_columns = {row[1] for row in self._db.execute("PRAGMA table_info(pa_candidates)")}
+            if "source_proposal_id" not in candidate_columns:
+                self._db.execute("ALTER TABLE pa_candidates ADD COLUMN source_proposal_id TEXT NOT NULL DEFAULT ''")
+                self._db.execute("UPDATE pa_candidates SET source_proposal_id=proposal_id WHERE source_proposal_id='' ")
+            self._db.execute("INSERT OR IGNORE INTO pa_settings VALUES (1,1)")
+            if not self._db.execute("SELECT 1 FROM pa_sessions WHERE status='active' LIMIT 1").fetchone():
+                self._db.execute(
+                    "INSERT INTO pa_sessions(id,started_at,ended_at,starting_balance,status,end_reason,updated_at) VALUES (?,?,?,?,?,?,?)",
+                    (uuid.uuid4().hex, _iso(), None, self.starting_balance, "active", None, _iso()),
+                )
+            leverage = self._db.execute("SELECT leverage FROM pa_settings WHERE id=1").fetchone()[0]
+            self.broker.leverage = float(leverage)
+            self._snapshot_current()
+
+    def session(self) -> dict:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM pa_sessions WHERE status='active' ORDER BY started_at DESC LIMIT 1").fetchone()
+            return dict(row) if row else {}
+
+    def sessions(self) -> list[dict]:
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM pa_sessions ORDER BY started_at DESC").fetchall()
+        return [self._decode_session(dict(row)) for row in rows]
+
+    @staticmethod
+    def _decode_session(row: dict) -> dict:
+        for key in ("strategy_config_json", "execution_config_json", "state_json", "metrics_json"):
+            raw = row.pop(key, "{}") or "{}"
+            row[key.removesuffix("_json")] = json.loads(raw)
+        return row
+
+    def _audit(self, kind: str, *, symbol: str = "", strategy_id: str = "",
+               object_id: str = "", payload: dict | None = None,
+               session_id: str | None = None) -> None:
+        sid = session_id or self.session().get("id")
+        if not sid:
+            return
+        self._db.execute(
+            "INSERT INTO pa_activity(id,session_id,kind,symbol,strategy_id,object_id,created_at,payload) VALUES (?,?,?,?,?,?,?,?)",
+            (uuid.uuid4().hex, sid, kind, symbol, strategy_id, object_id, _iso(),
+             json.dumps(payload or {}, sort_keys=True, default=str)),
+        )
+
+    def _snapshot_current(self, *, metrics: dict | None = None) -> None:
+        current = self.session()
+        if not current:
+            return
+        self._db.execute(
+            "UPDATE pa_sessions SET state_json=?,metrics_json=COALESCE(?,metrics_json),updated_at=? WHERE id=?",
+            (json.dumps(self.broker.export_state(), sort_keys=True),
+             json.dumps(metrics, sort_keys=True, default=str) if metrics is not None else None,
+             _iso(), current["id"]),
+        )
+
+    def configure(self, *, mode: str | None = None, symbol: str | None = None,
+                  timeframe: str | None = None, replay_cursor: int | None = None,
+                  strategy_config: dict | None = None,
+                  execution_config: PaperExecutionConfig | None = None) -> dict:
+        current = self.session()
+        if not current:
+            raise ValueError("no active Price Action session")
+        execution = (execution_config or PaperExecutionConfig(**json.loads(
+            current.get("execution_config_json") or "{}"))).validated()
+        values = {
+            "mode": mode or current.get("mode") or "LIVE_PAPER",
+            "symbol": (symbol or current.get("symbol") or "BTCUSDT").upper(),
+            "timeframe": timeframe or current.get("timeframe") or "5m",
+            "replay_cursor": int(replay_cursor if replay_cursor is not None else current.get("replay_cursor") or 0),
+            "operating_mode": execution.operating_mode,
+            "strategy_config_json": json.dumps(strategy_config or json.loads(current.get("strategy_config_json") or "{}"), sort_keys=True),
+            "execution_config_json": json.dumps(asdict(execution), sort_keys=True),
+        }
+        if values["timeframe"] not in TF_MS:
+            raise ValueError("unsupported session timeframe")
+        with self._lock, self._db:
+            self._db.execute(
+                "UPDATE pa_sessions SET mode=:mode,symbol=:symbol,timeframe=:timeframe,replay_cursor=:replay_cursor,operating_mode=:operating_mode,strategy_config_json=:strategy_config_json,execution_config_json=:execution_config_json,updated_at=:updated_at WHERE id=:id",
+                {**values, "updated_at": _iso(), "id": current["id"]},
+            )
+            self._audit("session_configuration_changed", symbol=values["symbol"],
+                        strategy_id=execution.strategy_id, payload=values)
+        return self.state()
+
+    def state(self, marks: dict[str, float] | None = None) -> dict:
+        current = self.session()
+        with self._lock:
+            candidates = [dict(row) for row in self._db.execute(
+                "SELECT * FROM pa_candidates WHERE session_id=? ORDER BY created_at DESC", (current.get("id", ""),))]
+            activity = [dict(row) for row in self._db.execute(
+                "SELECT * FROM pa_activity WHERE session_id=? ORDER BY created_at DESC LIMIT 500", (current.get("id", ""),))]
+            metadata = [dict(row) for row in self._db.execute(
+                "SELECT * FROM pa_order_meta WHERE session_id=? ORDER BY created_at DESC", (current.get("id", ""),))]
+        return {
+            "account_scope": "PRICE_ACTION_VISUAL_LAB_ONLY",
+            "currency": "USDT",
+            "execution_mode": "PAPER",
+            "real_funds": False,
+            "live_execution_allowed": False,
+            "session": self._decode_session(dict(current)) if current else {},
+            "account": self.broker.account(marks),
+            "positions": self.broker.positions(),
+            "orders": self.broker.orders(),
+            "trades": self.broker.fills(limit=500),
+            "candidates": [{**row, "payload": json.loads(row["payload"])} for row in candidates],
+            "order_metadata": [{**row, "config": json.loads(row["config_json"])} for row in metadata],
+            "activity": [{**row, "payload": json.loads(row["payload"])} for row in activity],
+        }
+
+    def reset(self) -> dict:
+        with self._lock:
+            old = self.session()
+            self._snapshot_current()
+            self.broker.factory_reset(self.starting_balance)
+            now, new_id = _iso(), uuid.uuid4().hex
+            with self._db:
+                if old:
+                    self._db.execute("UPDATE pa_sessions SET ended_at=?,status='ended',end_reason='account_restart' WHERE id=?",
+                                     (now, old["id"]))
+                self._db.execute(
+                    "INSERT INTO pa_sessions(id,started_at,ended_at,starting_balance,status,end_reason,updated_at) VALUES (?,?,?,?,?,?,?)",
+                    (new_id, now, None, self.starting_balance, "active", None, now),
+                )
+                if old:
+                    self._db.execute(
+                        "UPDATE pa_sessions SET mode=?,symbol=?,timeframe=?,operating_mode=?,strategy_config_json=?,execution_config_json=?,updated_at=? WHERE id=?",
+                        (old.get("mode", "LIVE_PAPER"), old.get("symbol", "BTCUSDT"), old.get("timeframe", "5m"),
+                         old.get("operating_mode", "signals_only"), old.get("strategy_config_json", "{}"),
+                         old.get("execution_config_json", "{}"), now, new_id),
+                    )
+                self._audit("session_reset", object_id=new_id,
+                            payload={"previous_session_id": old.get("id") if old else None,
+                                     "new_session_id": new_id, "confirmation_required": True})
+                self._snapshot_current()
+            return self.state()
+
+    def factory_reset(self) -> dict:
+        """Erase all PA operational history; used only by the global Factory Reset."""
+        with self._lock:
+            self.broker.factory_reset(self.starting_balance)
+            now, new_id = _iso(), uuid.uuid4().hex
+            for table in ("pa_order_meta", "pa_candidates", "pa_funding_events", "pa_activity", "pa_sessions"):
+                self._db.execute(f"DELETE FROM {table}")
+            self._db.execute(
+                "INSERT INTO pa_sessions(id,started_at,starting_balance,status,updated_at) VALUES (?,?,?,?,?)",
+                (new_id, now, self.starting_balance, "active", now),
+            )
+            self._snapshot_current()
+        return self.state()
+
+    def start(self, *, mode: str = "LIVE_PAPER", symbol: str = "BTCUSDT",
+              timeframe: str = "5m", starting_balance: float | None = None,
+              execution_config: PaperExecutionConfig | None = None,
+              strategy_config: dict | None = None) -> dict:
+        amount = float(starting_balance or self.starting_balance)
+        if amount <= 0:
+            raise ValueError("starting balance must be positive")
+        config = (execution_config or PaperExecutionConfig()).validated()
+        with self._lock, self._db:
+            prior = self.session()
+            if prior:
+                self._snapshot_current()
+                self._db.execute("UPDATE pa_sessions SET status='ended',ended_at=?,end_reason='new_session' WHERE id=?", (_iso(), prior["id"]))
+            self.broker.factory_reset(amount)
+            sid, now = uuid.uuid4().hex, _iso()
+            self._db.execute("INSERT INTO pa_sessions(id,started_at,starting_balance,status,mode,symbol,timeframe,operating_mode,strategy_config_json,execution_config_json,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                             (sid, now, amount, "active", mode, symbol.upper(), timeframe,
+                              config.operating_mode, json.dumps(strategy_config or {}, sort_keys=True),
+                              json.dumps(asdict(config), sort_keys=True), now))
+            self._audit("session_started", symbol=symbol, strategy_id=config.strategy_id,
+                        payload={"mode": mode, "timeframe": timeframe, "starting_balance": amount})
+            self._snapshot_current()
+        return self.state()
+
+    def end(self, reason: str = "user_end") -> dict:
+        with self._lock, self._db:
+            current = self.session()
+            if not current:
+                raise ValueError("no active session")
+            self._snapshot_current()
+            self._audit("session_ended", payload={"reason": reason})
+            self._db.execute("UPDATE pa_sessions SET status='ended',ended_at=?,end_reason=?,updated_at=? WHERE id=?",
+                             (_iso(), reason, _iso(), current["id"]))
+        return self._decode_session(dict(self._db.execute("SELECT * FROM pa_sessions WHERE id=?", (current["id"],)).fetchone()))
+
+    def resume(self, session_id: str) -> dict:
+        with self._lock, self._db:
+            target = self._db.execute("SELECT * FROM pa_sessions WHERE id=?", (session_id,)).fetchone()
+            if not target:
+                raise KeyError(session_id)
+            current = self.session()
+            if current and current["id"] != session_id:
+                self._snapshot_current()
+                self._db.execute("UPDATE pa_sessions SET status='paused',updated_at=? WHERE id=?", (_iso(), current["id"]))
+            snapshot = json.loads(target["state_json"] or "{}")
+            if not snapshot:
+                raise ValueError("session has no resumable broker snapshot")
+            self.broker.restore_state(snapshot)
+            self.broker.leverage = float(self._db.execute("SELECT leverage FROM pa_settings WHERE id=1").fetchone()[0])
+            self._db.execute("UPDATE pa_sessions SET status='active',ended_at=NULL,end_reason=NULL,updated_at=? WHERE id=?", (_iso(), session_id))
+            self._audit("session_resumed", session_id=session_id, payload={"restored": True})
+        return self.state()
+
+    def duplicate(self, session_id: str) -> dict:
+        row = self._db.execute("SELECT * FROM pa_sessions WHERE id=?", (session_id,)).fetchone()
+        if not row:
+            raise KeyError(session_id)
+        config = PaperExecutionConfig(**json.loads(row["execution_config_json"] or "{}"))
+        return self.start(mode=row["mode"], symbol=row["symbol"], timeframe=row["timeframe"],
+                          starting_balance=row["starting_balance"], execution_config=config,
+                          strategy_config=json.loads(row["strategy_config_json"] or "{}"))
+
+    def export_session(self, session_id: str | None = None) -> dict:
+        current = self.session()
+        sid = session_id or current.get("id")
+        row = self._db.execute("SELECT * FROM pa_sessions WHERE id=?", (sid,)).fetchone()
+        if not row:
+            raise KeyError(sid)
+        if current and current.get("id") == sid:
+            with self._lock, self._db:
+                self._snapshot_current()
+            row = self._db.execute("SELECT * FROM pa_sessions WHERE id=?", (sid,)).fetchone()
+        activity = [dict(item) for item in self._db.execute("SELECT * FROM pa_activity WHERE session_id=? ORDER BY created_at", (sid,))]
+        funding = [dict(item) for item in self._db.execute("SELECT * FROM pa_funding_events WHERE session_id=? ORDER BY funding_time", (sid,))]
+        return {"format_version": "2.0", "session": self._decode_session(dict(row)),
+                "activity": [{**item, "payload": json.loads(item["payload"])} for item in activity],
+                "funding": funding, "real_execution_allowed": False}
+
+    def record_external_event(self, event: dict) -> None:
+        with self._lock, self._db:
+            self._audit(event.get("kind", "runtime_event"), symbol=event.get("symbol", ""),
+                        object_id=event.get("object_id", ""), payload=event)
+
+    def set_replay_cursor(self, cursor: int, metrics: dict | None = None) -> None:
+        current = self.session()
+        if not current:
+            raise ValueError("no active session")
+        with self._lock, self._db:
+            self._db.execute("UPDATE pa_sessions SET replay_cursor=?,metrics_json=?,updated_at=? WHERE id=?",
+                             (int(cursor), json.dumps(metrics or {}, sort_keys=True, default=str),
+                              _iso(), current["id"]))
+            self._snapshot_current(metrics=metrics)
+
+    def set_leverage(self, leverage: float) -> dict:
+        value = float(leverage)
+        if value < 1 or value > 20:
+            raise ValueError("Price Action paper leverage must be between 1x and 20x")
+        with self._lock, self._db:
+            self._db.execute("UPDATE pa_settings SET leverage=? WHERE id=1", (value,))
+            self.broker.leverage = value
+        return self.state()
+
+    @staticmethod
+    def _round_step(value: float, step: float, *, upward: bool = False) -> float:
+        if step <= 0:
+            return float(value)
+        units = math.ceil(value / step - 1e-12) if upward else math.floor(value / step + 1e-12)
+        return round(units * step, 12)
+
+    def _execution_config(self) -> PaperExecutionConfig:
+        current = self.session()
+        return PaperExecutionConfig(**json.loads(current.get("execution_config_json") or "{}")) .validated()
+
+    def _candidate(self, proposal: dict, setup: dict, rules: dict, status: str,
+                   reason: str, config: PaperExecutionConfig) -> dict:
+        current, now = self.session(), _iso()
+        payload = {"proposal": proposal, "setup": setup, "rules": rules,
+                   "execution_config": asdict(config), "reason": reason}
+        candidate_id = f"{current['id']}:{proposal['id']}"
+        self._db.execute(
+            "INSERT OR IGNORE INTO pa_candidates(proposal_id,session_id,source_proposal_id,status,payload,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+            (candidate_id, current["id"], proposal["id"], status,
+             json.dumps(payload, sort_keys=True, default=str), now, now),
+        )
+        self._audit("strategy_candidate", symbol=current.get("symbol", ""),
+                    strategy_id=proposal["strategy_id"], object_id=proposal["id"],
+                    payload={"status": status, "reason": reason})
+        return payload
+
+    def _place_proposal(self, proposal: dict, setup: dict, rules: dict,
+                        config: PaperExecutionConfig, *, source: str) -> dict:
+        current = self.session()
+        zone_id = str(setup.get("zone_id") or "NO_ZONE")
+        duplicate = self._db.execute(
+            "SELECT order_id,status FROM pa_order_meta WHERE session_id=? AND zone_id=? AND direction=?",
+            (current["id"], zone_id, proposal["direction"]),
+        ).fetchone()
+        if duplicate:
+            reason = "duplicate trade blocked for the same session, zone and direction"
+            self._candidate(proposal, setup, rules, "REJECTED", reason, config)
+            return {"accepted": False, "reason": reason, "duplicate_order_id": duplicate["order_id"]}
+        account = self.broker.account()
+        risk_pct = min(config.risk_pct, config.max_risk_pct)
+        risk_amount = account["equity"] * risk_pct / 100
+        open_risk = 0.0
+        for row in self._db.execute(
+                "SELECT config_json FROM pa_order_meta WHERE session_id=? AND status IN ('ORDER_PENDING','PARTIALLY_FILLED','ENTERED')",
+                (current["id"],)):
+            open_risk += float(json.loads(row["config_json"]).get("risk_amount") or 0)
+        if open_risk + risk_amount > account["equity"] * config.max_concurrent_risk_pct / 100 + 1e-9:
+            reason = "maximum concurrent paper risk would be exceeded"
+            self._candidate(proposal, setup, rules, "REJECTED", reason, config)
+            return {"accepted": False, "reason": reason}
+        risk_distance = abs(float(proposal["entry"]) - float(proposal["stop"]))
+        if risk_distance <= 0:
+            reason = "entry-to-stop distance is not positive"
+            self._candidate(proposal, setup, rules, "REJECTED", reason, config)
+            return {"accepted": False, "reason": reason}
+        tick, step = float(rules.get("tick_size") or 0), float(rules.get("quantity_step") or 0)
+        is_long = proposal["direction"] == "bullish"
+        entry = self._round_step(float(proposal["entry"]), tick, upward=is_long)
+        stop = self._round_step(float(proposal["stop"]), tick, upward=not is_long)
+        actual_risk = abs(entry - stop)
+        target = self._round_step(entry + actual_risk * 2.5 * (1 if is_long else -1), tick,
+                                  upward=is_long)
+        quantity = self._round_step(risk_amount / actual_risk, step)
+        margin_cap = account["free_margin"] * self.broker.leverage / max(entry, 1e-12)
+        quantity = min(quantity, self._round_step(margin_cap, step))
+        minimum = float(rules.get("min_quantity") or 0)
+        notional = quantity * entry
+        rejection = None
+        if quantity <= 0 or quantity < minimum:
+            rejection = f"risk-sized quantity {quantity} is below minimum {minimum}"
+        elif rules.get("max_quantity") and quantity > float(rules["max_quantity"]):
+            rejection = "risk-sized quantity exceeds contract maximum"
+        elif notional < float(rules.get("min_notional") or 0):
+            rejection = f"risk-sized notional {notional:.8f} is below contract minimum"
+        if rejection:
+            self._candidate(proposal, setup, rules, "REJECTED", rejection, config)
+            return {"accepted": False, "reason": rejection}
+        order_config = {
+            "research_id": "PRICE_ACTION_NATIVE_V1_RESEARCH", "source": source,
+            "session_id": current["id"], "proposal": proposal, "setup": setup,
+            "strategy_configuration": json.loads(current.get("strategy_config_json") or "{}"),
+            "execution": asdict(config), "contract_rules": rules,
+            "risk_amount": risk_amount, "risk_pct": risk_pct, "quantity": quantity,
+            "entry": entry, "stop": stop, "target": target,
+            "leverage": self.broker.leverage, "execution_mode": "PAPER",
+            "live_execution_allowed": False,
+        }
+        order = self.broker.submit(symbol=current.get("symbol") or proposal.get("symbol") or "BTCUSDT",
+                                   side="buy" if is_long else "sell", order_type="stop",
+                                   quantity=quantity, stop_price=entry, market_open=True)
+        now = _iso()
+        self._db.execute(
+            "INSERT INTO pa_order_meta VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (order["id"], current["id"], proposal["id"], proposal["setup_id"], zone_id,
+             proposal["direction"], proposal["strategy_id"], json.dumps(order_config, sort_keys=True, default=str),
+             "ORDER_PENDING", "eligible setup accepted for paper execution", now, now,
+             int(proposal["valid_until_index"])),
+        )
+        self._db.execute("UPDATE pa_candidates SET status='ORDER_PENDING',updated_at=? WHERE session_id=? AND source_proposal_id=?",
+                         (now, current["id"], proposal["id"]))
+        self._audit("paper_order_accepted", symbol=current.get("symbol", ""),
+                    strategy_id=proposal["strategy_id"], object_id=order["id"], payload=order_config)
+        self._snapshot_current()
+        return {"accepted": True, "order": order, "configuration": order_config}
+
+    def synchronize_strategy(self, visual_state: dict, *, contract_rules: dict,
+                             candle: Bar, feed_reliable: bool = True) -> dict:
+        """Advance broker state and consume newly eligible proposals exactly once."""
+        config = self._execution_config()
+        current = self.session()
+        if not current:
+            raise ValueError("no active Price Action session")
+        proposals = {row["id"]: row for row in visual_state.get("proposals", [])}
+        setups = {row["id"]: row for row in visual_state.get("setups", [])}
+        index = len(visual_state.get("candles", [])) - 1
+        with self._lock, self._db:
+            open_meta = [dict(row) for row in self._db.execute(
+                "SELECT * FROM pa_order_meta WHERE session_id=? AND status IN ('ORDER_PENDING','PARTIALLY_FILLED','ENTERED')",
+                (current["id"],))]
+            for meta in open_meta:
+                cfg = json.loads(meta["config_json"])
+                zone = next((row for row in visual_state.get("zones", []) if row["id"] == meta["zone_id"]), None)
+                is_long = meta["direction"] == "bullish"
+                entry_touched = candle.high >= cfg["entry"] if is_long else candle.low <= cfg["entry"]
+                stop_breached = candle.low <= cfg["stop"] if is_long else candle.high >= cfg["stop"]
+                cancel_reason = None
+                if index > meta["valid_until_index"]:
+                    cancel_reason = "setup confirmation order expired"
+                elif zone is not None and not zone.get("active", True):
+                    cancel_reason = "structural zone invalidated before entry"
+                elif stop_breached and not entry_touched:
+                    cancel_reason = "protective premise breached before the entry order activated"
+                if meta["status"] in {"ORDER_PENDING", "PARTIALLY_FILLED"} and cancel_reason:
+                    try:
+                        self.broker.cancel(meta["order_id"])
+                    except (KeyError, ValueError):
+                        pass
+                    terminal = "EXPIRED" if "expired" in cancel_reason else "INVALIDATED" if "invalidated" in cancel_reason else "CANCELLED"
+                    self._db.execute("UPDATE pa_order_meta SET status=?,reason=?,updated_at=? WHERE order_id=?",
+                                     (terminal, cancel_reason, _iso(), meta["order_id"]))
+                    self._audit("paper_order_cancelled", object_id=meta["order_id"],
+                                payload={"bar_index": index, "reason": cancel_reason})
+            protections = {}
+            for meta in open_meta:
+                cfg = json.loads(meta["config_json"])
+                protections[meta["order_id"]] = {"stop_loss": cfg["stop"], "take_profit": cfg["target"]}
+            result = self.broker.process_candle(current.get("symbol", "BTCUSDT"), candle, protections=protections)
+            for event in result["events"]:
+                meta = self._db.execute("SELECT * FROM pa_order_meta WHERE order_id=?", (event.get("order_id"),)).fetchone()
+                if meta:
+                    order = self.broker.order(meta["order_id"])
+                    status = "ENTERED" if order["status"] == "filled" else "PARTIALLY_FILLED"
+                    self._db.execute("UPDATE pa_order_meta SET status=?,reason=?,updated_at=? WHERE order_id=?",
+                                     (status, "paper fill simulated from verified market data", _iso(), meta["order_id"]))
+                    self._audit("paper_order_filled", strategy_id=meta["strategy_id"], object_id=meta["order_id"], payload=event)
+                elif str(event.get("order_id", "")).startswith("protective-"):
+                    self._audit("paper_position_completed", object_id=event["order_id"], payload=event)
+                    self._db.execute(
+                        "UPDATE pa_order_meta SET status='COMPLETED',reason=?,updated_at=? WHERE session_id=? AND status='ENTERED'",
+                        ("protective stop or fixed 2.5R target completed the paper position",
+                         _iso(), current["id"]),
+                    )
+            created, rejected = [], []
+            for proposal in proposals.values():
+                if proposal["strategy_id"] != config.strategy_id:
+                    continue
+                if self._db.execute("SELECT 1 FROM pa_candidates WHERE session_id=? AND source_proposal_id=?",
+                                    (current["id"], proposal["id"])).fetchone() or \
+                   self._db.execute("SELECT 1 FROM pa_order_meta WHERE session_id=? AND proposal_id=?",
+                                    (current["id"], proposal["id"])).fetchone():
+                    continue
+                setup = setups.get(proposal["setup_id"], {})
+                if not feed_reliable:
+                    self._candidate(proposal, setup, contract_rules, "REJECTED", "new entry paused because market feed is unreliable", config)
+                    rejected.append({"proposal_id": proposal["id"], "reason": "feed unreliable"})
+                elif config.operating_mode == "signals_only":
+                    self._candidate(proposal, setup, contract_rules, "SIGNAL_ONLY", "signals-only mode does not create an order", config)
+                elif config.operating_mode == "manual_approval":
+                    self._candidate(proposal, setup, contract_rules, "PENDING_APPROVAL", "waiting for explicit paper-order approval", config)
+                else:
+                    placed = self._place_proposal(proposal, setup, contract_rules, config, source="automatic")
+                    (created if placed["accepted"] else rejected).append(placed)
+            self._snapshot_current(metrics=visual_state.get("metrics", {}))
+        return {"broker": result, "created": created, "rejected": rejected,
+                "operating_mode": config.operating_mode, "feed_reliable": feed_reliable,
+                "real_execution_allowed": False}
+
+    def approve_candidate(self, proposal_id: str) -> dict:
+        with self._lock, self._db:
+            current = self.session()
+            row = self._db.execute("SELECT * FROM pa_candidates WHERE session_id=? AND source_proposal_id=?",
+                                   (current.get("id", ""), proposal_id)).fetchone()
+            if not row:
+                raise KeyError(proposal_id)
+            if row["status"] != "PENDING_APPROVAL":
+                raise ValueError("candidate is not awaiting manual approval")
+            payload = json.loads(row["payload"])
+            config = PaperExecutionConfig(**payload["execution_config"]).validated()
+            return self._place_proposal(payload["proposal"], payload["setup"], payload["rules"], config,
+                                        source="manual_approval")
+
+    def apply_funding_once(self, *, symbol: str, funding_time: str,
+                           rate: float, mark_price: float) -> dict:
+        """Apply one provider funding event at most once per lab session."""
+        session_id = self.session().get("id")
+        if not session_id or not funding_time:
+            return {"applied": False, "reason": "funding event unavailable"}
+        key = (session_id, symbol.upper(), funding_time)
+        with self._lock:
+            existing = self._db.execute(
+                "SELECT applied,amount FROM pa_funding_events WHERE session_id=? AND symbol=? AND funding_time=?", key).fetchone()
+            if existing:
+                return {"applied": False, "reason": "funding event already processed",
+                        "originally_applied": bool(existing["applied"]), "funding": existing["amount"]}
+            result = self.broker.apply_funding(symbol, rate, mark_price)
+            with self._db:
+                self._db.execute(
+                    "INSERT INTO pa_funding_events VALUES (?,?,?,?,?,?,?)",
+                    (*key, float(rate), float(mark_price), int(bool(result.get("applied"))),
+                     float(result.get("funding") or 0)),
+                )
+            return {**result, "funding_time": funding_time, "rate": rate,
+                    "source": "Binance USDⓈ-M Futures public funding history"}
+
+
+def binance_visual_state(market: MarketDataService, symbol: str, timeframe: str, *,
+                         limit: int = 800, visible: int = 400,
+                         observed_at: datetime | None = None) -> dict:
+    symbol = normalize_symbol(symbol)
+    if timeframe not in TF_MS:
+        raise ValueError(f"unsupported timeframe '{timeframe}'")
+    now = observed_at or datetime.now(timezone.utc)
+    raw = market.public_usdm_window(symbol, timeframe, limit=limit)
+    step = timedelta(milliseconds=TF_MS[timeframe])
+    closed = [row for row in raw if row.timestamp + step <= now]
+    forming = next((row for row in reversed(raw) if row.timestamp + step > now), None)
+    if not closed:
+        raise RuntimeError("Binance USD-M returned no completed candles")
+    engine = NativePriceActionEngine(PriceActionConfig(symbol=symbol, timeframe=timeframe))
+    engine.ingest_closed_bars(closed)
+    state = engine.visual_state(candle_window=max(50, min(visible, 1500)))
+    previous = closed[-1].close
+    current = forming.close if forming else previous
+    try:
+        quote = market.public_usdm_quote(symbol)
+        connection_state = "CONNECTED"
+        entries_paused = False
+    except Exception:
+        # OHLC remains factual and usable for inspection, but the absence of
+        # the independent quote/mark channel is made explicit and automated
+        # paper entries stay paused.
+        quote = {"bid": current, "ask": current, "mark": current,
+                 "funding_rate": None, "last_funding_time": None, "next_funding_time": None}
+        connection_state = "DELAYED"
+        entries_paused = True
+    state["forming_candle"] = _candle(forming) if forming else None
+    state["live_display"] = {
+        "is_forming": forming is not None,
+        "observed_at": now.isoformat(),
+        "candle_closes_at": (forming.timestamp + step).isoformat() if forming else None,
+        "last_price": current,
+        "price_direction": "up" if current > previous else "down" if current < previous else "unchanged",
+        "bid": quote["bid"], "ask": quote["ask"], "mark": quote["mark"],
+        "funding_rate": quote["funding_rate"],
+        "last_funding_time": quote.get("last_funding_time"),
+        "next_funding_time": quote["next_funding_time"],
+        "connection_state": connection_state,
+        "new_entries_paused": entries_paused,
+        "refresh_interval_seconds": 3,
+        "execution_uses_closed_bars_only": True,
+    }
+    state["data_provenance"] = {
+        "mode": "LIVE_BINANCE_DISPLAY_WITH_CLOSED_BAR_PRICE_ACTION",
+        "market_data_mode": "LIVE",
+        "market_data_source": "Binance USDⓈ-M Futures public OHLCV",
+        "exchange": "Binance USDⓈ-M Futures",
+        "market_type": "USDT perpetual",
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "observed_at": now.isoformat(),
+        "raw_candles_received": len(raw),
+        "closed_candles_used": len(closed),
+        "forming_candle_excluded": forming is not None,
+        "connection_state": connection_state,
+        "new_entries_paused": entries_paused,
+        "real_execution_allowed": False,
+    }
+    return state
+
+
+def replay_state(market: MarketDataService, symbol: str, timeframe: str, *,
+                 cursor: int, limit: int = 1000) -> dict:
+    symbol = normalize_symbol(symbol)
+    try:
+        rows = market.bars(symbol, timeframe, limit=max(100, min(limit, 3000)))
+    except ValueError:
+        rows = []
+    if not rows:
+        raise RuntimeError("verified cached history is required for replay; download Binance USD-M history first")
+    reveal = max(1, min(int(cursor), len(rows)))
+    visible = rows[:reveal]
+    engine = NativePriceActionEngine(PriceActionConfig(symbol=symbol, timeframe=timeframe))
+    engine.ingest_closed_bars(visible)
+    state = engine.visual_state(candle_window=min(limit, reveal))
+    state["replay"] = {"cursor": reveal, "total": len(rows), "future_candles_visible": False,
+                       "has_next": reveal < len(rows)}
+    state["data_provenance"] = {
+        "mode": "HISTORICAL_REPLAY",
+        "market_data_mode": "REPLAY",
+        "market_data_source": "verified Binance USDⓈ-M Futures cache",
+        "exchange": "Binance USDⓈ-M Futures",
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "closed_candles_used": reveal,
+        "future_candles_visible": False,
+        "real_execution_allowed": False,
+    }
+    return state
+
+
+class PriceActionLabRuntime:
+    """One durable public-data/engine/executor owner for the Visual Lab."""
+
+    def __init__(self, market: MarketDataService, account: PriceActionPaperAccount):
+        self.market, self.account = market, account
+        self._lock = threading.RLock()
+        self.engine: NativePriceActionEngine | None = None
+        self.identity: tuple[str, str] | None = None
+        self.config_signature = ""
+        self.stream = PriceActionPublicStream(
+            market.public_usdm_window, event_sink=account.record_external_event,
+            bar_sink=self._on_closed_bar,
+        )
+
+    def ensure(self, symbol: str, timeframe: str) -> None:
+        identity = (normalize_symbol(symbol), timeframe)
+        config = self._engine_config(*identity)
+        signature = json.dumps(asdict(config), sort_keys=True)
+        with self._lock:
+            if self.identity == identity and self.engine is not None and self.config_signature == signature:
+                return
+            self.identity = identity
+            self.config_signature = signature
+            self.engine = NativePriceActionEngine(config)
+            started = self.stream.start(*identity)
+            if started:
+                self.engine.ingest_closed_bars(self.stream.snapshot()["closed_bars"])
+
+    def _engine_config(self, symbol: str, timeframe: str) -> PriceActionConfig:
+        session = self.account.session()
+        raw = json.loads(session.get("strategy_config_json") or "{}")
+        allowed = set(PriceActionConfig.__dataclass_fields__) - {"symbol", "timeframe", "execution_allowed"}
+        return PriceActionConfig(symbol=symbol, timeframe=timeframe,
+                                 **{key: value for key, value in raw.items() if key in allowed})
+
+    def _on_closed_bar(self, bar: Bar) -> None:
+        with self._lock:
+            if self.engine is None:
+                return
+            try:
+                self.engine.process_closed_bar(bar)
+            except ValueError:
+                # A REST reconciliation can deliver an older missing bar. Rebuild
+                # from the stream's now-contiguous history to preserve chronology.
+                rows = self.stream.snapshot()["closed_bars"]
+                self.engine = NativePriceActionEngine(self._engine_config(*self.identity))
+                self.engine.ingest_closed_bars(rows)
+            state = self.engine.visual_state(candle_window=1500)
+            rules = self.market.usdm_contract_rules(self.identity[0])
+            status = self.stream.status()
+            session = self.account.session()
+            session_matches = (session.get("symbol"), session.get("timeframe")) == self.identity
+            if session_matches:
+                self.account.synchronize_strategy(state, contract_rules=rules, candle=bar,
+                                                  feed_reliable=bool(status["reliable"]))
+            else:
+                self.account.record_external_event({
+                    "kind": "view_only_market_update", "symbol": self.identity[0],
+                    "timeframe": self.identity[1],
+                    "reason": "active paper session owns a different symbol/timeframe",
+                })
+            try:
+                quote = self.market.public_usdm_quote(self.identity[0])
+                self.account.apply_funding_once(symbol=self.identity[0],
+                                                funding_time=quote.get("last_funding_time"),
+                                                rate=quote.get("funding_rate") or 0,
+                                                mark_price=quote["mark"])
+                liquidation = self.account.broker.process_mark(self.identity[0], quote["mark"])
+                if liquidation.get("liquidated"):
+                    self.account.record_external_event({"kind": "paper_liquidation", **liquidation})
+            except Exception as exc:
+                self.account.record_external_event({"kind": "funding_or_mark_delayed", "error": str(exc),
+                                                    "symbol": self.identity[0]})
+
+    def live_state(self, symbol: str, timeframe: str, *, visible: int = 500) -> dict:
+        self.ensure(symbol, timeframe)
+        with self._lock:
+            if self.engine is None:
+                raise RuntimeError("Price Action runtime failed to initialize")
+            snapshot = self.stream.snapshot()
+            state = self.engine.visual_state(candle_window=max(50, min(visible, 1500)))
+        quote, connection = snapshot["quote"], snapshot["connection"]
+        if quote.get("bid") is None or quote.get("mark") is None:
+            try:
+                quote = {**quote, **self.market.public_usdm_quote(symbol)}
+            except Exception:
+                pass
+        forming = snapshot["forming"]
+        last = quote.get("last") or (forming.close if forming else (self.engine.bars[-1].close if self.engine.bars else None))
+        state["forming_candle"] = _candle(forming) if forming else None
+        state["live_display"] = {
+            "is_forming": forming is not None, "observed_at": _iso(),
+            "refresh_interval_seconds": 0, "candle_closes_at": (
+                (forming.timestamp + timedelta(milliseconds=TF_MS[timeframe])).isoformat() if forming else None),
+            "last_price": last, "bid": quote.get("bid"), "ask": quote.get("ask"),
+            "mark": quote.get("mark"), "funding_rate": quote.get("funding_rate"),
+            "next_funding_time": quote.get("next_funding_time"),
+            "connection_state": connection["state"],
+            "last_update": connection["last_update"],
+            "new_entries_paused": connection["new_entries_paused"],
+            "execution_uses_closed_bars_only": True,
+        }
+        state["connection"] = connection
+        state["data_provenance"] = {
+            "mode": "LIVE_BINANCE_WEBSOCKET_WITH_REST_RECOVERY",
+            "market_data_mode": "LIVE", "market_data_source": "Binance USDⓈ-M public streams",
+            "exchange": "Binance USDⓈ-M Futures", "symbol": normalize_symbol(symbol),
+            "timeframe": timeframe, "closed_candles_used": len(self.engine.bars),
+            "forming_candle_excluded": forming is not None,
+            "connection_state": connection["state"],
+            "new_entries_paused": connection["new_entries_paused"],
+            "real_execution_allowed": False,
+        }
+        return state
+
+    def replay_step(self, symbol: str, timeframe: str, cursor: int, *, limit: int = 3000) -> dict:
+        symbol = normalize_symbol(symbol)
+        rows = self.market.bars(symbol, timeframe, limit=max(100, min(limit, 10_000)))
+        if not rows:
+            raise RuntimeError("verified cached history is required for replay")
+        reveal = max(1, min(int(cursor), len(rows)))
+        session = self.account.session()
+        owns_replay = (session.get("mode") == "HISTORICAL" and
+                       (session.get("symbol"), session.get("timeframe")) == (symbol, timeframe))
+        prior_cursor = int(session.get("replay_cursor") or 0) if owns_replay else reveal
+        advances_session = owns_replay and reveal >= prior_cursor
+        engine = NativePriceActionEngine(self._engine_config(symbol, timeframe) if owns_replay else
+                                         PriceActionConfig(symbol=symbol, timeframe=timeframe))
+        warm_to = min(prior_cursor, reveal)
+        engine.ingest_closed_bars(rows[:warm_to])
+        rules = self.market.usdm_contract_rules(symbol) if owns_replay else None
+        for row in rows[warm_to:reveal]:
+            engine.process_closed_bar(row)
+            if advances_session:
+                self.account.synchronize_strategy(engine.visual_state(candle_window=3000),
+                                                  contract_rules=rules, candle=row,
+                                                  feed_reliable=True)
+        state = engine.visual_state(candle_window=min(limit, reveal))
+        if advances_session:
+            self.account.set_replay_cursor(reveal, state.get("metrics"))
+        state["replay"] = {"cursor": reveal, "total": len(rows), "future_candles_visible": False,
+                           "has_next": reveal < len(rows), "session_execution_advanced": advances_session,
+                           "rewind_is_view_only": bool(owns_replay and reveal < prior_cursor)}
+        state["data_provenance"] = {
+            "mode": "HISTORICAL_REPLAY", "market_data_mode": "REPLAY",
+            "market_data_source": "verified Binance USDⓈ-M Futures cache",
+            "exchange": "Binance USDⓈ-M Futures", "symbol": symbol, "timeframe": timeframe,
+            "closed_candles_used": reveal, "future_candles_visible": False,
+            "real_execution_allowed": False,
+        }
+        return state
+
+    def stop(self) -> None:
+        self.stream.stop()
