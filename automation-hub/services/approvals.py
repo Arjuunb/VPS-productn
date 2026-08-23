@@ -140,3 +140,9 @@ class ApprovalStore:
     def counts(self) -> dict:
         with self._lock:
             return {"pending": len(self._pending), "recent": len(self._recent)}
+
+    def clear(self) -> None:
+        with self._lock:
+            self._pending.clear()
+            self._recent.clear()
+            self._seq = itertools.count(1)

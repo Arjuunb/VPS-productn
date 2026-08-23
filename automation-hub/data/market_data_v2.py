@@ -428,6 +428,39 @@ class MarketDataService:
             self._perpetuals = (time.time(), pairs)
         return pairs
 
+    def verify_binance_usdm(self) -> dict:
+        """Perform a real Binance USD-M Futures metadata health check.
+
+        Unlike discovery this never uses the UI seed fallback, so callers can
+        distinguish a genuine provider reconnection from an offline catalog.
+        """
+        payload = self._requesters["binance-futures"](
+            _FUTURES_HOSTS[0] + "/fapi/v1/exchangeInfo", {})
+        pairs = sorted({x["symbol"] for x in payload.get("symbols", [])
+                        if x.get("status") == "TRADING" and x.get("quoteAsset") == "USDT"
+                        and x.get("contractType") == "PERPETUAL"})
+        if "BTCUSDT" not in pairs:
+            raise RuntimeError("Binance USD-M Futures returned no active BTCUSDT perpetual")
+        with self._lock:
+            self._perpetuals = (time.time(), pairs)
+        return {"connected": True, "provider": "Binance USD-M Futures",
+                "active_usdt_perpetuals": len(pairs)}
+
+    def clear_cache(self) -> int:
+        root = self.root.resolve()
+        if root == Path(root.anchor):
+            raise RuntimeError("refusing to clear a filesystem root as market cache")
+        removed = 0
+        with self._lock:
+            for candidate in root.rglob("*.sqlite3"):
+                resolved = candidate.resolve()
+                if root not in resolved.parents:
+                    raise RuntimeError("market cache path escaped configured root")
+                resolved.unlink(missing_ok=True)
+                removed += 1
+            self._perpetuals = (0.0, [])
+        return removed
+
     def update(self, symbol: str, timeframe: str = "1h") -> dict:
         """Incremental update. Provider rows are upserted; duplicates cannot accrue."""
         existing = self._rows(symbol, timeframe, limit=1)

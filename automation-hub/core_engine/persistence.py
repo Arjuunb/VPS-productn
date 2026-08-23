@@ -135,6 +135,11 @@ class ShadowDecisionStore:
             rows = self._conn.execute(sql, params).fetchall()
         return [json.loads(row["payload_json"]) for row in rows]
 
+    def clear(self) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM core_v2_shadow_decisions")
+            self._conn.commit()
+
     def summary(self) -> dict[str, Any]:
         """Dashboard-friendly counts and last-observed status per engine."""
         rows = self.latest(limit=200)

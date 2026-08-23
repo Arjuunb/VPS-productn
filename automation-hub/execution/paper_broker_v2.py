@@ -143,6 +143,24 @@ class PaperBrokerV2:
             return [dict(r) for r in self._c.execute(
                 "SELECT * FROM v2_fills ORDER BY timestamp DESC LIMIT ?", (int(limit),))]
 
+    def factory_reset(self, starting_balance: float) -> None:
+        amount = float(starting_balance)
+        if amount <= 0:
+            raise ValueError("starting balance must be positive")
+        with self._lock:
+            try:
+                self._c.execute("BEGIN IMMEDIATE")
+                self._c.execute("DELETE FROM v2_fills")
+                self._c.execute("DELETE FROM v2_orders")
+                self._c.execute("DELETE FROM v2_positions")
+                self._c.execute(
+                    "UPDATE v2_account SET starting_balance=?,balance=?,fees_paid=0,funding_paid=0,updated_at=? WHERE id=1",
+                    (amount, amount, _now()))
+                self._c.commit()
+            except Exception:
+                self._c.rollback()
+                raise
+
     def submit(self, *, symbol: str, side: str, order_type: str, quantity: float,
                limit_price: Optional[float] = None, stop_price: Optional[float] = None,
                trailing_offset: Optional[float] = None, reduce_only: bool = False,

@@ -73,3 +73,7 @@ class ExecutionQuality:
                             "model consistent with measured fills"),
             }
         return out
+
+    def clear(self) -> None:
+        with self._lock:
+            self._records.clear()

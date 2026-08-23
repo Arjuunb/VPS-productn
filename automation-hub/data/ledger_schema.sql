@@ -150,3 +150,17 @@ CREATE TABLE IF NOT EXISTS memory_reviews (
     report      TEXT,                  -- JSON: pattern-recognition report
     UNIQUE(period, period_key)
 );
+
+-- Security audit records deliberately live outside the operational dataset.
+-- Factory Reset clears trading/application state but never this table.
+CREATE TABLE IF NOT EXISTS factory_reset_audit (
+    id              TEXT PRIMARY KEY,
+    requested_at    TEXT NOT NULL,
+    completed_at    TEXT,
+    initiated_by    TEXT NOT NULL,
+    reset_version   TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    duration_ms     INTEGER,
+    preserved_scope TEXT NOT NULL,
+    error           TEXT
+);

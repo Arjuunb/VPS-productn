@@ -98,6 +98,10 @@ class Ledger(Protocol):
     def get_logs(self, limit: int = 200, instance_id: str = "") -> list[dict]: ...
     def add_alert(self, *, severity: str, category: str, title: str, detail: str = "", instance_id: str = "") -> None: ...
     def get_alerts(self, limit: int = 100) -> list[dict]: ...
+    def begin_factory_reset_audit(self, row: dict) -> None: ...
+    def finish_factory_reset_audit(self, reset_id: str, *, status: str,
+                                   duration_ms: int, error: str = "") -> None: ...
+    def factory_reset_application_data(self, reset_id: str, confirmation: str) -> None: ...
 
 
 class SqliteLedger:
@@ -325,6 +329,52 @@ class SqliteLedger:
             self._c.execute("DELETE FROM positions")
             self._c.commit()
 
+    def begin_factory_reset_audit(self, row: dict) -> None:
+        with self._lock:
+            self._c.execute(
+                "INSERT INTO factory_reset_audit"
+                "(id,requested_at,initiated_by,reset_version,status,preserved_scope) "
+                "VALUES (?,?,?,?,?,?)",
+                (row["id"], row["requested_at"], row["initiated_by"],
+                 row["reset_version"], "requested", json.dumps(row["preserved_scope"])))
+            self._c.commit()
+
+    def finish_factory_reset_audit(self, reset_id: str, *, status: str,
+                                   duration_ms: int, error: str = "") -> None:
+        with self._lock:
+            self._c.execute(
+                "UPDATE factory_reset_audit SET completed_at=?,status=?,duration_ms=?,error=? WHERE id=?",
+                (_now(), status, int(duration_ms), error[:2000] or None, reset_id))
+            self._c.commit()
+
+    def factory_reset_application_data(self, reset_id: str, confirmation: str) -> None:
+        """Atomically erase only operational ledger/instance rows.
+
+        Schema and ``factory_reset_audit`` are intentionally outside this
+        allowlist. Authentication is stored elsewhere and cannot be reached.
+        """
+        if confirmation != "FACTORY RESET":
+            raise ValueError("exact factory-reset confirmation is required")
+        tables = (
+            "instance_engine_logs", "instance_metrics", "instance_market_state",
+            "simulation_account_audit", "simulation_sessions", "positions",
+            "paper_trades", "webhook_events", "bot_logs", "alerts",
+            "trade_memories", "memory_reviews", "trading_instances",
+            "trading_instance_platform_settings", "user_settings",
+        )
+        with self._lock:
+            try:
+                self._c.execute("BEGIN IMMEDIATE")
+                existing = {r[0] for r in self._c.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+                for table in tables:
+                    if table in existing:
+                        self._c.execute(f'DELETE FROM "{table}"')
+                self._c.commit()
+            except Exception:
+                self._c.rollback()
+                raise
+
     # ----------------------------------------------------------- logs / alerts
     def log(self, *, level, stage, message, symbol="", instance_id=""):
         with self._lock:
@@ -551,6 +601,25 @@ class SupabaseLedger:
     def get_alerts(self, limit=100):  # pragma: no cover
         return remote_call_with_retry(lambda: self._t("alerts").select("*")
                                       .order("ts", desc=True).limit(limit).execute()).data
+
+    def begin_factory_reset_audit(self, row: dict) -> None:  # pragma: no cover
+        payload = dict(row)
+        payload["status"] = "requested"
+        self._t("factory_reset_audit").insert(payload).execute()
+
+    def finish_factory_reset_audit(self, reset_id: str, *, status: str,
+                                   duration_ms: int, error: str = "") -> None:  # pragma: no cover
+        self._t("factory_reset_audit").update({
+            "completed_at": _now(), "status": status,
+            "duration_ms": int(duration_ms), "error": error[:2000] or None,
+        }).eq("id", reset_id).execute()
+
+    def factory_reset_application_data(self, reset_id: str, confirmation: str) -> None:  # pragma: no cover
+        if confirmation != "FACTORY RESET":
+            raise ValueError("exact factory-reset confirmation is required")
+        self._db.rpc("factory_reset_application_data", {
+            "p_reset_id": reset_id, "p_confirmation": confirmation,
+        }).execute()
 
 
 # Honest Supabase health: get_ledger() records whether Supabase was configured

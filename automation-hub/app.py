@@ -139,6 +139,9 @@ elif settings.admin_key == settings.webhook_secret:
 # always reflect live webhook activity.
 import webhook_api  # noqa: E402
 from webhook_api import router as webhook_router  # noqa: E402
+from services.factory_reset import FactoryResetService  # noqa: E402
+webhook_api.core_v2_store = core_v2_store
+webhook_api.factory_reset_service = FactoryResetService(webhook_api, store, manager)
 _core_v2_mode = _sec_os.environ.get("HUB_CORE_V2_MODE", "off").lower()
 if _core_v2_mode == "shadow":
     webhook_api.engine.core_v2_observer = CoreV2ShadowObserver(core_v2_store)
@@ -261,6 +264,15 @@ def _client_ip(request: Request) -> str:
 @app.middleware("http")
 async def _require_auth(request: Request, call_next):
     path = request.url.path
+    factory_reset_service = getattr(webhook_api, "factory_reset_service", None)
+    if (factory_reset_service is not None and factory_reset_service.in_progress
+            and request.method not in {"GET", "HEAD", "OPTIONS"}
+            and not path.rstrip("/").endswith("/system/factory-reset")):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            {"error": "Factory Reset is in progress; state-changing requests are blocked."},
+            status_code=503,
+        )
     # Same-origin protection for state-changing requests authenticated only by
     # the HttpOnly Supabase bridge cookie. A browser supplies Origin for fetch/
     # form requests; an absent Origin is retained for non-browser API clients.

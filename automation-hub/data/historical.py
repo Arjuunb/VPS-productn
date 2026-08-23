@@ -105,6 +105,14 @@ class HistoricalStore:
             c.close()
         return row[0] if row and row[0] is not None else None
 
+    def clear(self) -> None:
+        c = self._conn()
+        try:
+            c.execute("DELETE FROM candles")
+            c.commit()
+        finally:
+            c.close()
+
 
 # --------------------------------------------------------------- REST fetcher
 def fetch_klines(symbol: str, interval: str, *, limit: int = 1000,

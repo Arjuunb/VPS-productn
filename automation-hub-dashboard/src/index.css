@@ -1062,6 +1062,9 @@ html[data-density="compact"] .data-table th, html[data-density="compact"] .data-
 .settings-protected-action p { margin: 0; color: var(--dim); font-size: 12px; line-height: 1.5; }
 .settings-protected-action > .btn { justify-self: start; }
 .settings-confirm-list { margin: 8px 0 12px; padding-left: 20px; color: var(--text); line-height: 1.65; }
+.settings-danger-zone { margin-top: 28px; border-color: rgba(239,68,68,0.42); background: rgba(239,68,68,0.055); }
+.settings-danger-label { width: max-content; padding: 2px 6px; border: 1px solid rgba(239,68,68,0.35); border-radius: 4px; color: var(--red); font-size: 10px; font-weight: 800; letter-spacing: .09em; text-transform: uppercase; }
+.settings-preserved-list { color: var(--green); }
 .btn:disabled { opacity: 0.6; cursor: default; }
 .bot-info-link { cursor: pointer; }
 .bot-info-link:hover .bot-name-row b { color: var(--purple-2); }

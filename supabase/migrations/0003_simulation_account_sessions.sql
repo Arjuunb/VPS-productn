@@ -67,8 +67,12 @@ BEGIN
  v_next_session_number:=GREATEST(1,v_instance.simulation_session_number+1);
  SELECT COUNT(*) INTO v_open_positions FROM public.positions
   WHERE instance_id=p_instance_id AND status='open';
- SELECT COALESCE(jsonb_object_length(COALESCE(pending_orders_json,'{}'::jsonb)),0)
-  INTO v_pending_orders FROM public.instance_market_state WHERE instance_id=p_instance_id;
+ SELECT COUNT(*) INTO v_pending_orders
+  FROM public.instance_market_state AS market_state
+  CROSS JOIN LATERAL jsonb_object_keys(
+    COALESCE(market_state.pending_orders_json,'{}'::jsonb)
+  ) AS pending_order(key)
+  WHERE market_state.instance_id=p_instance_id;
  v_pending_orders:=COALESCE(v_pending_orders,0);
  SELECT COUNT(*) INTO v_closed_trades FROM public.paper_trades
   WHERE instance_id=p_instance_id AND simulation_session_id=v_previous_session_id AND status='closed';

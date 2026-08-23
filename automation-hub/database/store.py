@@ -89,6 +89,22 @@ class SqliteStore:
             self._conn.execute("DELETE FROM bots WHERE id = ?", (bot_id,))
             self._conn.commit()
 
+    def clear_application_data(self) -> None:
+        """Clear bot configuration/preferences while preserving identity.
+
+        ``users``, auth tokens, TOTP/OAuth identity rows and migrations are
+        deliberately not part of this explicit operational allowlist.
+        """
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                self._conn.execute("DELETE FROM bots")
+                self._conn.execute("DELETE FROM user_settings")
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
     def load_all(self) -> list[Bot]:
         out: list[Bot] = []
         for r in self._conn.execute("SELECT * FROM bots ORDER BY created_at"):

@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -6,6 +7,18 @@ from data.journal_store import JournalStore
 from data.ledger import SqliteLedger
 from execution.paper_engine import PaperExecutionEngine
 from services.trading_instances import InstanceLedger, TradingInstanceManager
+
+
+@pytest.mark.parametrize("relative_path", [
+    "automation-hub/data/trading_instances_schema.sql",
+    "supabase/migrations/0003_simulation_account_sessions.sql",
+])
+def test_remote_restart_schema_uses_supported_jsonb_pending_order_count(relative_path):
+    repository_root = Path(__file__).resolve().parents[2]
+    sql = (repository_root / relative_path).read_text()
+
+    assert "jsonb_object_length" not in sql
+    assert "jsonb_object_keys" in sql
 
 
 def _factory(_key, symbol):

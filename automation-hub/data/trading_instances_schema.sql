@@ -268,8 +268,12 @@ BEGIN
  v_next_session_number := GREATEST(1, v_instance.simulation_session_number + 1);
  SELECT COUNT(*) INTO v_open_positions FROM positions
   WHERE instance_id=p_instance_id AND status='open';
- SELECT COALESCE(jsonb_object_length(COALESCE(pending_orders_json,'{}'::jsonb)),0)
-  INTO v_pending_orders FROM instance_market_state WHERE instance_id=p_instance_id;
+ SELECT COUNT(*) INTO v_pending_orders
+  FROM instance_market_state AS market_state
+  CROSS JOIN LATERAL jsonb_object_keys(
+    COALESCE(market_state.pending_orders_json,'{}'::jsonb)
+  ) AS pending_order(key)
+  WHERE market_state.instance_id=p_instance_id;
  v_pending_orders := COALESCE(v_pending_orders,0);
  SELECT COUNT(*) INTO v_closed_trades FROM paper_trades
   WHERE instance_id=p_instance_id AND simulation_session_id=v_previous_session_id AND status='closed';
@@ -315,6 +319,51 @@ $$;
 REVOKE ALL ON FUNCTION public.restart_simulation_account(TEXT,TEXT,DOUBLE PRECISION,TEXT,TIMESTAMPTZ)
  FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.restart_simulation_account(TEXT,TEXT,DOUBLE PRECISION,TEXT,TIMESTAMPTZ)
+ TO service_role;
+
+-- Factory Reset audit is deliberately outside the operational deletion set.
+CREATE TABLE IF NOT EXISTS public.factory_reset_audit (
+ id TEXT PRIMARY KEY, requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+ completed_at TIMESTAMPTZ, initiated_by TEXT NOT NULL, reset_version TEXT NOT NULL,
+ status TEXT NOT NULL CHECK (status IN ('requested','succeeded','failed')),
+ duration_ms BIGINT, preserved_scope JSONB NOT NULL DEFAULT '{}'::jsonb, error TEXT
+);
+ALTER TABLE public.factory_reset_audit ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON TABLE public.factory_reset_audit FROM PUBLIC, anon, authenticated;
+GRANT SELECT, INSERT, UPDATE ON TABLE public.factory_reset_audit TO service_role;
+
+CREATE OR REPLACE FUNCTION public.factory_reset_application_data(
+ p_reset_id TEXT, p_confirmation TEXT
+) RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path=public,pg_temp AS $$
+BEGIN
+ IF p_confirmation IS DISTINCT FROM 'FACTORY RESET' THEN
+   RAISE EXCEPTION 'exact factory-reset confirmation is required';
+ END IF;
+ IF NOT EXISTS (SELECT 1 FROM public.factory_reset_audit
+                WHERE id=p_reset_id AND status='requested') THEN
+   RAISE EXCEPTION 'factory-reset audit request does not exist';
+ END IF;
+ DELETE FROM public.instance_engine_logs;
+ DELETE FROM public.instance_metrics;
+ DELETE FROM public.instance_market_state;
+ DELETE FROM public.simulation_account_audit;
+ DELETE FROM public.positions;
+ DELETE FROM public.paper_trades;
+ DELETE FROM public.simulation_sessions;
+ DELETE FROM public.webhook_events;
+ DELETE FROM public.bot_logs;
+ DELETE FROM public.alerts;
+ DELETE FROM public.trade_memories;
+ DELETE FROM public.memory_reviews;
+ DELETE FROM public.trading_instances;
+ DELETE FROM public.trading_instance_platform_settings;
+ DELETE FROM public.user_settings;
+ RETURN jsonb_build_object('ok',TRUE,'reset_id',p_reset_id);
+END;
+$$;
+REVOKE ALL ON FUNCTION public.factory_reset_application_data(TEXT,TEXT)
+ FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.factory_reset_application_data(TEXT,TEXT)
  TO service_role;
 
 -- Make newly created/altered relations visible to the REST API immediately.
