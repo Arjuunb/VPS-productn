@@ -76,7 +76,7 @@ class Ledger(Protocol):
     def open_position(self, *, symbol: str, side: str, size: float, entry: float,
                       stop: Optional[float], target: Optional[float] = None,
                       management: Optional[dict] = None,
-                      instance_id: str = "") -> str: ...
+                      instance_id: str = "", simulation_session_id: str = "") -> str: ...
     def update_position_management(self, *, symbol: str,
                                    stop: Optional[float] = None,
                                    target: Optional[float] = None,
@@ -84,14 +84,15 @@ class Ledger(Protocol):
                                    instance_id: str = "") -> int: ...
     def close_position(self, position_id: str, *, exit_price: float, pnl: float,
                        instance_id: str = "") -> int: ...
-    def get_positions(self, status: Optional[str] = None, instance_id: str = "") -> list[dict]: ...
+    def get_positions(self, status: Optional[str] = None, instance_id: str = "",
+                      simulation_session_id: str = "") -> list[dict]: ...
     def record_paper_trade(self, trade: dict) -> str: ...
     def close_paper_trade(self, trade_id: str, *, exit_price: float, pnl: float, rr: float,
                           size: float | None = None, fees: float = 0.0,
                           realized_pnl: float | None = None,
                           equity_after_close: float | None = None,
                           instance_id: str = "") -> int: ...
-    def get_paper_trades(self, instance_id: str = "") -> list[dict]: ...
+    def get_paper_trades(self, instance_id: str = "", simulation_session_id: str = "") -> list[dict]: ...
     # logs / alerts
     def log(self, *, level: str, stage: str, message: str, symbol: str = "", instance_id: str = "") -> None: ...
     def get_logs(self, limit: int = 200, instance_id: str = "") -> list[dict]: ...
@@ -137,6 +138,8 @@ class SqliteLedger:
                 ensure_column(self._c, "paper_trades", _name, _definition)
             for _t in ("webhook_events", "positions", "paper_trades", "bot_logs", "alerts"):
                 ensure_column(self._c, _t, "instance_id")
+            ensure_column(self._c, "positions", "simulation_session_id")
+            ensure_column(self._c, "paper_trades", "simulation_session_id")
             ensure_column(self._c, "positions", "target", "REAL")
             ensure_column(self._c, "positions", "management_json", "TEXT NOT NULL DEFAULT '{}'")
             ensure_column(self._c, "paper_trades", "target", "REAL")
@@ -183,14 +186,15 @@ class SqliteLedger:
 
     # ----------------------------------------------------------- positions
     def open_position(self, *, symbol, side, size, entry, stop, target=None,
-                      management=None, instance_id=""):
+                      management=None, instance_id="", simulation_session_id=""):
         pid = _id()
         with self._lock:
             self._c.execute(
-                "INSERT INTO positions(id,symbol,side,size,entry,stop,target,management_json,status,pnl,opened_at,instance_id)"
-                " VALUES (?,?,?,?,?,?,?,?, 'open', 0, ?,?)",
+                "INSERT INTO positions(id,symbol,side,size,entry,stop,target,management_json,status,pnl,opened_at,instance_id,simulation_session_id)"
+                " VALUES (?,?,?,?,?,?,?,?, 'open', 0, ?,?,?)",
                 (pid, symbol, side, size, entry, stop, target,
-                 json.dumps(management or {}, separators=(",", ":")), _now(), instance_id))
+                 json.dumps(management or {}, separators=(",", ":")), _now(), instance_id,
+                 simulation_session_id))
             self._c.commit()
         return pid
 
@@ -205,7 +209,7 @@ class SqliteLedger:
             self._c.commit()
             return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
-    def get_positions(self, status=None, instance_id=""):
+    def get_positions(self, status=None, instance_id="", simulation_session_id=""):
         q = "SELECT * FROM positions"
         where, args = [], []
         if status:
@@ -214,6 +218,9 @@ class SqliteLedger:
         if instance_id:
             where.append("instance_id=?")
             args.append(instance_id)
+        if simulation_session_id:
+            where.append("simulation_session_id=?")
+            args.append(simulation_session_id)
         if where:
             q += " WHERE " + " AND ".join(where)
         q += " ORDER BY opened_at DESC"
@@ -256,12 +263,13 @@ class SqliteLedger:
         with self._lock:
             self._c.execute(
                 "INSERT INTO paper_trades(id,alert_id,symbol,side,size,entry,stop,target,status,"
-                "opened_at,strategy_id,instance_id,sizing_mode,sizing_engine_version,"
+                "opened_at,strategy_id,instance_id,simulation_session_id,sizing_mode,sizing_engine_version,"
                 "risk_basis_at_entry,risk_pct_at_entry,risk_amount_at_entry,equity_before_trade,fees) "
-                "VALUES (?,?,?,?,?,?,?,?, 'open', ?,?,?,?,?,?,?,?,?,0)",
+                "VALUES (?,?,?,?,?,?,?,?, 'open', ?,?,?,?,?,?,?,?,?,?,0)",
                 (tid, trade.get("alert_id"), trade["symbol"], trade["side"], trade["size"],
                  trade["entry"], trade.get("stop"), trade.get("target"), _now(),
                  trade.get("strategy_id") or "", trade.get("instance_id") or "",
+                 trade.get("simulation_session_id") or "",
                  trade.get("sizing_mode"), trade.get("sizing_engine_version"),
                  trade.get("risk_basis_at_entry"), trade.get("risk_pct_at_entry"),
                  trade.get("risk_amount_at_entry"), trade.get("equity_before_trade")))
@@ -294,12 +302,17 @@ class SqliteLedger:
             self._c.commit()
             return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
-    def get_paper_trades(self, instance_id=""):
+    def get_paper_trades(self, instance_id="", simulation_session_id=""):
         query = "SELECT * FROM paper_trades"
-        args: tuple = ()
+        where, args = [], []
         if instance_id:
-            query += " WHERE instance_id=?"
-            args = (instance_id,)
+            where.append("instance_id=?")
+            args.append(instance_id)
+        if simulation_session_id:
+            where.append("simulation_session_id=?")
+            args.append(simulation_session_id)
+        if where:
+            query += " WHERE " + " AND ".join(where)
         query += " ORDER BY opened_at DESC"
         with self._lock:
             return [dict(r) for r in self._c.execute(query, args)]
@@ -415,7 +428,7 @@ class SupabaseLedger:
         return rows
 
     def open_position(self, *, symbol, side, size, entry, stop, target=None,
-                      management=None, instance_id=""):  # pragma: no cover
+                      management=None, instance_id="", simulation_session_id=""):  # pragma: no cover
         pid = _id()
         row = {
             "id": pid, "symbol": symbol, "side": side, "size": size, "entry": entry,
@@ -423,6 +436,8 @@ class SupabaseLedger:
             "status": "open", "pnl": 0, "opened_at": _now()}
         if instance_id:
             row["instance_id"] = instance_id
+        if simulation_session_id:
+            row["simulation_session_id"] = simulation_session_id
         self._t("positions").insert(row).execute()
         return pid
 
@@ -434,13 +449,15 @@ class SupabaseLedger:
         result = q.execute()
         return len(result.data or [])
 
-    def get_positions(self, status=None, instance_id=""):  # pragma: no cover
+    def get_positions(self, status=None, instance_id="", simulation_session_id=""):  # pragma: no cover
         def query():
             q = self._t("positions").select("*")
             if status:
                 q = q.eq("status", status)
             if instance_id:
                 q = q.eq("instance_id", instance_id)
+            if simulation_session_id:
+                q = q.eq("simulation_session_id", simulation_session_id)
             return q.order("opened_at", desc=True).execute()
         return remote_call_with_retry(query).data
 
@@ -476,6 +493,8 @@ class SupabaseLedger:
             row["strategy_id"] = trade["strategy_id"]
         if trade.get("instance_id"):
             row["instance_id"] = trade["instance_id"]
+        if trade.get("simulation_session_id"):
+            row["simulation_session_id"] = trade["simulation_session_id"]
         for key in ("sizing_mode", "sizing_engine_version", "risk_basis_at_entry",
                     "risk_pct_at_entry", "risk_amount_at_entry", "equity_before_trade"):
             if trade.get(key) is not None:
@@ -497,11 +516,13 @@ class SupabaseLedger:
         result = q.execute()
         return len(result.data or [])
 
-    def get_paper_trades(self, instance_id=""):  # pragma: no cover
+    def get_paper_trades(self, instance_id="", simulation_session_id=""):  # pragma: no cover
         def query():
             q = self._t("paper_trades").select("*")
             if instance_id:
                 q = q.eq("instance_id", instance_id)
+            if simulation_session_id:
+                q = q.eq("simulation_session_id", simulation_session_id)
             return q.order("opened_at", desc=True).execute()
         return remote_call_with_retry(query).data
 

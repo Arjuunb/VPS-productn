@@ -318,6 +318,7 @@ def test_instance_worker_wires_journal_memory_and_server_owned_provenance(monkey
     assert pipeline.trade_memory is memory
     assert pipeline.journal_context == {
         "instance_id": instance.id,
+        "simulation_session_id": instance.simulation_session_id,
         "instance_name": f"ETHUSDT Supertrend 15m #{instance.id[:6].upper()}",
         "strategy_id": "supertrend",
         "strategy_name": "Supertrend",

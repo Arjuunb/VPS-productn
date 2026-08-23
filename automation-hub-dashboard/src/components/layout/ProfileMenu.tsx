@@ -149,10 +149,14 @@ export default function ProfileMenu() {
       <button ref={triggerRef} type="button" className={`profile pm-trigger ${open ? "open" : ""}`}
               aria-haspopup="menu" aria-expanded={open} aria-label="Account menu"
               onClick={() => setOpen((v) => !v)}>
-        <Avatar profile={profile} username={username} size={34} />
+        <Avatar profile={profile} username={username} size={30} />
         <div className="profile-meta">
-          <b>{profile.name || "Paper Account"}</b>
-          <span className="dim">Simulation</span>
+          <b className="profile-name">{profile.name || "Paper Account"}</b>
+          <span className="profile-environment">
+            <span className="profile-mode">PAPER</span>
+            <span className="profile-environment-separator" aria-hidden="true">·</span>
+            <span className="profile-environment-label">Simulation</span>
+          </span>
         </div>
       </button>
 

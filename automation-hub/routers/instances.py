@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import importlib
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 from typing import Optional
 
@@ -82,6 +82,10 @@ class PlatformConfig(BaseModel):
     default_fill_model: Optional[str] = None
 
 
+class SimulationAccountRestart(BaseModel):
+    confirm: bool = False
+
+
 def _field_error(field: str, message: str, status: int = 422):
     raise HTTPException(status, detail={"field": field, "message": message})
 
@@ -98,6 +102,18 @@ def _manager():
     if not manager.store.available:
         raise HTTPException(503, manager.store.error)
     return manager
+
+
+def _initiated_by(request: Request) -> str:
+    """Return authenticated identity without logging credentials."""
+    try:
+        app_module = importlib.import_module("app")
+        identity = app_module._user(request)
+        if identity:
+            return str(identity)
+    except Exception:  # pragma: no cover - defensive for direct router consumers
+        pass
+    return "control-credential operator"
 
 
 @router.get("/instances/options")
@@ -360,6 +376,34 @@ def update_instance(instance_id: str, body: InstanceUpdate,
     except KeyError: raise HTTPException(404, "Trading instance not found")
     except ValueError as exc: raise HTTPException(409, str(exc))
     except RuntimeError as exc: raise HTTPException(503, str(exc))
+
+
+@router.post("/instances/{instance_id}/simulation-account/restart")
+def restart_simulation_account(instance_id: str, body: SimulationAccountRestart,
+                               request: Request,
+                               x_webhook_secret: Optional[str] = Header(default=None)):
+    _wa._check_secret(x_webhook_secret)
+    if not body.confirm:
+        raise HTTPException(400, "Explicit confirmation is required to restart a simulation account")
+    try:
+        return _manager().restart_simulation_account(
+            instance_id, initiated_by=_initiated_by(request))
+    except KeyError:
+        raise HTTPException(404, "Trading instance not found")
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc))
+
+
+@router.get("/instances/{instance_id}/simulation-sessions")
+def simulation_sessions(instance_id: str):
+    manager = _manager()
+    try:
+        manager.status(instance_id)
+    except KeyError:
+        raise HTTPException(404, "Trading instance not found")
+    return {"sessions": manager.store.simulation_sessions(instance_id)}
 
 
 @router.post("/instances/{instance_id}/{action}")

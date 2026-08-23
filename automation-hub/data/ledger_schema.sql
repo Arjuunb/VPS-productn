@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS positions (
     status     TEXT NOT NULL,          -- open | closed
     pnl        REAL DEFAULT 0,
     opened_at  TEXT NOT NULL,
-    closed_at  TEXT
+    closed_at  TEXT,
+    simulation_session_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
 
@@ -56,7 +57,8 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     status     TEXT NOT NULL,          -- open | closed
     source     TEXT NOT NULL DEFAULT 'paper',   -- paper | backtest | live (dataset separation)
     opened_at  TEXT NOT NULL,
-    closed_at  TEXT
+    closed_at  TEXT,
+    simulation_session_id TEXT
 );
 -- H-5: paper_trades is scanned ~10x per signal (PnL / streak / Kelly / curve);
 -- index the columns those queries filter/order on.

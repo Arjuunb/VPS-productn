@@ -293,6 +293,28 @@ class AutoStrategyEngine:
         self.ledger.log(level="info", stage="engine", message=f"Autonomous engine stopped: {reason}")
         return True
 
+    def flush_runtime_state(self) -> dict:
+        """Persist every recoverable execution checkpoint before replacement.
+
+        Transient worker state is intentionally not serialised: a full reboot
+        must rebuild caches, candle buffers, timers and error counters from a
+        fresh engine object. Pending orders, the candle cursor and managed
+        position protection are durable execution state and therefore must be
+        flushed before that object is discarded.
+        """
+        self._checkpoint_pending_orders()
+        if self.last_processed_candle and self._candle_checkpoint is not None:
+            self._checkpoint_candle(self.last_processed_candle)
+        with self._adjust_lock:
+            managed = list(self._managed.items())
+        for symbol, trade in managed:
+            self._checkpoint_managed(symbol, trade)
+        return {
+            "pending_orders": len(self._pending),
+            "managed_positions": len(managed),
+            "last_processed_candle_timestamp": self.last_processed_candle,
+        }
+
     def restart(self) -> bool:
         """Restart the worker without changing its strategy/risk configuration."""
         self.stop("Restart requested by operator")
@@ -1125,6 +1147,13 @@ class AutoStrategyEngine:
                 print(f"[explain] cycle report failed for {sym}: {type(e).__name__}: {e}")
 
     def _check_pending(self, sym: str, bar) -> bool:
+        # A paused/rebooting worker may keep consuming market data so open
+        # positions remain observable, but a persisted pending order must not
+        # age, disappear or fill while the execution gate is closed. It will be
+        # reconciled and monitored again after the gate is explicitly resumed.
+        controls = getattr(self.pipeline, "controls", None)
+        if controls is not None and not controls.trading_allowed():
+            return False
         po = self._pending.get(sym)
         if po is None:
             return False
@@ -1586,6 +1615,16 @@ class AutoStrategyEngine:
                          + f" — idea #{idea['id']}"))
             return {"kind": "queued" if self.trading_mode == "semi" else "signal",
                     "idea": idea, "decision": decision, "verdict": v}
+        controls = getattr(self.pipeline, "controls", None)
+        if pos is None and controls is not None and not controls.trading_allowed():
+            # Do not create a fresh resting order behind a paused/reboot gate.
+            # Route once through the pipeline so the blocked decision remains
+            # explainable, but keep both durable and in-memory order books
+            # unchanged until an operator/health check reopens execution.
+            result = self._route(payload)
+            return {"kind": "rejected", "stage": "controls",
+                    "reason": getattr(result, "reason", "Trading paused — entry blocked"),
+                    "decision": decision, "verdict": v}
         if self.entry_mode == "limit" and pos is None and signal.stop_loss:
             self._pending[sym] = {"side": side, "price": signal.entry,
                                   "target": signal.take_profit,

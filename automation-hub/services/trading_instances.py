@@ -11,6 +11,7 @@ import os
 import inspect
 import math
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -48,6 +49,9 @@ _ACTIVE_INSTANCE_STATES = {
     "data_stale", "recovering",
 }
 
+_REBOOT_RUNNING = "running"
+_REBOOT_TERMINAL = {"completed", "degraded", "failed"}
+
 
 def _age_seconds(value: object) -> Optional[int]:
     if not value:
@@ -76,13 +80,13 @@ def _market_health(market: dict, *, timeframe: str, worker_state: str) -> dict:
     age = max(0, raw_age - interval) if raw_age is not None else None
     out["market_data_age_seconds"] = age
     raw = str(out.get("market_data_status") or "").lower()
-    if worker_state in ("error",) or raw == "error":
+    if worker_state in ("error", "degraded") or raw == "error":
         state = "error"
     elif worker_state == "created":
         state = "stopped"
     elif worker_state in ("stopped",) and raw not in ("healthy", "stale", "disconnected"):
         state = "stopped"
-    elif worker_state in ("starting", "bootstrapping", "warming", "syncing", "ready") or raw in ("warming_up", "bootstrapping", "warming", "syncing"):
+    elif worker_state in ("starting", "bootstrapping", "warming", "syncing", "ready", "rebooting") or raw in ("warming_up", "bootstrapping", "warming", "syncing"):
         state = "warming_up"
     elif age is None:
         state = "error" if raw in ("failed", "error") else "disconnected"
@@ -124,6 +128,8 @@ class TradingInstance:
     entry_mode: str = "limit"
     fill_model: str = "RealisticFill"
     execution_mode: str = "paper"
+    simulation_session_id: str = ""
+    simulation_session_number: int = 0
     mode: str = "trading"              # trading | research (paper only)
     # Trading instances are always forward paper. Research remains the only
     # instance mode allowed to consume a historical replay.
@@ -142,8 +148,9 @@ class TradingInstance:
 
 class InstanceLedger:
     """Tag every record and constrain every read to one instance."""
-    def __init__(self, ledger: Ledger, instance_id: str):
+    def __init__(self, ledger: Ledger, instance_id: str, simulation_session_id: str = ""):
         self._ledger, self.instance_id = ledger, instance_id
+        self.simulation_session_id = simulation_session_id
 
     def __getattr__(self, name):
         return getattr(self._ledger, name)
@@ -160,10 +167,14 @@ class InstanceLedger:
                 if e.get("instance_id") == self.instance_id][:limit]
 
     def open_position(self, **kw):
-        return self._ledger.open_position(**kw, instance_id=self.instance_id)
+        return self._ledger.open_position(
+            **kw, instance_id=self.instance_id,
+            simulation_session_id=self.simulation_session_id)
 
     def get_positions(self, status=None):
-        return self._ledger.get_positions(status, instance_id=self.instance_id)
+        return self._ledger.get_positions(
+            status, instance_id=self.instance_id,
+            simulation_session_id=self.simulation_session_id)
 
     def update_position_stop(self, *, symbol, stop):
         return self._ledger.update_position_stop(symbol=symbol, stop=stop, instance_id=self.instance_id)
@@ -179,10 +190,13 @@ class InstanceLedger:
 
     def record_paper_trade(self, trade):
         row = dict(trade); row["instance_id"] = self.instance_id
+        row["simulation_session_id"] = self.simulation_session_id
         return self._ledger.record_paper_trade(row)
 
     def get_paper_trades(self):
-        return self._ledger.get_paper_trades(instance_id=self.instance_id)
+        return self._ledger.get_paper_trades(
+            instance_id=self.instance_id,
+            simulation_session_id=self.simulation_session_id)
 
     def close_paper_trade(self, trade_id, **kw):
         return self._ledger.close_paper_trade(trade_id, **kw, instance_id=self.instance_id)
@@ -227,6 +241,7 @@ CREATE TABLE IF NOT EXISTS trading_instances (
  current_realized_equity REAL, risk_basis REAL, sizing_engine_version TEXT NOT NULL DEFAULT 'v2',
  entry_mode TEXT NOT NULL DEFAULT 'limit', fill_model TEXT NOT NULL DEFAULT 'RealisticFill',
  execution_mode TEXT NOT NULL DEFAULT 'paper',
+ simulation_session_id TEXT NOT NULL DEFAULT '', simulation_session_number INTEGER NOT NULL DEFAULT 0,
  mode TEXT NOT NULL, market_data_mode TEXT NOT NULL DEFAULT 'paper_forward', state TEXT NOT NULL, desired_running INTEGER NOT NULL DEFAULT 0,
  created_at TEXT NOT NULL, started_at TEXT, stopped_at TEXT, updated_at TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT ''
 );
@@ -243,6 +258,21 @@ CREATE TABLE IF NOT EXISTS instance_market_state (
  duplicate_candles INTEGER NOT NULL DEFAULT 0, missing_candles INTEGER NOT NULL DEFAULT 0,
  out_of_order_candles INTEGER NOT NULL DEFAULT 0,
  pending_orders_json TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS simulation_sessions (
+ id TEXT PRIMARY KEY, instance_id TEXT NOT NULL, session_number INTEGER NOT NULL,
+ starting_balance REAL NOT NULL, ending_balance REAL, realized_pnl REAL NOT NULL DEFAULT 0,
+ trades_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL,
+ started_at TEXT NOT NULL, ended_at TEXT, end_reason TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_simulation_session_number
+ ON simulation_sessions(instance_id, session_number);
+CREATE TABLE IF NOT EXISTS simulation_account_audit (
+ id TEXT PRIMARY KEY, action TEXT NOT NULL, instance_id TEXT NOT NULL,
+ previous_session_id TEXT, new_session_id TEXT NOT NULL,
+ previous_balance REAL NOT NULL, new_balance REAL NOT NULL,
+ open_positions_cleared INTEGER NOT NULL, pending_orders_cleared INTEGER NOT NULL,
+ timestamp TEXT NOT NULL, initiated_by TEXT NOT NULL, result TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS trading_instance_platform_settings (
  id TEXT PRIMARY KEY, max_active_slots INTEGER NOT NULL DEFAULT 1,
@@ -268,8 +298,9 @@ class InstanceStore:
             "id", "instance_id", "target", "sizing_mode", "sizing_engine_version",
             "risk_basis_at_entry", "risk_pct_at_entry", "risk_amount_at_entry",
             "equity_before_trade", "equity_after_close", "fees", "realized_pnl",
+            "simulation_session_id",
         ),
-        "positions": ("id", "instance_id", "target", "management_json"),
+        "positions": ("id", "instance_id", "target", "management_json", "simulation_session_id"),
         "trading_instances": (
             "id", "symbol", "strategy_key", "strategy_label", "strategy_version",
             "timeframe", "risk_per_trade_pct", "capital_allocation", "exchange",
@@ -277,7 +308,8 @@ class InstanceStore:
             "sizing_mode", "fixed_position_size", "fixed_quantity", "profit_reinvestment",
             "maximum_risk_amount", "minimum_equity", "starting_equity",
             "current_realized_equity", "risk_basis", "sizing_engine_version", "entry_mode", "fill_model",
-            "execution_mode", "mode", "market_data_mode", "state", "desired_running",
+            "execution_mode", "simulation_session_id", "simulation_session_number",
+            "mode", "market_data_mode", "state", "desired_running",
             "created_at", "started_at", "stopped_at", "updated_at", "last_error",
         ),
         "instance_market_state": (
@@ -288,6 +320,15 @@ class InstanceStore:
         ),
         "instance_metrics": ("instance_id", "data_json", "updated_at"),
         "instance_engine_logs": ("id", "instance_id", "ts", "level", "message"),
+        "simulation_sessions": (
+            "id", "instance_id", "session_number", "starting_balance", "ending_balance",
+            "realized_pnl", "trades_count", "status", "started_at", "ended_at", "end_reason",
+        ),
+        "simulation_account_audit": (
+            "id", "action", "instance_id", "previous_session_id", "new_session_id",
+            "previous_balance", "new_balance", "open_positions_cleared",
+            "pending_orders_cleared", "timestamp", "initiated_by", "result",
+        ),
         "trading_instance_platform_settings": (
             "id", "max_active_slots", "max_global_risk_pct",
             "max_global_daily_loss_pct", "max_instance_risk_per_trade_pct",
@@ -326,6 +367,8 @@ class InstanceStore:
                     ("entry_mode", "TEXT NOT NULL DEFAULT 'limit'"),
                     ("fill_model", "TEXT NOT NULL DEFAULT 'RealisticFill'"),
                     ("execution_mode", "TEXT NOT NULL DEFAULT 'paper'"),
+                    ("simulation_session_id", "TEXT NOT NULL DEFAULT ''"),
+                    ("simulation_session_number", "INTEGER NOT NULL DEFAULT 0"),
                     ("max_open_positions", "INTEGER NOT NULL DEFAULT 3"),
                     ("started_at", "TEXT"),
                     ("stopped_at", "TEXT"),
@@ -395,19 +438,185 @@ class InstanceStore:
         else:
             with self.ledger._lock:
                 self.ledger._c.execute("""INSERT INTO trading_instances
-                (id,symbol,strategy_key,strategy_label,strategy_version,timeframe,risk_per_trade_pct,capital_allocation,exchange,instrument_type,max_open_positions,sizing_mode,fixed_position_size,fixed_quantity,profit_reinvestment,maximum_risk_amount,minimum_equity,starting_equity,current_realized_equity,risk_basis,sizing_engine_version,entry_mode,fill_model,execution_mode,mode,market_data_mode,state,desired_running,created_at,started_at,stopped_at,updated_at,last_error)
-                VALUES (:id,:symbol,:strategy_key,:strategy_label,:strategy_version,:timeframe,:risk_per_trade_pct,:capital_allocation,:exchange,:instrument_type,:max_open_positions,:sizing_mode,:fixed_position_size,:fixed_quantity,:profit_reinvestment,:maximum_risk_amount,:minimum_equity,:starting_equity,:current_realized_equity,:risk_basis,:sizing_engine_version,:entry_mode,:fill_model,:execution_mode,:mode,:market_data_mode,:state,:desired_running,:created_at,:started_at,:stopped_at,:updated_at,:last_error)""", row)
+                (id,symbol,strategy_key,strategy_label,strategy_version,timeframe,risk_per_trade_pct,capital_allocation,exchange,instrument_type,max_open_positions,sizing_mode,fixed_position_size,fixed_quantity,profit_reinvestment,maximum_risk_amount,minimum_equity,starting_equity,current_realized_equity,risk_basis,sizing_engine_version,entry_mode,fill_model,execution_mode,simulation_session_id,simulation_session_number,mode,market_data_mode,state,desired_running,created_at,started_at,stopped_at,updated_at,last_error)
+                VALUES (:id,:symbol,:strategy_key,:strategy_label,:strategy_version,:timeframe,:risk_per_trade_pct,:capital_allocation,:exchange,:instrument_type,:max_open_positions,:sizing_mode,:fixed_position_size,:fixed_quantity,:profit_reinvestment,:maximum_risk_amount,:minimum_equity,:starting_equity,:current_realized_equity,:risk_basis,:sizing_engine_version,:entry_mode,:fill_model,:execution_mode,:simulation_session_id,:simulation_session_number,:mode,:market_data_mode,:state,:desired_running,:created_at,:started_at,:stopped_at,:updated_at,:last_error)""", row)
                 self.ledger._c.commit()
 
-    def delete(self, instance_id: str) -> None:
+    def ensure_simulation_session(self, instance: TradingInstance) -> None:
+        """Backfill one active session for pre-session Trading Instances."""
+        if instance.simulation_session_id and instance.simulation_session_number > 0:
+            return
+        session_id = _id()
+        row = {
+            "id": session_id, "instance_id": instance.id, "session_number": 1,
+            "starting_balance": instance.starting_equity,
+            "ending_balance": None, "realized_pnl": 0.0, "trades_count": 0,
+            "status": "active", "started_at": instance.created_at,
+            "ended_at": None, "end_reason": None,
+        }
+        if self.remote:
+            remote_call_with_retry(lambda: self._table("simulation_sessions").insert(row).execute())
+            remote_call_with_retry(lambda: self._table("paper_trades").update(
+                {"simulation_session_id": session_id}).eq("instance_id", instance.id)
+                .eq("simulation_session_id", "").execute())
+            remote_call_with_retry(lambda: self._table("positions").update(
+                {"simulation_session_id": session_id}).eq("instance_id", instance.id)
+                .eq("simulation_session_id", "").execute())
+        else:
+            with self.ledger._lock:
+                self.ledger._c.execute("""INSERT INTO simulation_sessions
+                    (id,instance_id,session_number,starting_balance,ending_balance,realized_pnl,
+                     trades_count,status,started_at,ended_at,end_reason)
+                    VALUES (:id,:instance_id,:session_number,:starting_balance,:ending_balance,
+                            :realized_pnl,:trades_count,:status,:started_at,:ended_at,:end_reason)""", row)
+                self.ledger._c.execute(
+                    "UPDATE paper_trades SET simulation_session_id=? WHERE instance_id=? AND COALESCE(simulation_session_id,'')=''",
+                    (session_id, instance.id))
+                self.ledger._c.execute(
+                    "UPDATE positions SET simulation_session_id=? WHERE instance_id=? AND COALESCE(simulation_session_id,'')=''",
+                    (session_id, instance.id))
+                self.ledger._c.commit()
+        instance.simulation_session_id = session_id
+        instance.simulation_session_number = 1
+        self.save(instance)
+
+    def simulation_session(self, session_id: str) -> dict | None:
+        if not session_id:
+            return None
+        if self.remote:
+            rows = remote_call_with_retry(lambda: self._table("simulation_sessions")
+                                          .select("*").eq("id", session_id).limit(1).execute()).data
+            return dict(rows[0]) if rows else None
+        with self.ledger._lock:
+            row = self.ledger._c.execute(
+                "SELECT * FROM simulation_sessions WHERE id=?", (session_id,)).fetchone()
+        return dict(row) if row else None
+
+    def simulation_sessions(self, instance_id: str) -> list[dict]:
+        if self.remote:
+            return list(remote_call_with_retry(lambda: self._table("simulation_sessions")
+                                               .select("*").eq("instance_id", instance_id)
+                                               .order("session_number", desc=True).execute()).data)
+        with self.ledger._lock:
+            return [dict(row) for row in self.ledger._c.execute(
+                "SELECT * FROM simulation_sessions WHERE instance_id=? ORDER BY session_number DESC",
+                (instance_id,))]
+
+    def restart_simulation_account(self, instance: TradingInstance, *, previous_balance: float,
+                                   initiated_by: str) -> dict:
+        """Atomically end one paper session and create its clean successor."""
+        timestamp, new_session_id = _now(), _id()
+        if self.remote:
+            result = remote_call_with_retry(lambda: self.ledger._db.rpc(
+                "restart_simulation_account", {
+                    "p_instance_id": instance.id,
+                    "p_new_session_id": new_session_id,
+                    "p_previous_balance": float(previous_balance),
+                    "p_initiated_by": initiated_by,
+                    "p_timestamp": timestamp,
+                }).execute())
+            payload = result.data
+            if isinstance(payload, list):
+                payload = payload[0] if payload else {}
+            if not isinstance(payload, dict):
+                raise RuntimeError("Simulation account restart returned an invalid persistence result")
+            return payload
+
+        with self.ledger._lock:
+            db = self.ledger._c
+            try:
+                open_positions = int(db.execute(
+                    "SELECT COUNT(*) FROM positions WHERE instance_id=? AND status='open'",
+                    (instance.id,)).fetchone()[0])
+                market_row = db.execute(
+                    "SELECT pending_orders_json FROM instance_market_state WHERE instance_id=?",
+                    (instance.id,)).fetchone()
+                try:
+                    pending_orders = json.loads(market_row[0] or "{}") if market_row else {}
+                except (TypeError, ValueError):
+                    pending_orders = {}
+                pending_count = len(pending_orders) if isinstance(pending_orders, dict) else 0
+                closed_trades = int(db.execute(
+                    "SELECT COUNT(*) FROM paper_trades WHERE instance_id=? AND simulation_session_id=? AND status='closed'",
+                    (instance.id, instance.simulation_session_id)).fetchone()[0])
+                db.execute(
+                    "UPDATE positions SET status='reset', pnl=0, closed_at=? WHERE instance_id=? AND status='open'",
+                    (timestamp, instance.id))
+                db.execute(
+                    "UPDATE paper_trades SET status='cancelled', pnl=0, realized_pnl=0, closed_at=? "
+                    "WHERE instance_id=? AND status='open'",
+                    (timestamp, instance.id))
+                db.execute("""UPDATE simulation_sessions
+                    SET status='ended', ending_balance=?, realized_pnl=?, trades_count=?,
+                        ended_at=?, end_reason='account restart'
+                    WHERE id=? AND instance_id=?""",
+                    (previous_balance, previous_balance - instance.starting_equity,
+                     closed_trades, timestamp, instance.simulation_session_id, instance.id))
+                next_number = max(1, int(instance.simulation_session_number) + 1)
+                db.execute("""INSERT INTO simulation_sessions
+                    (id,instance_id,session_number,starting_balance,ending_balance,realized_pnl,
+                     trades_count,status,started_at,ended_at,end_reason)
+                    VALUES (?,?,?,?,NULL,0,0,'active',?,NULL,NULL)""",
+                    (new_session_id, instance.id, next_number,
+                     instance.starting_equity, timestamp))
+                db.execute("""UPDATE trading_instances
+                    SET current_realized_equity=?, risk_basis=?, simulation_session_id=?,
+                        simulation_session_number=?, updated_at=? WHERE id=?""",
+                    (instance.starting_equity, instance.starting_equity, new_session_id,
+                     next_number, timestamp, instance.id))
+                db.execute(
+                    "UPDATE instance_market_state SET pending_orders_json='{}', updated_at=? WHERE instance_id=?",
+                    (timestamp, instance.id))
+                db.execute("DELETE FROM instance_metrics WHERE instance_id=?", (instance.id,))
+                audit = {
+                    "id": _id(), "action": "simulation_account_restart",
+                    "instance_id": instance.id,
+                    "previous_session_id": instance.simulation_session_id,
+                    "new_session_id": new_session_id,
+                    "previous_balance": float(previous_balance),
+                    "new_balance": float(instance.starting_equity),
+                    "open_positions_cleared": open_positions,
+                    "pending_orders_cleared": pending_count,
+                    "timestamp": timestamp, "initiated_by": initiated_by,
+                    "result": "success",
+                }
+                db.execute("""INSERT INTO simulation_account_audit
+                    (id,action,instance_id,previous_session_id,new_session_id,previous_balance,
+                     new_balance,open_positions_cleared,pending_orders_cleared,timestamp,initiated_by,result)
+                    VALUES (:id,:action,:instance_id,:previous_session_id,:new_session_id,:previous_balance,
+                            :new_balance,:open_positions_cleared,:pending_orders_cleared,:timestamp,:initiated_by,:result)""",
+                    audit)
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+        return {**audit, "session_number": next_number}
+
+    def simulation_restart_audit(self, instance_id: str) -> list[dict]:
+        if self.remote:
+            return list(remote_call_with_retry(lambda: self._table("simulation_account_audit")
+                                               .select("*").eq("instance_id", instance_id)
+                                               .order("timestamp", desc=True).execute()).data)
+        with self.ledger._lock:
+            return [dict(row) for row in self.ledger._c.execute(
+                "SELECT * FROM simulation_account_audit WHERE instance_id=? ORDER BY timestamp DESC",
+                (instance_id,))]
+
+    def delete(self, instance_id: str, *, purge_sessions: bool = False) -> None:
         """Delete one configuration and its instance-owned auxiliary state."""
         if self.remote:
+            if purge_sessions:
+                remote_call_with_retry(lambda: self._table("simulation_sessions")
+                                       .delete().eq("instance_id", instance_id).execute())
             remote_call_with_retry(lambda: self._table("trading_instances")
                                    .delete().eq("id", instance_id).execute())
             return
         with self.ledger._lock:
             for table in ("instance_market_state", "instance_metrics", "instance_engine_logs"):
                 self.ledger._c.execute(f"DELETE FROM {table} WHERE instance_id=?", (instance_id,))
+            if purge_sessions:
+                self.ledger._c.execute(
+                    "DELETE FROM simulation_sessions WHERE instance_id=?", (instance_id,))
             self.ledger._c.execute("DELETE FROM trading_instances WHERE id=?", (instance_id,))
             self.ledger._c.commit()
 
@@ -457,6 +666,8 @@ class InstanceStore:
                         risk_basis=:risk_basis,
                         sizing_engine_version=:sizing_engine_version,
                         entry_mode=:entry_mode, fill_model=:fill_model, execution_mode=:execution_mode,
+                        simulation_session_id=:simulation_session_id,
+                        simulation_session_number=:simulation_session_number,
                         market_data_mode=:market_data_mode, state=:state, desired_running=:desired_running,
                         started_at=:started_at, stopped_at=:stopped_at,
                         updated_at=:updated_at, last_error=:last_error
@@ -642,7 +853,7 @@ class TradingInstanceManager:
                  max_consecutive_losses: int = 0, cooldown_after_loss_min: int = 0,
                  session_start: int = 0, session_end: int = 24,
                  max_weekly_loss_pct: float = 0.0, max_trades_per_day: int = 0,
-                 trading_days_mask: int = 127):
+                 trading_days_mask: int = 127, full_reboot_timeout_s: float | None = None):
         self.ledger, self.store = ledger, InstanceStore(ledger)
         self.strategy_factory, self.live, self.live_poll_s, self.fetcher = strategy_factory, live, live_poll_s, fetcher
         self.decision_store = decision_store
@@ -688,9 +899,56 @@ class TradingInstanceManager:
             "default_fill_model": str(configured.get("default_fill_model") or "RealisticFill"),
         }
         self._instances: dict[str, TradingInstance] = {i.id: i for i in self.store.list()}
+        for instance in self._instances.values():
+            self.store.ensure_simulation_session(instance)
         self._runtime: dict[str, tuple[AutoStrategyEngine, PaperExecutionEngine, SignalPipeline, TradingControl]] = {}
         self._metric_fingerprints: dict[str, tuple] = {}
+        self._reboots: dict[str, dict] = {}
+        self._reboot_threads: dict[str, threading.Thread] = {}
+        configured_reboot_timeout = os.environ.get("HUB_FULL_REBOOT_TIMEOUT_SECONDS", "300")
+        self.full_reboot_timeout_s = max(
+            1.0, float(full_reboot_timeout_s if full_reboot_timeout_s is not None
+                       else configured_reboot_timeout))
         self._lock = threading.RLock()
+
+    def _reboot_active(self, instance_id: str) -> bool:
+        return self._reboots.get(instance_id, {}).get("status") == _REBOOT_RUNNING
+
+    def _assert_reboot_idle(self, instance_id: str) -> None:
+        if self._reboot_active(instance_id):
+            raise ValueError("A Full Bot Reboot is already in progress for this Trading Instance")
+
+    def _set_reboot_phase(self, instance_id: str, phase: str, message: str, *,
+                          status: str = _REBOOT_RUNNING, error: str = "",
+                          details: dict | None = None) -> dict:
+        with self._lock:
+            current = self._reboots.get(instance_id, {})
+            now = _now()
+            row = {
+                **current,
+                "id": current.get("id") or _id(),
+                "instance_id": instance_id,
+                "status": status,
+                "phase": phase,
+                "message": message,
+                "started_at": current.get("started_at") or now,
+                "updated_at": now,
+                "completed_at": now if status in _REBOOT_TERMINAL else None,
+                "error": error,
+            }
+            if details:
+                row["details"] = {**row.get("details", {}), **details}
+            self._reboots[instance_id] = row
+            inst = self._instances.get(instance_id)
+            if inst is not None:
+                level = "error" if status in ("degraded", "failed") else "info"
+                try:
+                    self.store.append_engine_log(
+                        instance_id, level=level,
+                        message=f"full_reboot phase={phase} status={status} message={message}")
+                except Exception:  # reboot truth must survive telemetry outages
+                    pass
+            return dict(row)
 
     def create(self, *, symbol: str, strategy_key: str, strategy_label: str, strategy_version: str,
                timeframe: str, risk_per_trade_pct: float, capital_allocation: float, mode: str = "trading",
@@ -776,6 +1034,7 @@ class TradingInstanceManager:
                                    market_data_mode="paper_forward" if mode == "trading" else "replay")
             self.store.create(inst)
             try:
+                self.store.ensure_simulation_session(inst)
                 if mode == "trading":
                     self.store.save_market_state(
                         inst.id, market_data_mode="paper_forward",
@@ -785,7 +1044,7 @@ class TradingInstanceManager:
                 # Remote writes cannot span a PostgREST transaction here. Make
                 # the operation atomic from the API's perspective by compensating
                 # immediately if the required cursor row cannot be initialized.
-                self.store.delete(inst.id)
+                self.store.delete(inst.id, purge_sessions=True)
                 raise
             self._instances[inst.id] = inst
             return inst
@@ -793,6 +1052,7 @@ class TradingInstanceManager:
     def delete(self, instance_id: str) -> str:
         """Delete one stopped instance without touching any sibling worker."""
         with self._lock:
+            self._assert_reboot_idle(instance_id)
             inst = self._instances[instance_id]
             runtime = self._runtime.get(instance_id)
             if runtime and runtime[0].running:
@@ -833,6 +1093,8 @@ class TradingInstanceManager:
                                         symbol=inst.symbol, instance_id=inst.id)
             self._runtime.pop(instance_id, None)
             self._metric_fingerprints.pop(instance_id, None)
+            self._reboots.pop(instance_id, None)
+            self._reboot_threads.pop(instance_id, None)
             del self._instances[instance_id]
             return inst.id
 
@@ -847,8 +1109,10 @@ class TradingInstanceManager:
         allocated_capital = sum(i.capital_allocation for i in self._instances.values() if i.mode == "trading")
         capital = allocated_capital or 1.0
         today = datetime.now(timezone.utc).date().isoformat()
+        active_sessions = {item.simulation_session_id for item in self._instances.values()}
         daily_pnl = sum(float(t.get("pnl") or 0) for t in self.ledger.get_paper_trades()
                         if t.get("instance_id") in self._instances
+                        and t.get("simulation_session_id") in active_sessions
                         and str(t.get("closed_at") or "").startswith(today))
         if daily_pnl <= -(capital * self.max_global_daily_loss_pct):
             return False, "Global daily loss limit reached"
@@ -856,8 +1120,11 @@ class TradingInstanceManager:
             return False, f"Global account risk exceeded ({risk + next_risk:.2f} > {capital * self.max_global_risk_pct:.2f})"
         return True, "global risk within limit"
 
-    def start(self, instance_id: str) -> TradingInstance:
+    def start(self, instance_id: str, *, entry_gate_closed: bool = False,
+              allow_during_reboot: bool = False) -> TradingInstance:
         with self._lock:
+            if not allow_during_reboot:
+                self._assert_reboot_idle(instance_id)
             inst = self._instances[instance_id]
             prior_runtime = self._runtime.get(instance_id)
             if prior_runtime is not None and prior_runtime[0].running:
@@ -875,8 +1142,11 @@ class TradingInstanceManager:
                                  if runtime[0].running and self._instances[key].mode == "trading")
             if inst.mode == "trading" and active_trading >= self.max_slots:
                 raise ValueError(f"Maximum active trading slots reached ({self.max_slots})")
-            scoped = InstanceLedger(self.ledger, instance_id)
+            self.store.assert_runtime_schema()
+            scoped = InstanceLedger(self.ledger, instance_id, inst.simulation_session_id)
             controls = TradingControl()
+            if entry_gate_closed:
+                controls.pause_all()
             engine_type = ResearchExecutionEngine if inst.mode == "research" else PaperExecutionEngine
             from services.fill_model import from_name as fill_model_from_name
             paper = engine_type(scoped, inst.starting_equity,
@@ -925,6 +1195,7 @@ class TradingInstanceManager:
             pipeline.learning = LearningBook(learning_path)
             pipeline.journal_context = {
                 "instance_id": inst.id,
+                "simulation_session_id": inst.simulation_session_id,
                 "instance_name": f"{inst.symbol} {inst.strategy_label} {inst.timeframe} #{inst.id[:6].upper()}",
                 "strategy_id": inst.strategy_key,
                 "strategy_name": inst.strategy_label,
@@ -1068,8 +1339,10 @@ class TradingInstanceManager:
             return inst
 
     def stop(self, instance_id: str) -> TradingInstance:
-        inst = self._instances[instance_id]
-        runtime = self._runtime.get(instance_id)
+        with self._lock:
+            self._assert_reboot_idle(instance_id)
+            inst = self._instances[instance_id]
+            runtime = self._runtime.get(instance_id)
         if runtime:
             runtime[0].stop("Stopped by instance operator")
             ws_feed = getattr(runtime[0], "ws_feed", None)
@@ -1078,16 +1351,345 @@ class TradingInstanceManager:
         inst.state, inst.desired_running, inst.stopped_at = "stopped", False, _now(); self.store.save(inst); return inst
 
     def restart(self, instance_id: str) -> TradingInstance:
-        self.stop(instance_id)
-        return self.start(instance_id)
+        """Begin a genuine staged Full Bot Reboot and return immediately."""
+        self.request_full_reboot(instance_id)
+        return self._instances[instance_id]
+
+    @staticmethod
+    def _validate_reboot_recovery(instance: TradingInstance, positions: list[dict],
+                                  trades: list[dict], pending_orders: dict) -> None:
+        """Fail closed when persisted execution state cannot be restored exactly."""
+        if len(positions) > instance.max_open_positions:
+            raise RuntimeError(
+                f"Reconciliation found {len(positions)} positions, above the configured maximum "
+                f"of {instance.max_open_positions}")
+        open_trades = [trade for trade in trades if trade.get("status") == "open"]
+        if len(open_trades) != len(positions):
+            raise RuntimeError(
+                "Open position and open paper-trade counts do not reconcile")
+        for trade in open_trades:
+            if (str(trade.get("instance_id") or "") != instance.id
+                    or str(trade.get("simulation_session_id") or "") != instance.simulation_session_id
+                    or str(trade.get("symbol") or "").upper() != instance.symbol):
+                raise RuntimeError("An open paper-trade has invalid Trading Instance ownership")
+        for position in positions:
+            if (str(position.get("instance_id") or "") != instance.id
+                    or str(position.get("simulation_session_id") or "") != instance.simulation_session_id):
+                raise RuntimeError("A persisted position has invalid Trading Instance ownership")
+            if str(position.get("symbol") or "").upper() != instance.symbol:
+                raise RuntimeError("A persisted position belongs to a different symbol")
+            if position.get("side") not in ("long", "short"):
+                raise RuntimeError("A persisted position has an invalid side")
+            for field_name in ("size", "entry", "stop", "target"):
+                value = position.get(field_name)
+                if value is None or not math.isfinite(float(value)) or float(value) <= 0:
+                    raise RuntimeError(
+                        f"Open-position {field_name} is missing or invalid; exact protection cannot be restored")
+            raw_management = position.get("management_json") or {}
+            if isinstance(raw_management, str):
+                try:
+                    raw_management = json.loads(raw_management)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError("Open-position management state is invalid JSON") from exc
+            if not isinstance(raw_management, dict):
+                raise RuntimeError("Open-position management state is not an object")
+            matching_trades = [trade for trade in open_trades
+                               if str(trade.get("symbol") or "").upper() == instance.symbol]
+            if not matching_trades:
+                raise RuntimeError("Open position has no matching open paper-trade record")
+        if not isinstance(pending_orders, dict):
+            raise RuntimeError("Persisted pending-order state is not an object")
+        for symbol, order in pending_orders.items():
+            if str(symbol).upper() != instance.symbol or not isinstance(order, dict):
+                raise RuntimeError("A pending order has invalid instance/symbol ownership")
+            payload = order.get("payload")
+            if not isinstance(payload, dict):
+                raise RuntimeError("A pending order is missing its persisted execution payload")
+            if str(order.get("side") or "").upper() not in ("BUY", "SELL"):
+                raise RuntimeError("A pending order has an invalid side")
+            try:
+                price = float(order.get("price"))
+                target = float(order.get("target"))
+                ttl = int(order.get("ttl"))
+                entry = float(payload.get("entry"))
+                stop = float(payload.get("stop"))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("A pending order has incomplete execution levels") from exc
+            if (not all(math.isfinite(value) and value > 0
+                        for value in (price, target, entry, stop)) or ttl <= 0):
+                raise RuntimeError("A pending order has invalid execution levels or expiry")
+            payload_symbol = str(payload.get("symbol") or symbol).upper()
+            if payload_symbol != instance.symbol:
+                raise RuntimeError("A pending order payload belongs to a different symbol")
+
+    def request_full_reboot(self, instance_id: str) -> dict:
+        """Start one asynchronous, backend-owned runtime reconstruction."""
+        with self._lock:
+            instance = self._instances[instance_id]
+            if instance.mode != "trading":
+                raise ValueError("Full Bot Reboot is available only for automated Trading Instances")
+            self._assert_reboot_idle(instance_id)
+            runtime = self._runtime.get(instance_id)
+            if runtime is not None:
+                # Close the execution gate before the request returns. The
+                # background worker cannot accept a new entry after this point.
+                runtime[3].pause_all()
+                runtime[0]._lifecycle_callback = None
+            reboot_id = _id()
+            self._reboots[instance_id] = {
+                "id": reboot_id, "instance_id": instance_id,
+                "status": _REBOOT_RUNNING, "phase": "blocking_entries",
+                "message": "New paper entries are blocked",
+                "started_at": _now(), "updated_at": _now(),
+                "completed_at": None, "error": "", "details": {},
+            }
+            thread = threading.Thread(
+                target=self._run_full_reboot, args=(instance_id, reboot_id),
+                name=f"full-reboot-{instance_id}", daemon=True)
+            self._reboot_threads[instance_id] = thread
+            try:
+                self.store.append_engine_log(
+                    instance_id, level="info",
+                    message="full_reboot phase=blocking_entries status=running message=New paper entries are blocked")
+            except Exception:
+                pass
+            thread.start()
+            return dict(self._reboots[instance_id])
+
+    def _run_full_reboot(self, instance_id: str, reboot_id: str) -> None:
+        preserved: dict = {}
+        try:
+            with self._lock:
+                runtime = self._runtime.get(instance_id)
+                instance = self._instances[instance_id]
+                session_id = instance.simulation_session_id
+            if runtime is not None:
+                engine, paper, _pipeline, _controls = runtime
+                preserved["balance"] = float(paper.current_realized_equity())
+                self._set_reboot_phase(instance_id, "stopping_worker",
+                                       "Stopping strategy processing gracefully")
+                engine.stop("Full Bot Reboot requested by operator")
+                worker_thread = getattr(engine, "_thread", None)
+                if worker_thread is not None and worker_thread.is_alive():
+                    feed = getattr(engine, "ws_feed", None)
+                    if feed is not None:
+                        feed.stop()
+                    raise RuntimeError(
+                        "The existing worker did not stop cleanly; runtime replacement was aborted")
+                self._set_reboot_phase(instance_id, "disconnecting_market_data",
+                                       "Disconnecting the current market-data transport")
+                feed = getattr(engine, "ws_feed", None)
+                if feed is not None:
+                    feed.stop()
+                self._set_reboot_phase(instance_id, "flushing_runtime_state",
+                                       "Persisting candle, order and position checkpoints")
+                preserved["runtime_checkpoint"] = engine.flush_runtime_state()
+                paper.equity_listener = None
+            self._set_reboot_phase(instance_id, "clearing_transient_state",
+                                   "Discarding caches, queues, timers and stale runtime errors")
+            with self._lock:
+                if runtime is not None and self._runtime.get(instance_id) is runtime:
+                    self._runtime.pop(instance_id, None)
+                self._metric_fingerprints.pop(instance_id, None)
+
+            self._set_reboot_phase(instance_id, "reloading_configuration",
+                                   "Reloading the saved Trading Instance configuration")
+            reloaded = next((row for row in self.store.list() if row.id == instance_id), None)
+            if reloaded is None:
+                raise RuntimeError("Saved Trading Instance configuration could not be reloaded")
+            if reloaded.simulation_session_id != session_id:
+                raise RuntimeError("Simulation session changed during Full Bot Reboot")
+            with self._lock:
+                self._instances[instance_id] = reloaded
+            scoped = InstanceLedger(self.ledger, instance_id, reloaded.simulation_session_id)
+            positions = scoped.get_positions("open")
+            trades = scoped.get_paper_trades()
+            persisted_balance = reloaded.starting_equity + sum(
+                float(trade.get("pnl") or 0) for trade in trades
+                if trade.get("status") == "closed")
+            if "balance" in preserved and abs(persisted_balance - preserved["balance"]) > 0.000001:
+                raise RuntimeError("Persisted paper balance changed while the worker was stopping")
+            preserved["balance"] = float(persisted_balance)
+            market = self.store.market_state(instance_id)
+            pending_orders = market.get("pending_orders_json") or {}
+            self._set_reboot_phase(instance_id, "reconciling_execution_state",
+                                   "Reconciling persisted positions and pending orders")
+            self._validate_reboot_recovery(reloaded, positions, trades, pending_orders)
+            preserved.update({
+                "simulation_session_id": session_id,
+                "position_ids": sorted(str(row.get("id")) for row in positions),
+                "pending_order_symbols": sorted(pending_orders),
+            })
+
+            self._set_reboot_phase(instance_id, "connecting_market_data",
+                                   "Creating a fresh worker and reconnecting market data")
+            self.start(instance_id, entry_gate_closed=True, allow_during_reboot=True)
+            with self._lock:
+                new_runtime = self._runtime[instance_id]
+            new_engine, new_paper, _new_pipeline, new_controls = new_runtime
+            restored_positions = new_paper.positions()
+            restored_ids = sorted(str(row.get("id")) for row in restored_positions)
+            if restored_ids != preserved["position_ids"]:
+                raise RuntimeError("Open-position reconciliation changed the persisted position set")
+            if dict(new_engine._pending) != pending_orders:
+                raise RuntimeError("Pending-order reconciliation did not restore the persisted order set")
+            if abs(float(new_paper.current_realized_equity()) - preserved["balance"]) > 0.000001:
+                raise RuntimeError("Paper balance changed during Full Bot Reboot")
+            for position in restored_positions:
+                if new_engine._adopt(position["symbol"], position) is None:
+                    raise RuntimeError("Open-position protection could not be reconstructed")
+
+            deadline = time.monotonic() + self.full_reboot_timeout_s
+            last_phase = ""
+            while time.monotonic() < deadline:
+                status = new_engine.status()
+                lifecycle = str(status.get("lifecycle_state") or "starting")
+                if lifecycle in ("error", "stopped"):
+                    raise RuntimeError(status.get("last_error") or status.get("stop_reason")
+                                       or "Replacement worker stopped during health verification")
+                phase = ("loading_warmup" if lifecycle in ("starting", "bootstrapping", "warming")
+                         else "rebuilding_indicators" if lifecycle == "syncing"
+                         else "running_health_checks")
+                if phase != last_phase:
+                    messages = {
+                        "loading_warmup": "Loading closed-candle warm-up history",
+                        "rebuilding_indicators": "Rebuilding indicators and strategy state",
+                        "running_health_checks": "Verifying worker, feed and execution ownership",
+                    }
+                    self._set_reboot_phase(instance_id, phase, messages[phase])
+                    last_phase = phase
+                market_status = str(status.get("market_data_status") or "")
+                if lifecycle == "running" and market_status == "healthy":
+                    break
+                time.sleep(0.2)
+            else:
+                raise RuntimeError("Replacement worker did not become healthy before the reboot timeout")
+
+            new_controls.resume()
+            with self._lock:
+                current = self._instances[instance_id]
+                current.state, current.desired_running = "running", True
+                current.last_error = ""
+                self.store.save(current)
+            self._set_reboot_phase(
+                instance_id, "running", "Full Bot Reboot completed; execution gate reopened",
+                status="completed", details={**preserved, "transient_state_recreated": True})
+        except Exception as exc:  # fail closed; never manufacture a close/fill during recovery
+            detail = f"{type(exc).__name__}: {exc}"[:500]
+            with self._lock:
+                current = self._instances.get(instance_id)
+                runtime = self._runtime.get(instance_id)
+                if runtime is not None:
+                    runtime[3].pause_all()
+                if current is not None:
+                    current.state = "degraded"
+                    current.desired_running = bool(runtime is not None and runtime[0].running)
+                    current.last_error = (
+                        "Full Bot Reboot reconciliation failed; new entries remain blocked. "
+                        f"Manual repair required: {detail}")
+                    self.store.save(current)
+            self._set_reboot_phase(
+                instance_id, "reconciliation_failed",
+                "Reboot is degraded; new entries remain blocked pending manual repair",
+                status="degraded", error=detail, details=preserved)
+        finally:
+            with self._lock:
+                active = self._reboot_threads.get(instance_id)
+                if active is threading.current_thread():
+                    self._reboot_threads.pop(instance_id, None)
+
+    def restart_simulation_account(self, instance_id: str, *, initiated_by: str) -> dict:
+        """Reset one paper account while preserving configuration and history."""
+        with self._lock:
+            self._assert_reboot_idle(instance_id)
+            inst = self._instances[instance_id]
+            if inst.execution_mode.lower() != "paper" or inst.mode != "trading":
+                raise ValueError("Simulation account restart is allowed only for Paper Trading instances")
+            runtime = self._runtime.get(instance_id)
+            prior_state = inst.state
+            had_running_worker = bool(runtime is not None and runtime[0].running)
+            previous_session_id = inst.simulation_session_id
+            if runtime is not None:
+                # Close the entry gate before releasing the manager lock. The
+                # worker is stopped outside this lock so its final lifecycle
+                # callback cannot deadlock while the stop waits for its thread.
+                runtime[3].pause_all()
+
+        if runtime is not None:
+            self.stop(instance_id)
+            feed = getattr(runtime[0], "ws_feed", None)
+            if feed is not None:
+                feed.stop()
+
+        with self._lock:
+            inst = self._instances[instance_id]
+            if inst.simulation_session_id != previous_session_id:
+                raise RuntimeError("Simulation session changed while account restart was acquiring its execution lock")
+            if runtime is not None:
+                previous_balance = runtime[1].current_realized_equity()
+                runtime[1].equity_listener = None
+                self._runtime.pop(instance_id, None)
+            else:
+                current_trades = self.ledger.get_paper_trades(
+                    instance_id=instance_id,
+                    simulation_session_id=inst.simulation_session_id)
+                previous_balance = inst.starting_equity + sum(
+                    float(trade.get("pnl") or 0) for trade in current_trades
+                    if trade.get("status") == "closed")
+            result = self.store.restart_simulation_account(
+                inst, previous_balance=float(previous_balance),
+                initiated_by=initiated_by or "authenticated operator")
+            inst.current_realized_equity = inst.starting_equity
+            inst.risk_basis = inst.starting_equity
+            inst.simulation_session_id = str(result["new_session_id"])
+            inst.simulation_session_number = int(result["session_number"])
+            self._metric_fingerprints.pop(instance_id, None)
+
+            if self.decision_journal is not None:
+                try:
+                    self.decision_journal.store.cancel_open_for_instance(
+                        instance_id,
+                        reason="Paper position terminated by simulation account restart; no execution fill was fabricated.")
+                except Exception as exc:  # noqa: BLE001 - the ledger reset already committed
+                    self.ledger.log(
+                        level="warning", stage="simulation_account_restart",
+                        message=f"Journal reset annotation failed: {type(exc).__name__}",
+                        symbol=inst.symbol, instance_id=inst.id)
+
+            resumed = False
+            resume_error = ""
+            if had_running_worker:
+                try:
+                    self.start(instance_id)
+                    if prior_state == "paused":
+                        self.pause(instance_id)
+                    resumed = True
+                except Exception as exc:  # account reset is durable even if market data cannot resume
+                    resume_error = f"{type(exc).__name__}: {exc}"[:500]
+                    inst.state, inst.desired_running = "error", False
+                    inst.last_error = f"Simulation account reset succeeded, but worker resume failed: {resume_error}"
+                    self.store.save(inst)
+
+            self.ledger.log(
+                level="info", stage="simulation_account_restart",
+                message=(f"Simulation account restarted: session {result.get('previous_session_id') or 'legacy'} "
+                         f"→ {result['new_session_id']}; positions={result['open_positions_cleared']} "
+                         f"pending_orders={result['pending_orders_cleared']}"),
+                symbol=inst.symbol, instance_id=inst.id)
+            return {**result, "resumed": resumed, "resume_error": resume_error,
+                    "instance": self.status(instance_id)}
 
     def pause(self, instance_id: str) -> TradingInstance:
-        inst = self._instances[instance_id]; runtime = self._runtime.get(instance_id)
+        with self._lock:
+            self._assert_reboot_idle(instance_id)
+            inst = self._instances[instance_id]; runtime = self._runtime.get(instance_id)
         if runtime: runtime[3].pause_all()
         inst.state, inst.desired_running = "paused", False; self.store.save(inst); return inst
 
     def resume(self, instance_id: str) -> TradingInstance:
-        inst = self._instances[instance_id]; runtime = self._runtime.get(instance_id)
+        with self._lock:
+            self._assert_reboot_idle(instance_id)
+            inst = self._instances[instance_id]; runtime = self._runtime.get(instance_id)
         if runtime and runtime[0].running:
             runtime[3].resume()
             inst.state, inst.desired_running = "running", True
@@ -1119,6 +1721,7 @@ class TradingInstanceManager:
         restores its prior running/paused lifecycle state.
         """
         with self._lock:
+            self._assert_reboot_idle(instance_id)
             inst = self._instances[instance_id]
             open_positions = InstanceLedger(self.ledger, instance_id).get_positions("open")
             trade_history = self.ledger.get_paper_trades(instance_id=instance_id)
@@ -1322,6 +1925,13 @@ class TradingInstanceManager:
         instance_trades = (instance_trades if instance_trades is not None else
                            [t for t in self.ledger.get_paper_trades()
                             if t.get("instance_id") in instance_ids])
+        active_session_by_instance = {
+            item.id: item.simulation_session_id for item in self._instances.values()
+        }
+        instance_trades = [
+            trade for trade in instance_trades
+            if trade.get("simulation_session_id") == active_session_by_instance.get(str(trade.get("instance_id")))
+        ]
         today_closed = [t for t in instance_trades if str(t.get("closed_at") or "").startswith(today)]
         today_pnl = sum(float(t.get("pnl") or 0) for t in today_closed)
         # GET /instances already materializes these expensive, storage-backed
@@ -1347,7 +1957,7 @@ class TradingInstanceManager:
         else:
             risk_status, risk_message = "healthy", "Global risk within limits"
         active_lifecycle = {"starting", "bootstrapping", "warming", "syncing", "ready",
-                            "running", "data_stale", "recovering"}
+                            "running", "data_stale", "recovering", "rebooting", "degraded"}
         market_states = [str((row.get("market_data") or {}).get("market_data_status") or "")
                          for row in runtime_states if row.get("mode") == "trading"
                          and (row.get("state") in active_lifecycle or row.get("desired_running"))]
@@ -1355,7 +1965,8 @@ class TradingInstanceManager:
         # are not a current platform outage. Only a worker that is still marked
         # as desired-running may make the live platform status critical.
         worker_errors = sum(1 for row in runtime_states
-                            if row.get("state") == "error" and row.get("desired_running"))
+                            if row.get("state") in ("error", "degraded")
+                            and row.get("desired_running"))
         if not self.store.available or worker_errors or any(s in ("error", "disconnected") for s in market_states):
             global_status = "critical"
         elif risk_status != "healthy" or any(s in ("stale", "warming_up") for s in market_states):
@@ -1382,8 +1993,8 @@ class TradingInstanceManager:
                 "total_instances": len(self._instances),
                 "instance_counts": {state: sum(1 for row in runtime_states if row.get("state") == state)
                                     for state in ("created", "starting", "bootstrapping", "warming", "syncing",
-                                                  "ready", "running", "data_stale", "recovering",
-                                                  "paused", "stopped", "error")},
+                                                  "ready", "running", "data_stale", "recovering", "rebooting",
+                                                  "degraded", "paused", "stopped", "error")},
                 "total_allocated_capital": round(allocated_capital, 2),
                 "paper_account_capital": round(self.paper_account_capital, 2),
                 "total_current_equity": round(total_equity, 2),
@@ -1442,13 +2053,16 @@ class TradingInstanceManager:
     def metrics(self, instance_id: str, *, trades_snapshot: list[dict] | None = None) -> dict:
         inst = self._instances[instance_id]; runtime = self._runtime.get(instance_id)
         if trades_snapshot is not None:
-            trades = [t for t in trades_snapshot if t.get("status") == "closed"]
+            trades = [t for t in trades_snapshot
+                      if t.get("status") == "closed"
+                      and t.get("simulation_session_id") == inst.simulation_session_id]
             if runtime is not None:
                 runtime[1]._hist_cache = list(trades)
         else:
             trades = (runtime[1].history() if runtime else
                       [t for t in self.ledger.get_paper_trades(instance_id=instance_id)
-                       if t.get("status") == "closed"])
+                       if t.get("status") == "closed"
+                       and t.get("simulation_session_id") == inst.simulation_session_id])
         out = summarize(trades, inst.capital_allocation)
         equity, peak = inst.capital_allocation, inst.capital_allocation
         for trade in sorted(trades, key=lambda item: item.get("closed_at") or ""):
@@ -1546,7 +2160,16 @@ class TradingInstanceManager:
                           "duplicate_candles": engine.get("duplicate_candles_ignored", market.get("duplicate_candles", 0)),
                           "missing_candles": engine.get("missing_candles", market.get("missing_candles", 0)),
                           "out_of_order_candles": engine.get("out_of_order_candles", market.get("out_of_order_candles", 0))}
-        state = inst.state if engine is None else ("paused" if inst.state == "paused" else engine.get("lifecycle_state", inst.state))
+        reboot = dict(self._reboots.get(instance_id, {})) or None
+        if reboot and reboot.get("status") == _REBOOT_RUNNING:
+            state = "rebooting"
+        elif inst.state == "degraded":
+            # A running replacement worker may still be intentionally entry-
+            # gated after failed reconciliation. Never let its internal
+            # lifecycle badge hide the operator-visible degraded state.
+            state = "degraded"
+        else:
+            state = inst.state if engine is None else ("paused" if inst.state == "paused" else engine.get("lifecycle_state", inst.state))
         if inst.mode == "trading":
             market = _market_health(market, timeframe=inst.timeframe, worker_state=state)
         if engine and state in ("stopped", "error") and inst.state != state:
@@ -1611,11 +2234,21 @@ class TradingInstanceManager:
                         "open_risk_pct": round(open_risk / max(float(execution["current_equity"] or 0), 1.0) * 100, 3)}
         else:
             # A stopped worker has no authoritative in-memory mark.  Its
-            # closed-trade balance is available, but available cash and any
-            # live open-position valuation are intentionally left unknown.
+            # closed-trade balance is available. Valuation remains unknown
+            # only when a persisted open position still exists; an empty book
+            # has exactly zero unrealized P&L and all realized equity available.
             execution["current_equity"] = metrics.get("balance")
             execution["current_realized_equity"] = metrics.get("balance")
             execution["mark_to_market_equity"] = metrics.get("balance")
+            persisted_open = (positions_snapshot if positions_snapshot is not None else
+                              self.ledger.get_positions(
+                                  "open", instance_id=instance_id,
+                                  simulation_session_id=inst.simulation_session_id))
+            if not persisted_open:
+                execution["available_capital"] = metrics.get("balance")
+                execution["unrealized_pnl"] = 0.0
+            pending = market.get("pending_orders_json") if isinstance(market, dict) else None
+            execution["pending_orders"] = len(pending) if isinstance(pending, dict) else None
         accounting_changed = False
         observed_realized = execution.get("current_realized_equity")
         if observed_realized is not None and abs(inst.current_realized_equity - float(observed_realized)) > 0.0000001:
@@ -1681,10 +2314,17 @@ class TradingInstanceManager:
                 "state": state, "engine": engine,
                 "configuration": configuration, "execution": execution,
                 "risk": risk, "market_data": market, "current_position": current_position,
+                "simulation_session": {
+                    "id": inst.simulation_session_id,
+                    "number": inst.simulation_session_number,
+                    "starting_balance": inst.starting_equity,
+                    "status": "active",
+                },
                 "performance": {**metrics, "net_pnl": execution.get("realized_pnl"),
                                 "return_pct": execution.get("return_pct")},
                 "strategy_health": metrics.get("strategy_health"),
-                "last_decision": last_decision, "metrics": metrics}
+                "last_decision": last_decision, "metrics": metrics,
+                "reboot": reboot}
 
     def snapshot(self) -> tuple[list[dict], list[dict], list[dict]]:
         """Materialize one dashboard snapshot without per-instance remote reads."""

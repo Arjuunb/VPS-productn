@@ -64,7 +64,7 @@ class JournalStore:
                 "instance_id TEXT", "instance_name TEXT", "strategy_id TEXT",
                 "strategy_name TEXT", "strategy_version TEXT", "execution_mode TEXT",
                 "market_data_mode TEXT", "market_data_source TEXT", "exchange TEXT",
-                "position_id TEXT",
+                "position_id TEXT", "simulation_session_id TEXT",
             ):
                 if column.split()[0] not in existing:
                     self._c.execute(f"ALTER TABLE trade_decision_journal ADD COLUMN {column}")
@@ -85,8 +85,8 @@ class JournalStore:
                  entry, stop, target, size, risk_amount, planned_rr, confidence,
                  brain_score, regime, status, sections_json, instance_id, instance_name,
                  strategy_id, strategy_name, strategy_version, execution_mode,
-                 market_data_mode, market_data_source, exchange, position_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?,?,?,?,?,?,?,?,?,?,?)""",
+                 market_data_mode, market_data_source, exchange, position_id, simulation_session_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (j["trade_id"], _now(), j.get("mode", "paper"), j.get("symbol"),
                  j.get("side"), j.get("strategy"), j.get("timeframe"), j.get("entry"),
                  j.get("stop"), j.get("target"), j.get("size"), j.get("risk_amount"),
@@ -95,7 +95,7 @@ class JournalStore:
                  j.get("instance_name"), j.get("strategy_id"), j.get("strategy_name"),
                  j.get("strategy_version"), j.get("execution_mode"),
                  j.get("market_data_mode"), j.get("market_data_source"),
-                 j.get("exchange"), j.get("position_id")))
+                 j.get("exchange"), j.get("position_id"), j.get("simulation_session_id")))
             self._c.commit()
 
     def add_event(self, trade_id: str, kind: str, detail: str = "",
@@ -128,6 +128,25 @@ class JournalStore:
             self._c.commit()
             return True
 
+    def cancel_open_for_instance(self, instance_id: str, *, reason: str) -> int:
+        """Terminate open journal rows without fabricating an execution fill."""
+        with self._lock:
+            rows = self._c.execute(
+                "SELECT trade_id FROM trade_decision_journal WHERE instance_id=? AND status='open'",
+                (instance_id,)).fetchall()
+            timestamp = _now()
+            self._c.execute(
+                """UPDATE trade_decision_journal
+                   SET closed_at=?, status='cancelled', result='account_restart'
+                   WHERE instance_id=? AND status='open'""",
+                (timestamp, instance_id))
+            self._c.executemany(
+                "INSERT INTO trade_decision_events(trade_id,ts,kind,detail) VALUES (?,?,?,?)",
+                [(row["trade_id"], timestamp, "simulation-account-restarted", reason)
+                 for row in rows])
+            self._c.commit()
+            return len(rows)
+
     # ------------------------------------------------------------- queries
     def _row(self, r: sqlite3.Row) -> dict:
         d = dict(r)
@@ -137,7 +156,7 @@ class JournalStore:
         # promoted; otherwise execution truth remains visibly unverified.
         for key in ("instance_id", "instance_name", "strategy_id", "strategy_name",
                     "strategy_version", "market_data_mode", "market_data_source",
-                    "exchange", "position_id"):
+                    "exchange", "position_id", "simulation_session_id"):
             if d.get(key) is None and provenance.get(key) is not None:
                 d[key] = provenance[key]
         d["strategy_name"] = d.get("strategy_name") or d.get("strategy")

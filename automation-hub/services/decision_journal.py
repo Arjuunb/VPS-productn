@@ -260,6 +260,7 @@ class DecisionJournal:
             },
             "provenance": {
                 "instance_id": provenance.get("instance_id"),
+                "simulation_session_id": provenance.get("simulation_session_id"),
                 "instance_name": provenance.get("instance_name"),
                 "strategy_id": provenance.get("strategy_id"),
                 "strategy_name": provenance.get("strategy_name") or strategy,
@@ -282,6 +283,7 @@ class DecisionJournal:
             "planned_rr": planned_rr, "confidence": confidence,
             "brain_score": brain_score, "regime": regime, "sections": sections,
             "instance_id": provenance.get("instance_id"),
+            "simulation_session_id": provenance.get("simulation_session_id"),
             "instance_name": provenance.get("instance_name"),
             "strategy_id": provenance.get("strategy_id"),
             "strategy_name": provenance.get("strategy_name") or strategy,
