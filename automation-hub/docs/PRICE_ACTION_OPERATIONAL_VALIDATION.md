@@ -37,10 +37,10 @@ Do not continue if the app is unhealthy or the checkout does not contain
 ## 2. Public-feed and PAPER-only soak
 
 Run a bounded five-minute validation. This checks public exchange metadata,
-REST candles, public bid/ask/mark/funding, WebSocket updates, a controlled
-disconnect/reconnect, stale-feed entry blocking, candle/event deduplication,
-funding deduplication, and persistence of a deliberately far-away PAPER limit
-order across reopening the validation account.
+REST candles, public bid/ask/mark/funding, routed market and public WebSocket
+updates, a controlled market-channel disconnect/reconnect, stale-feed entry
+blocking, candle/event deduplication, funding deduplication, and persistence of
+a deliberately far-away PAPER limit order across reopening the validation account.
 
 ```bash
 cd /opt/VPS-productn
@@ -61,6 +61,9 @@ The command must exit zero and the report must contain:
 - `real_execution_allowed: false`
 - final market-data state `SYNCHRONIZED`, transport state `CONNECTED`, and
   `reliable: true`
+- routed transport channels `market: CONNECTED` and `public: CONNECTED`; the
+  market channel carries kline/mark-price updates and the public channel carries
+  bid/ask updates
 - non-null independent candle, bid/ask and mark update timestamps after the
   controlled reconnect
 - the last completed candle advances during the soak

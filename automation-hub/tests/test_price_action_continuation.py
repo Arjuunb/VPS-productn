@@ -29,6 +29,11 @@ def visual(proposal=True, count=10):
             "metrics": {"closed": 0}}
 
 
+def connect_stream_channels(stream):
+    stream._set_channel_state("market", "CONNECTED")
+    stream._set_channel_state("public", "CONNECTED")
+
+
 def test_automatic_paper_lifecycle_sizes_rounds_protects_and_stops_first(tmp_path):
     account = PriceActionPaperAccount(tmp_path / "auto.db")
     account.configure(execution_config=PaperExecutionConfig(operating_mode="automatic", risk_pct=.5))
@@ -109,7 +114,7 @@ def test_public_stream_dedupes_closed_candles_and_marks_gaps_unreliable():
                                      clock=clock)
     stream.bootstrap("BTCUSDT", "5m")
     stream.reconciliation_complete = True
-    stream._set_state("CONNECTED")
+    connect_stream_channels(stream)
     stream.ingest_event({"data": {"e": "bookTicker", "s": "BTCUSDT", "b": "100", "a": "100.1"}})
     stream.ingest_event({"data": {"e": "markPriceUpdate", "p": "100.05", "r": ".0001", "T": 1767225600000}})
     closed = {"e": "kline", "k": {"t": int(bar(2).timestamp.timestamp() * 1000),
@@ -132,6 +137,7 @@ def test_public_stream_rest_reconciles_a_missing_closed_candle_once():
     stream.bootstrap("BTCUSDT", "5m")
     stream._bars.remove(history[1])
     stream.missing_candles += 1
+    connect_stream_channels(stream)
     stream._set_state("DELAYED", "controlled test gap")
 
     assert asyncio.run(stream.reconcile()) == 1
@@ -147,13 +153,41 @@ def test_public_stream_rest_reconciles_a_missing_closed_candle_once():
     assert asyncio.run(stream.reconcile()) == 0
 
 
+def test_public_stream_routes_required_events_and_aggregates_channel_health():
+    stream = PriceActionPublicStream(lambda *_args, **_kwargs: [bar(0), bar(1)])
+    stream.bootstrap("BTCUSDT", "5m")
+    stream.reconciliation_complete = True
+
+    assert stream.market_url == (
+        "wss://fstream.binance.com/market/stream?streams="
+        "btcusdt@kline_5m/btcusdt@markPrice@1s")
+    assert stream.public_url == (
+        "wss://fstream.binance.com/public/stream?streams=btcusdt@bookTicker")
+    assert stream.url == stream.market_url
+
+    stream._set_channel_state("market", "CONNECTED")
+    assert stream.state == "CONNECTING"
+    stream._set_channel_state("public", "CONNECTED")
+    status = stream.status()
+    assert status["transport_state"] == "CONNECTED"
+    assert status["transport_channels"] == {"market": "CONNECTED", "public": "CONNECTED"}
+    assert status["public_streams"] == {
+        "market": ["kline", "markPrice"], "public": ["bookTicker"]}
+
+    stream._set_channel_state("market", "RECONNECTING", "controlled test")
+    status = stream.status()
+    assert status["transport_state"] == "RECONNECTING"
+    assert status["reliable"] is False
+    assert status["new_entries_paused"] is True
+
+
 def test_public_stream_fails_closed_until_all_identity_bound_channels_are_fresh():
     clock_now = [bar(3).timestamp + timedelta(minutes=5)]
     stream = PriceActionPublicStream(lambda *_args, **_kwargs: [bar(0), bar(1), bar(2)],
                                      stale_after_seconds=10, clock=lambda: clock_now[0])
     stream.bootstrap("BTCUSDT", "5m")
     stream.reconciliation_complete = True
-    stream._set_state("CONNECTED")
+    connect_stream_channels(stream)
     assert stream.status()["state"] == "STALE_CANDLES"
 
     kline = {"e": "kline", "s": "BTCUSDT", "k": {
@@ -180,7 +214,7 @@ def test_public_stream_rejects_old_symbol_or_timeframe_events_and_quote_mismatch
                                      quote_mismatch_bps=50)
     stream.bootstrap("BTCUSDT", "5m")
     stream.reconciliation_complete = True
-    stream._set_state("CONNECTED")
+    connect_stream_channels(stream)
     wrong = stream.ingest_event({"data": {"e": "bookTicker", "s": "ETHUSDT", "b": "100", "a": "101"}})
     assert wrong["identity_mismatch"] is True
     wrong_tf = stream.ingest_event({"data": {"e": "kline", "s": "BTCUSDT", "k": {

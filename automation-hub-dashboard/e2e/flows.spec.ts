@@ -38,6 +38,11 @@ test("Price Action Visual Lab — public stream truth and protected paper modes"
   await expect(page.getByText("REAL ORDERS DISABLED")).toBeVisible();
   await expect(page.getByText(/Binance · SYNCHRONIZED/)).toBeVisible();
   await expect(page.getByText(/PAPER · NO LIVE EXECUTION PATH/)).toBeVisible();
+  const ticker = page.locator(".smc-live-price-ticker");
+  await expect(ticker).toBeVisible();
+  await expect(ticker).not.toHaveClass(/stale/);
+  await expect(ticker).toHaveAttribute(
+    "aria-label", /Live price .* candle closes in \d{2}:\d{2}/);
 
   await page.getByLabel("Paper operating mode").selectOption("automatic");
   const [request] = await Promise.all([

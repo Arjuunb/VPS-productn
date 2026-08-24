@@ -124,7 +124,7 @@ def main() -> int:
                     "positions": len(disconnected_positions)}
                 socket = runtime.stream._socket
                 if socket is None:
-                    raise RuntimeError("public WebSocket unavailable for controlled reconnect")
+                    raise RuntimeError("market WebSocket unavailable for controlled reconnect")
                 asyncio.run_coroutine_threadsafe(
                     socket.close(code=1012, reason="controlled validation reconnect"),
                     loop).result(timeout=30)
@@ -144,15 +144,23 @@ def main() -> int:
                 final_status["last_closed_update"] > initial_closed_update),
             "controlled_reconnect_performed": restarted,
         }
-        connection_states = [row.get("state") for row in events if row.get("kind") == "connection"]
+        market_channel_states = [
+            row.get("state") for row in events
+            if row.get("kind") == "connection_channel" and row.get("channel") == "market"]
+        public_channel_states = [
+            row.get("state") for row in events
+            if row.get("kind") == "connection_channel" and row.get("channel") == "public"]
         health_states = [row.get("state") for row in events if row.get("kind") == "market_data_health"]
         result["checks"]["rest_gap_reconciliation"] = gap_probe
         result["checks"]["websocket"]["reconnect_completed"] = (
-            connection_states.count("CONNECTED") >= 2)
+            market_channel_states.count("CONNECTED") >= 2 and
+            public_channel_states.count("CONNECTED") >= 1)
         result["checks"]["websocket"]["synchronized_after_reconnect"] = (
             health_states.count("SYNCHRONIZED") >= 2 and
             final_status["state"] == "SYNCHRONIZED" and
             final_status["transport_state"] == "CONNECTED" and
+            final_status.get("transport_channels") == {
+                "market": "CONNECTED", "public": "CONNECTED"} and
             final_status["reliable"] is True and
             all(final_status.get(field) is not None for field in (
                 "last_candle_update", "last_quote_update", "last_mark_update"))

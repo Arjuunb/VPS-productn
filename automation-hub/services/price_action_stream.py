@@ -1,8 +1,8 @@
 """Public Binance USD-M stream for the isolated Price Action Visual Lab.
 
-Only public combined streams are used. REST remains authoritative for bootstrap
-and gap repair. The class is deliberately injectable so parsing, deduplication,
-staleness and recovery can be tested without a network connection.
+Only Binance's public routed streams are used. REST remains authoritative for
+bootstrap and gap repair. The class is deliberately injectable so parsing,
+deduplication, staleness and recovery can be tested without a network connection.
 """
 from __future__ import annotations
 
@@ -65,7 +65,11 @@ class PriceActionPublicStream:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._loop = None
+        self._channel_states = {"market": "DISCONNECTED", "public": "DISCONNECTED"}
+        self._channel_errors = {"market": "", "public": ""}
+        self._reconnect_attempts = {"market": 0, "public": 0}
         self._socket = None
+        self._public_socket = None
 
     def _set_state(self, state: str, error: str = "") -> None:
         if state not in CONNECTION_STATES:
@@ -88,6 +92,45 @@ class PriceActionPublicStream:
                 "timestamp": self.clock().isoformat(), "symbol": self.symbol,
                 "timeframe": self.timeframe,
             })
+
+    def _refresh_transport_state(self) -> None:
+        """Aggregate the required routed Binance transports into one state."""
+        with self._lock:
+            states = dict(self._channel_states)
+            errors = {key: value for key, value in self._channel_errors.items() if value}
+            reconciliation_pending = self.history_loaded and not self.reconciliation_complete
+        if all(value == "CONNECTED" for value in states.values()):
+            state = "DELAYED" if reconciliation_pending else "CONNECTED"
+        elif all(value == "DISCONNECTED" for value in states.values()):
+            state = "DISCONNECTED"
+        elif any(value == "RECONNECTING" for value in states.values()):
+            state = "RECONNECTING"
+        elif any(value == "ERROR" for value in states.values()):
+            state = "ERROR"
+        else:
+            state = "CONNECTING"
+        error = "; ".join(f"{key}: {value}" for key, value in sorted(errors.items()))
+        if state == "DELAYED" and not error:
+            error = (self.last_error if self.state == "DELAYED" and self.last_error
+                     else "gap reconciliation incomplete")
+        self._set_state(state, error)
+
+    def _set_channel_state(self, channel: str, state: str, error: str = "") -> None:
+        if channel not in self._channel_states:
+            raise ValueError(channel)
+        if state not in CONNECTION_STATES:
+            raise ValueError(state)
+        with self._lock:
+            changed = (self._channel_states[channel], self._channel_errors[channel]) != (state, error[:500])
+            self._channel_states[channel] = state
+            self._channel_errors[channel] = error[:500]
+        if changed and self.event_sink:
+            self.event_sink({
+                "kind": "connection_channel", "channel": channel, "state": state,
+                "error": error[:500], "timestamp": self.clock().isoformat(),
+                "symbol": self.symbol, "timeframe": self.timeframe,
+            })
+        self._refresh_transport_state()
 
     @staticmethod
     def _bar(kline: dict) -> Bar:
@@ -126,6 +169,11 @@ class PriceActionPublicStream:
             return True
         self.stop()
         self._stop.clear()
+        with self._lock:
+            self._channel_states = {"market": "CONNECTING", "public": "CONNECTING"}
+            self._channel_errors = {"market": "", "public": ""}
+            self._reconnect_attempts = {"market": 0, "public": 0}
+            self.reconnect_attempt = 0
         self._set_state("CONNECTING")
         try:
             self.bootstrap(symbol, timeframe)
@@ -139,23 +187,39 @@ class PriceActionPublicStream:
     def stop(self) -> None:
         self._stop.set()
         loop = self._loop
-        socket = self._socket
-        if loop and loop.is_running() and socket is not None:
-            try:
-                asyncio.run_coroutine_threadsafe(socket.close(), loop).result(timeout=2)
-            except Exception:
-                pass
+        sockets = [socket for socket in (self._socket, self._public_socket) if socket is not None]
+        if loop and loop.is_running():
+            for socket in sockets:
+                try:
+                    asyncio.run_coroutine_threadsafe(socket.close(), loop).result(timeout=2)
+                except Exception:
+                    pass
         thread = self._thread
         if thread and thread is not threading.current_thread():
             thread.join(timeout=3)
         self._thread = None
+        self._socket = None
+        self._public_socket = None
+        with self._lock:
+            self._channel_states = {"market": "DISCONNECTED", "public": "DISCONNECTED"}
+            self._channel_errors = {"market": "", "public": ""}
         self._set_state("DISCONNECTED")
 
     @property
-    def url(self) -> str:
+    def market_url(self) -> str:
         lower = self.symbol.lower()
-        streams = f"{lower}@kline_{self.timeframe}/{lower}@bookTicker/{lower}@markPrice@1s"
-        return f"wss://fstream.binance.com/stream?streams={streams}"
+        streams = f"{lower}@kline_{self.timeframe}/{lower}@markPrice@1s"
+        return f"wss://fstream.binance.com/market/stream?streams={streams}"
+
+    @property
+    def public_url(self) -> str:
+        lower = self.symbol.lower()
+        return f"wss://fstream.binance.com/public/stream?streams={lower}@bookTicker"
+
+    @property
+    def url(self) -> str:
+        """Backward-compatible alias for the regular market-data route."""
+        return self.market_url
 
     def _run(self) -> None:
         loop = asyncio.new_event_loop()
@@ -172,38 +236,59 @@ class PriceActionPublicStream:
         try:
             import websockets
         except Exception as exc:
-            self._set_state("ERROR", f"websockets unavailable: {exc}")
+            error = f"websockets unavailable: {exc}"
+            self._set_channel_state("market", "ERROR", error)
+            self._set_channel_state("public", "ERROR", error)
             return
+        await asyncio.gather(
+            self._stream_channel("market", self.market_url, websockets),
+            self._stream_channel("public", self.public_url, websockets),
+        )
+
+    async def _stream_channel(self, channel: str, url: str, websockets) -> None:
         while not self._stop.is_set():
             try:
-                self._set_state("CONNECTING" if self.reconnect_attempt == 0 else "RECONNECTING")
-                async with websockets.connect(self.url, ping_interval=20, ping_timeout=20,
+                attempt = self._reconnect_attempts[channel]
+                self._set_channel_state(channel, "CONNECTING" if attempt == 0 else "RECONNECTING")
+                async with websockets.connect(url, ping_interval=20, ping_timeout=20,
                                               close_timeout=5, max_queue=2048) as socket:
-                    self._socket = socket
-                    self._set_state("CONNECTED")
-                    self.reconnect_attempt = 0
+                    if channel == "market":
+                        self._socket = socket
+                    else:
+                        self._public_socket = socket
+                    self._reconnect_attempts[channel] = 0
+                    self.reconnect_attempt = max(self._reconnect_attempts.values())
+                    self._set_channel_state(channel, "CONNECTED")
                     with self._lock:
                         # Values may remain useful for visual continuity, but no
                         # prior socket receipt may prove the new connection fresh.
-                        self.last_candle_update = None
-                        self.last_quote_update = None
-                        self.last_mark_update = None
-                        self.reconciliation_complete = False
-                    await self.reconcile()
+                        if channel == "market":
+                            self.last_candle_update = None
+                            self.last_mark_update = None
+                            self.reconciliation_complete = False
+                        else:
+                            self.last_quote_update = None
+                    if channel == "market":
+                        await self.reconcile()
                     async for raw in socket:
                         if self._stop.is_set():
                             break
                         result = self.ingest_event(json.loads(raw))
-                        if result.get("closed") and self.state == "DELAYED":
+                        if channel == "market" and result.get("closed") and self.state == "DELAYED":
                             await self.reconcile()
             except asyncio.CancelledError:
                 return
             except Exception as exc:
-                self.reconnect_attempt += 1
-                self._set_state("RECONNECTING", f"{type(exc).__name__}: {exc}")
-                await asyncio.sleep(min(2 ** min(self.reconnect_attempt, 5), 30))
+                self._reconnect_attempts[channel] += 1
+                self.reconnect_attempt = max(self._reconnect_attempts.values())
+                self._set_channel_state(channel, "RECONNECTING", f"{type(exc).__name__}: {exc}")
+                await asyncio.sleep(min(2 ** min(self._reconnect_attempts[channel], 5), 30))
             finally:
-                self._socket = None
+                if channel == "market":
+                    self._socket = None
+                else:
+                    self._public_socket = None
+        self._set_channel_state(channel, "DISCONNECTED")
 
     async def reconcile(self) -> int:
         """Recover missing closed bars using REST before entries may resume."""
@@ -225,12 +310,12 @@ class PriceActionPublicStream:
             self.reconciled_candles += count
             with self._lock:
                 self.reconciliation_complete = self._unresolved_gaps() == 0
-            self._set_state("CONNECTED")
+            self._refresh_transport_state()
             return count
         except Exception as exc:
-            self._set_state("DELAYED", f"gap reconciliation failed: {exc}")
             with self._lock:
                 self.reconciliation_complete = False
+            self._set_state("DELAYED", f"gap reconciliation failed: {exc}")
             return 0
 
     def _unresolved_gaps(self) -> int:
@@ -257,6 +342,7 @@ class PriceActionPublicStream:
             step = timedelta(milliseconds=TF_MS[self.timeframe])
             if self._bars and bar.timestamp > self._bars[-1].timestamp + step:
                 self.missing_candles += int((bar.timestamp - self._bars[-1].timestamp) / step) - 1
+                self.reconciliation_complete = False
                 self._set_state("DELAYED", "missing completed candle detected; REST reconciliation required")
             if self._bars and bar.timestamp < self._bars[-1].timestamp:
                 merged = {row.timestamp: row for row in self._bars}
@@ -379,9 +465,13 @@ class PriceActionPublicStream:
                     "unresolved_missing_candles": unresolved,
                     "candle_quote_deviation_bps": mismatch_bps,
                     "reconnect_attempt": self.reconnect_attempt,
+                    "transport_channels": dict(self._channel_states),
+                    "transport_errors": dict(self._channel_errors),
                     "duplicate_events": self.duplicate_events, "missing_candles": self.missing_candles,
                     "reconciled_candles": self.reconciled_candles, "last_error": self.last_error,
-                    "public_streams": ["kline", "bookTicker", "markPrice"],
+                    "public_streams": {
+                        "market": ["kline", "markPrice"], "public": ["bookTicker"],
+                    },
                     "private_key_required": False, "real_execution_allowed": False}
         self._emit_health(health, reason)
         return payload
