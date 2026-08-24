@@ -144,3 +144,32 @@ def test_historical_funding_download_is_protected_and_smc_normalization_is_read_
     body = normalized.json()
     assert body["read_only"] is True and body["execution_allowed"] is False
     assert body["normalization"]["fair_comparison_allowed"] is False
+
+
+def test_governance_read_models_are_paper_only_and_mutations_are_protected(monkeypatch, tmp_path):
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+    account = PriceActionPaperAccount(tmp_path / "pa-governance-api.db")
+    monkeypatch.setattr(webhook_api, "price_action_paper", account)
+
+    journal = client.get("/research/price-action/journal?symbol=BTCUSDT&timeframe=5m")
+    assert journal.status_code == 200
+    assert journal.json()["entries"] == []
+    assert journal.json()["real_execution_allowed"] is False
+    exported = client.get("/research/price-action/journal/export?partition=untouched_oos")
+    assert exported.status_code == 200
+    assert exported.json()["immutable_source_records"] is True
+    analysis = client.get("/research/price-action/learning/analysis")
+    assert analysis.status_code == 200
+    assert analysis.json()["active_strategy_mutated"] is False
+    assert client.get("/research/price-action/learning/candidates").json()["real_execution_allowed"] is False
+
+    candidate = {
+        "rule_difference": {"first_touch_only": True}, "evidence_ids": [],
+        "code_fingerprint": "engine-1", "dataset_fingerprint": "dataset-1",
+        "expected_benefit": "test one isolated hypothesis",
+    }
+    assert client.post("/research/price-action/learning/candidates", json=candidate).status_code == 401
+    assert client.post("/research/price-action/journal/missing/revisions",
+                       json={"notes": "test", "tags": []}).status_code == 401

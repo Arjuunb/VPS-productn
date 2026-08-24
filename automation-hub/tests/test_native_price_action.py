@@ -9,6 +9,7 @@ from services.native_price_action import (
     PriceZone,
     ResearchTrade,
     RESEARCH_ID,
+    SetupPhase,
     STRATEGIES,
 )
 
@@ -77,6 +78,15 @@ def test_four_strategies_are_independent_and_research_boundary_is_explicit():
     assert len(engine.latest_snapshot.strategy_traces) == len(STRATEGIES) * 2
 
 
+def test_canonical_setup_state_machine_is_complete():
+    assert {phase.value for phase in SetupPhase} == {
+        "WATCHING_LOCATION", "LOCATION_REACHED", "REJECTION_DETECTED",
+        "WAITING_FOR_CONFIRMATION", "ORDER_PENDING", "ENTERED", "STOPPED",
+        "TARGET_HIT", "CANCELLED", "EXPIRED", "INVALIDATED", "DATA_PAUSED",
+        "LIQUIDATED_PAPER", "CLOSED_OTHER",
+    }
+
+
 def test_confirmed_zone_rejection_can_create_signal_only_proposal():
     engine = NativePriceActionEngine(PriceActionConfig(
         "BTCUSDT", swing_left=2, swing_right=2, wick_body_ratio=1.2,
@@ -101,7 +111,28 @@ def test_confirmed_zone_rejection_can_create_signal_only_proposal():
     assert proposal.stop < proposal.entry < proposal.target
     research_trade = next(row for row in engine.research_trades.values() if row.proposal_id == proposal.id)
     assert research_trade.status == "PENDING"
-    engine.process_closed_bar(bar(6, proposal.entry, proposal.entry + 1, proposal.stop - 1, proposal.stop))
+    setup = engine.setups[proposal.setup_id]
+    assert [row.to_phase for row in setup.transitions[:4]] == [
+        "LOCATION_REACHED", "REJECTION_DETECTED", "WAITING_FOR_CONFIRMATION", "ORDER_PENDING"]
+    for transition in setup.transitions:
+        assert transition.candle_identity
+        assert transition.market_data_health
+        assert transition.reason_code
+        assert transition.strategy_version == "1.1.0"
+        assert transition.configuration_fingerprint
+    # A later candle activates the confirmation order without crossing the
+    # saved structural invalidation boundary.  A subsequent candle then stops
+    # the open research trade.  Same-candle entry+stop ambiguity is covered by
+    # the separate adverse-first test below.
+    engine.process_closed_bar(bar(
+        6, proposal.entry - .1, proposal.entry + 1,
+        proposal.entry - .2, proposal.entry + .5,
+    ))
+    assert research_trade.status == "OPEN"
+    engine.process_closed_bar(bar(
+        7, proposal.entry, proposal.entry + .1,
+        proposal.stop - 1, proposal.stop,
+    ))
     assert research_trade.status == "LOST"
     assert research_trade.outcome == "STOP"
     assert research_trade.costs_r > 0
@@ -189,7 +220,7 @@ def test_unfilled_confirmation_order_expires_and_remains_reported():
     trade = ResearchTrade(
         id="trade-expire", proposal_id="proposal-expire", setup_id="setup-expire",
         strategy_id="PA1_SR_REJECTION", direction="bullish", status="PENDING",
-        requested_entry=200, stop=190, target=225, created_at=first.timestamp,
+        requested_entry=200, stop=90, target=475, created_at=first.timestamp,
         valid_until_index=1,
     )
     engine.research_trades[trade.id] = trade
@@ -199,3 +230,48 @@ def test_unfilled_confirmation_order_expires_and_remains_reported():
     assert trade.status == "EXPIRED"
     assert trade.outcome == "UNFILLED"
     assert engine.visual_state()["trades"][0]["reason"].startswith("confirmation order expired")
+
+
+def test_same_candle_entry_and_stop_is_unfilled_adverse_first_invalidation():
+    engine = NativePriceActionEngine(PriceActionConfig("BTCUSDT"))
+    first = bar(0, 100, 101, 99, 100)
+    engine.process_closed_bar(first)
+    trade = ResearchTrade(
+        id="trade-ambiguous", proposal_id="proposal-ambiguous", setup_id="setup-missing",
+        strategy_id="PA1_SR_REJECTION", direction="bullish", status="PENDING",
+        requested_entry=105, stop=95, target=130, created_at=first.timestamp,
+        valid_until_index=3,
+    )
+    engine.research_trades[trade.id] = trade
+    engine.process_closed_bar(bar(1, 100, 106, 94, 101))
+    assert trade.status == "INVALIDATED"
+    assert trade.outcome == "UNFILLED"
+    assert trade.fill_price is None
+    assert "before a provable confirmation fill" in trade.reason
+
+
+def test_research_trade_records_conservative_excursion_and_bar_timing():
+    engine = NativePriceActionEngine(PriceActionConfig("BTCUSDT"))
+    trade = ResearchTrade(
+        id="trade-evidence", proposal_id="proposal-evidence", setup_id="setup-missing",
+        strategy_id="PA1_SR_REJECTION", direction="bullish", status="PENDING",
+        requested_entry=105, stop=100, target=117.5,
+        created_at=bar(0, 100, 101, 99, 100).timestamp,
+        created_index=0, valid_until_index=5,
+    )
+    engine.research_trades[trade.id] = trade
+    engine._advance_research_trades(bar(2, 104, 106, 101, 105), 2)
+    assert trade.status == "OPEN"
+    assert trade.bars_to_entry == 2
+    assert trade.maximum_favourable_excursion_r == 0
+    assert trade.maximum_adverse_excursion_r == 0
+    engine._advance_research_trades(bar(3, 105, 110, 103, 108), 3)
+    assert trade.bars_in_trade == 1
+    assert trade.maximum_favourable_excursion_r > 0
+    assert trade.maximum_adverse_excursion_r > 0
+    engine._advance_research_trades(bar(4, 103, 104, 99, 100), 4)
+    assert trade.status == "LOST"
+    assert trade.bars_in_trade == 2
+    assert trade.closed_index == 4
+    assert trade.maximum_adverse_excursion_r >= 1
+    assert trade.excursion_model == "completed_ohlc_conservative"

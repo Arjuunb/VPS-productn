@@ -4,7 +4,12 @@ import pytest
 
 from bot.types import Bar
 from data.market_data_v2 import MarketDataService
-from services.price_action_lab import PriceActionPaperAccount, binance_visual_state, replay_state
+from services.price_action_lab import (
+    PaperExecutionConfig,
+    PriceActionPaperAccount,
+    binance_visual_state,
+    replay_state,
+)
 
 
 NOW = datetime(2026, 1, 2, 12, 2, tzinfo=timezone.utc)
@@ -117,3 +122,84 @@ def test_binance_public_contract_rules_and_quote_are_provider_derived(tmp_path):
     assert quote["ask"] == 50_000.1
     assert quote["mark"] == 50_000.05
     assert quote["funding_rate"] == .0001
+
+
+def test_unreliable_feed_cancels_strategy_order_and_never_infers_fill(tmp_path):
+    account = PriceActionPaperAccount(tmp_path / "pa.db")
+    account.start(
+        mode="LIVE_PAPER", symbol="BTCUSDT", timeframe="5m",
+        execution_config=PaperExecutionConfig(
+            operating_mode="automatic", strategy_id="PA1_SR_REJECTION"),
+    )
+    state = {
+        "symbol": "BTCUSDT", "timeframe": "5m", "setups": [],
+        "proposals": [{
+            "id": "proposal-1", "setup_id": "setup-1", "strategy_id": "PA1_SR_REJECTION",
+            "direction": "bullish", "entry": 105, "stop": 100, "target": 117.5,
+            "valid_until_index": 20,
+        }],
+        "metrics": {},
+    }
+    rules = {"tick_size": .1, "quantity_step": .001, "min_quantity": .001,
+             "max_quantity": 1000, "min_notional": 5}
+    created = account.synchronize_strategy(
+        state, contract_rules=rules, candle=Bar(NOW, 100, 104, 99, 101, 1000),
+        feed_reliable=True, feed_status={"state": "SYNCHRONIZED"})
+    assert len(created["created"]) == 1
+    assert account.audit_pending_orders()["pending_strategy_orders"] == 1
+    balance = account.state()["account"]["balance"]
+    paused = account.synchronize_strategy(
+        state, contract_rules=rules, candle=Bar(NOW + timedelta(minutes=5), 101, 110, 95, 105, 1000),
+        feed_reliable=False,
+        feed_status={"state": "STALE_CANDLES", "health_reason": "test stale feed"})
+    assert paused["broker"]["paused"] is True
+    assert paused["broker"]["events"] == []
+    assert account.audit_pending_orders()["pending_strategy_orders"] == 0
+    assert account.state()["positions"] == []
+    assert account.state()["account"]["balance"] == balance
+    assert any(row["action"] == "metadata_reconciled"
+               for row in paused["reconciliation"]["actions"])
+
+
+def test_reconciled_fill_quote_and_funding_are_order_scoped_and_persistent(tmp_path):
+    path = tmp_path / "evidence.db"
+    account = PriceActionPaperAccount(path)
+    account.start(
+        mode="LIVE_PAPER", symbol="BTCUSDT", timeframe="5m",
+        execution_config=PaperExecutionConfig(
+            operating_mode="automatic", strategy_id="PA1_SR_REJECTION"),
+    )
+    state = {
+        "symbol": "BTCUSDT", "timeframe": "5m", "setups": [],
+        "proposals": [{
+            "id": "proposal-evidence", "setup_id": "setup-evidence",
+            "strategy_id": "PA1_SR_REJECTION", "direction": "bullish",
+            "entry": 105, "stop": 100, "target": 117.5, "valid_until_index": 20,
+        }], "metrics": {},
+    }
+    rules = {"tick_size": .1, "quantity_step": .001, "min_quantity": .001,
+             "max_quantity": 1000, "min_notional": 5}
+    account.synchronize_strategy(
+        state, contract_rules=rules, candle=Bar(NOW, 100, 104, 99, 103, 1000),
+        feed_reliable=True, feed_status={"state": "SYNCHRONIZED"})
+    account.synchronize_strategy(
+        state, contract_rules=rules,
+        candle=Bar(NOW + timedelta(minutes=5), 104, 106, 101, 105, 1000),
+        feed_reliable=True,
+        feed_status={"state": "SYNCHRONIZED", "last_quote_update": NOW.isoformat(),
+                     "last_mark_update": NOW.isoformat()},
+        execution_quote={"bid": 104.9, "ask": 105.1, "mark": 105.0},
+    )
+    snapshot = account.state()
+    order_id = snapshot["order_metadata"][0]["order_id"]
+    fill_event = next(row for row in snapshot["activity"]
+                      if row["kind"] == "paper_order_filled")
+    assert fill_event["object_id"] == order_id
+    assert fill_event["payload"]["execution_quote"]["bid"] == 104.9
+    applied = account.apply_funding_once(
+        symbol="BTCUSDT", funding_time=NOW.isoformat(), rate=.001, mark_price=105)
+    assert applied["applied"] is True
+    funding = account.state()["funding_events"][0]
+    assert funding["order_id"] == order_id
+    reopened = PriceActionPaperAccount(path)
+    assert reopened.state()["funding_events"][0]["order_id"] == order_id

@@ -15,6 +15,7 @@ from bot.types import Bar
 from data.market_data_v2 import TF_MS, MarketDataService, normalize_symbol
 from execution.paper_broker_v2 import PaperBrokerV2
 from services.native_price_action import STRATEGIES, NativePriceActionEngine, PriceActionConfig
+from services.price_action_governance import PriceActionJournalStore
 from services.price_action_stream import PriceActionPublicStream
 
 
@@ -120,6 +121,9 @@ class PriceActionPaperAccount:
             if "source_proposal_id" not in candidate_columns:
                 self._db.execute("ALTER TABLE pa_candidates ADD COLUMN source_proposal_id TEXT NOT NULL DEFAULT ''")
                 self._db.execute("UPDATE pa_candidates SET source_proposal_id=proposal_id WHERE source_proposal_id='' ")
+            funding_columns = {row[1] for row in self._db.execute("PRAGMA table_info(pa_funding_events)")}
+            if "order_id" not in funding_columns:
+                self._db.execute("ALTER TABLE pa_funding_events ADD COLUMN order_id TEXT")
             self._db.execute("INSERT OR IGNORE INTO pa_settings VALUES (1,1)")
             if not self._db.execute("SELECT 1 FROM pa_sessions WHERE status='active' LIMIT 1").fetchone():
                 self._db.execute(
@@ -129,6 +133,7 @@ class PriceActionPaperAccount:
             leverage = self._db.execute("SELECT leverage FROM pa_settings WHERE id=1").fetchone()[0]
             self.broker.leverage = float(leverage)
             self._snapshot_current()
+        self.journal = PriceActionJournalStore(self.path)
 
     def session(self) -> dict:
         with self._lock:
@@ -256,7 +261,8 @@ class PriceActionPaperAccount:
         }
 
     def reconcile_pending_orders(self, visual_state: dict | None = None,
-                                 candle: Bar | None = None) -> dict:
+                                 candle: Bar | None = None,
+                                 *, feed_reliable: bool = True) -> dict:
         """Safely reconcile strategy metadata; manual paper orders are untouched."""
         before = self.audit_pending_orders()
         current = self.session()
@@ -295,6 +301,14 @@ class PriceActionPaperAccount:
                                   "reason": f"metadata is already terminal ({meta['status']})"}
                         actions.append(action)
                         self._audit("paper_order_reconciled", object_id=meta["order_id"], payload=action)
+                    except (KeyError, ValueError):
+                        pass
+                elif meta_open and broker_open and not feed_reliable:
+                    terminal_status = "DATA_PAUSED"
+                    reason = ("market data became unreliable before a provable activation; "
+                              "pending paper order cancelled without inferring a fill")
+                    try:
+                        self.broker.cancel(meta["order_id"])
                     except (KeyError, ValueError):
                         pass
                 elif meta_open and broker_open and visual_state is not None:
@@ -339,6 +353,9 @@ class PriceActionPaperAccount:
                 "SELECT * FROM pa_activity WHERE session_id=? ORDER BY created_at DESC LIMIT 500", (current.get("id", ""),))]
             metadata = [dict(row) for row in self._db.execute(
                 "SELECT * FROM pa_order_meta WHERE session_id=? ORDER BY created_at DESC", (current.get("id", ""),))]
+            funding = [dict(row) for row in self._db.execute(
+                "SELECT * FROM pa_funding_events WHERE session_id=? ORDER BY funding_time DESC",
+                (current.get("id", ""),))]
         return {
             "account_scope": "PRICE_ACTION_VISUAL_LAB_ONLY",
             "currency": "USDT",
@@ -353,6 +370,7 @@ class PriceActionPaperAccount:
             "candidates": [{**row, "payload": json.loads(row["payload"])} for row in candidates],
             "order_metadata": [{**row, "config": json.loads(row["config_json"])} for row in metadata],
             "activity": [{**row, "payload": json.loads(row["payload"])} for row in activity],
+            "funding_events": funding,
             "order_audit": self.audit_pending_orders(),
         }
 
@@ -387,6 +405,7 @@ class PriceActionPaperAccount:
         """Erase all PA operational history; used only by the global Factory Reset."""
         with self._lock:
             self.broker.factory_reset(self.starting_balance)
+            self.journal.factory_reset()
             now, new_id = _iso(), uuid.uuid4().hex
             for table in ("pa_order_meta", "pa_candidates", "pa_funding_events", "pa_activity", "pa_sessions"):
                 self._db.execute(f"DELETE FROM {table}")
@@ -607,7 +626,9 @@ class PriceActionPaperAccount:
         return {"accepted": True, "order": order, "configuration": order_config}
 
     def synchronize_strategy(self, visual_state: dict, *, contract_rules: dict,
-                             candle: Bar, feed_reliable: bool = True) -> dict:
+                             candle: Bar, feed_reliable: bool = True,
+                             feed_status: dict | None = None,
+                             execution_quote: dict | None = None) -> dict:
         """Advance broker state and consume newly eligible proposals exactly once."""
         config = self._execution_config()
         current = self.session()
@@ -615,7 +636,8 @@ class PriceActionPaperAccount:
             raise ValueError("no active Price Action session")
         proposals = {row["id"]: row for row in visual_state.get("proposals", [])}
         setups = {row["id"]: row for row in visual_state.get("setups", [])}
-        reconciliation = self.reconcile_pending_orders(visual_state, candle)
+        reconciliation = self.reconcile_pending_orders(
+            visual_state, candle, feed_reliable=feed_reliable)
         with self._lock, self._db:
             open_meta = [dict(row) for row in self._db.execute(
                 "SELECT * FROM pa_order_meta WHERE session_id=? AND status IN ('ORDER_PENDING','PARTIALLY_FILLED','ENTERED')",
@@ -624,7 +646,28 @@ class PriceActionPaperAccount:
             for meta in open_meta:
                 cfg = json.loads(meta["config_json"])
                 protections[meta["order_id"]] = {"stop_loss": cfg["stop"], "take_profit": cfg["target"]}
-            result = self.broker.process_candle(current.get("symbol", "BTCUSDT"), candle, protections=protections)
+            result = (self.broker.process_candle(
+                current.get("symbol", "BTCUSDT"), candle, protections=protections)
+                if feed_reliable else {
+                    "symbol": current.get("symbol", "BTCUSDT"), "events": [],
+                    "account": self.broker.account(), "paused": True,
+                    "reason": "unreliable market data; no fills or exits inferred",
+                })
+            quote_evidence = None
+            if feed_reliable and (feed_status or {}).get("state") == "SYNCHRONIZED":
+                candidate_quote = execution_quote or {}
+                try:
+                    bid, ask, mark = (float(candidate_quote[key]) for key in ("bid", "ask", "mark"))
+                    if bid > 0 and ask >= bid and mark > 0:
+                        quote_evidence = {
+                            "bid": bid, "ask": ask, "mark": mark,
+                            "quote_observed_at": (feed_status or {}).get("last_quote_update"),
+                            "mark_observed_at": (feed_status or {}).get("last_mark_update"),
+                            "source": "Binance USDⓈ-M reconciled public streams",
+                            "market_data_health": "SYNCHRONIZED",
+                        }
+                except (KeyError, TypeError, ValueError):
+                    quote_evidence = None
             for event in result["events"]:
                 meta = self._db.execute("SELECT * FROM pa_order_meta WHERE order_id=?", (event.get("order_id"),)).fetchone()
                 if meta:
@@ -632,9 +675,17 @@ class PriceActionPaperAccount:
                     status = "ENTERED" if order["status"] == "filled" else "PARTIALLY_FILLED"
                     self._db.execute("UPDATE pa_order_meta SET status=?,reason=?,updated_at=? WHERE order_id=?",
                                      (status, "paper fill simulated from verified market data", _iso(), meta["order_id"]))
-                    self._audit("paper_order_filled", strategy_id=meta["strategy_id"], object_id=meta["order_id"], payload=event)
+                    self._audit("paper_order_filled", strategy_id=meta["strategy_id"], object_id=meta["order_id"],
+                                payload={**event, "execution_quote": quote_evidence})
                 elif str(event.get("order_id", "")).startswith("protective-"):
-                    self._audit("paper_position_completed", object_id=event["order_id"], payload=event)
+                    owning = self._db.execute(
+                        "SELECT order_id,strategy_id FROM pa_order_meta WHERE session_id=? AND status='ENTERED' ORDER BY created_at DESC LIMIT 1",
+                        (current["id"],)).fetchone()
+                    self._audit("paper_position_completed",
+                                strategy_id=owning["strategy_id"] if owning else "",
+                                object_id=owning["order_id"] if owning else event["order_id"],
+                                payload={**event, "execution_quote": quote_evidence,
+                                         "broker_event_order_id": event["order_id"]})
                     self._db.execute(
                         "UPDATE pa_order_meta SET status='COMPLETED',reason=?,updated_at=? WHERE session_id=? AND status='ENTERED'",
                         ("protective stop or fixed 2.5R target completed the paper position",
@@ -651,7 +702,8 @@ class PriceActionPaperAccount:
                     continue
                 setup = setups.get(proposal["setup_id"], {})
                 if not feed_reliable:
-                    self._candidate(proposal, setup, contract_rules, "REJECTED", "new entry paused because market feed is unreliable", config)
+                    self._candidate(proposal, setup, contract_rules, "DATA_PAUSED",
+                                    "new entry paused because market feed is unreliable", config)
                     rejected.append({"proposal_id": proposal["id"], "reason": "feed unreliable"})
                 elif config.operating_mode == "signals_only":
                     self._candidate(proposal, setup, contract_rules, "SIGNAL_ONLY", "signals-only mode does not create an order", config)
@@ -661,8 +713,18 @@ class PriceActionPaperAccount:
                     placed = self._place_proposal(proposal, setup, contract_rules, config, source="automatic")
                     (created if placed["accepted"] else rejected).append(placed)
             self._snapshot_current(metrics=visual_state.get("metrics", {}))
+        observed_health = feed_status or {
+            "state": "SYNCHRONIZED" if feed_reliable else "DATA_PAUSED",
+            "health_reason": "caller supplied only the reliability boundary",
+        }
+        captured = self.journal.capture(
+            visual_state=visual_state, session=self._decode_session(dict(current)),
+            paper_state=self.state(), feed_status=observed_health,
+            partition_label="paper_forward" if current.get("mode") == "LIVE_PAPER" else "development",
+        )
         return {"broker": result, "created": created, "rejected": rejected,
                 "reconciliation": reconciliation,
+                "journal_entries_captured": captured,
                 "operating_mode": config.operating_mode, "feed_reliable": feed_reliable,
                 "real_execution_allowed": False}
 
@@ -694,11 +756,14 @@ class PriceActionPaperAccount:
                 return {"applied": False, "reason": "funding event already processed",
                         "originally_applied": bool(existing["applied"]), "funding": existing["amount"]}
             result = self.broker.apply_funding(symbol, rate, mark_price)
+            owning = self._db.execute(
+                "SELECT order_id FROM pa_order_meta WHERE session_id=? AND status='ENTERED' ORDER BY created_at DESC LIMIT 1",
+                (session_id,)).fetchone()
             with self._db:
                 self._db.execute(
-                    "INSERT INTO pa_funding_events VALUES (?,?,?,?,?,?,?)",
+                    "INSERT INTO pa_funding_events(session_id,symbol,funding_time,funding_rate,mark_price,applied,amount,order_id) VALUES (?,?,?,?,?,?,?,?)",
                     (*key, float(rate), float(mark_price), int(bool(result.get("applied"))),
-                     float(result.get("funding") or 0)),
+                     float(result.get("funding") or 0), owning["order_id"] if owning else None),
                 )
             return {**result, "funding_time": funding_time, "rate": rate,
                     "source": "Binance USDⓈ-M Futures public funding history"}
@@ -827,6 +892,7 @@ class PriceActionLabRuntime:
         self.engine: NativePriceActionEngine | None = None
         self.identity: tuple[str, str] | None = None
         self.config_signature = ""
+        self._shadow_runs: dict[str, dict] = {}
         self.stream = PriceActionPublicStream(
             market.public_usdm_window, event_sink=account.record_external_event,
             bar_sink=self._on_closed_bar,
@@ -844,7 +910,10 @@ class PriceActionLabRuntime:
             self.engine = NativePriceActionEngine(config)
             started = self.stream.start(*identity)
             if started:
-                self.engine.ingest_closed_bars(self.stream.snapshot()["closed_bars"])
+                self.engine.ingest_closed_bars(
+                    self.stream.snapshot()["closed_bars"],
+                    market_data_health="LIVE_BOOTSTRAP_RECONCILED",
+                )
 
     def _session_identity(self, expected_mode: str) -> tuple[dict, tuple[str, str]]:
         session = self.account.session()
@@ -878,43 +947,99 @@ class PriceActionLabRuntime:
         with self._lock:
             if self.engine is None:
                 return
+            status = self.stream.status()
             try:
-                self.engine.process_closed_bar(bar)
+                self.engine.process_closed_bar(bar, market_data_health=status["state"])
             except ValueError:
                 # A REST reconciliation can deliver an older missing bar. Rebuild
                 # from the stream's now-contiguous history to preserve chronology.
                 rows = self.stream.snapshot()["closed_bars"]
                 self.engine = NativePriceActionEngine(self._engine_config(*self.identity))
-                self.engine.ingest_closed_bars(rows)
+                self.engine.ingest_closed_bars(rows, market_data_health=status["state"])
             state = self.engine.visual_state(candle_window=1500)
+            self._advance_shadows(bar)
             rules = self.market.usdm_contract_rules(self.identity[0])
-            status = self.stream.status()
             session = self.account.session()
+            stream_snapshot = self.stream.snapshot()
+            quote = stream_snapshot.get("quote") or {}
+            state["live_display"] = {
+                "bid": quote.get("bid"), "ask": quote.get("ask"),
+                "mark": quote.get("mark"), "connection_state": status["state"],
+            }
+            state["data_provenance"] = {
+                "mode": "LIVE_BINANCE_WEBSOCKET_WITH_REST_RECOVERY",
+                "market_data_mode": "LIVE",
+                "market_data_source": "Binance USDⓈ-M public streams",
+                "exchange": "Binance USDⓈ-M Futures",
+                "symbol": self.identity[0], "timeframe": self.identity[1],
+                "connection_state": status["state"],
+                "real_execution_allowed": False,
+            }
+            state["metrics_scope"].update({
+                "session_id": session.get("id"),
+                "mode": "LIVE_PUBLIC_MARKET_OBSERVATION",
+            })
             session_matches = (
                 session.get("mode") == "LIVE_PAPER" and
                 (session.get("symbol"), session.get("timeframe")) == self.identity
             )
             if session_matches:
                 self.account.synchronize_strategy(state, contract_rules=rules, candle=bar,
-                                                  feed_reliable=bool(status["reliable"]))
+                                                  feed_reliable=bool(status["reliable"]),
+                                                  feed_status=status,
+                                                  execution_quote=quote)
             else:
                 self.account.record_external_event({
                     "kind": "view_only_market_update", "symbol": self.identity[0],
                     "timeframe": self.identity[1],
                     "reason": "active paper session owns a different symbol/timeframe",
                 })
-            try:
-                quote = self.market.public_usdm_quote(self.identity[0])
-                self.account.apply_funding_once(symbol=self.identity[0],
-                                                funding_time=quote.get("last_funding_time"),
-                                                rate=quote.get("funding_rate") or 0,
-                                                mark_price=quote["mark"])
-                liquidation = self.account.broker.process_mark(self.identity[0], quote["mark"])
-                if liquidation.get("liquidated"):
-                    self.account.record_external_event({"kind": "paper_liquidation", **liquidation})
-            except Exception as exc:
-                self.account.record_external_event({"kind": "funding_or_mark_delayed", "error": str(exc),
-                                                    "symbol": self.identity[0]})
+            if status["reliable"]:
+                # Use the mark that participated in the stream-health
+                # reconciliation for account-changing liquidation checks.  A
+                # separate REST snapshot may supply the last funding timestamp,
+                # but it may never substitute an unreconciled mark.
+                reconciled_mark: float | None = None
+                try:
+                    stream_quote = self.stream.snapshot()["quote"]
+                    reconciled_mark = float(stream_quote["mark"])
+                    if reconciled_mark <= 0:
+                        raise ValueError("reconciled stream mark is invalid")
+                    liquidation = self.account.broker.process_mark(
+                        self.identity[0], reconciled_mark)
+                    if liquidation.get("liquidated"):
+                        self.account.record_external_event({"kind": "paper_liquidation", **liquidation})
+                except Exception as exc:
+                    self.account.record_external_event({
+                        "kind": "paper_mark_processing_delayed", "error": str(exc),
+                        "symbol": self.identity[0],
+                    })
+                try:
+                    if reconciled_mark is None:
+                        raise ValueError("funding requires a reconciled stream mark")
+                    funding_quote = self.market.public_usdm_quote(self.identity[0])
+                    funding_mark = float(funding_quote["mark"])
+                    deviation_bps = abs(funding_mark - reconciled_mark) / reconciled_mark * 10_000
+                    if deviation_bps > 100:
+                        raise ValueError(
+                            f"funding snapshot mark differs by {deviation_bps:.2f} bps")
+                    self.account.apply_funding_once(
+                        symbol=self.identity[0],
+                        funding_time=funding_quote.get("last_funding_time"),
+                        rate=funding_quote.get("funding_rate") or 0,
+                        mark_price=reconciled_mark,
+                    )
+                except Exception as exc:
+                    self.account.record_external_event({
+                        "kind": "paper_funding_processing_delayed", "error": str(exc),
+                        "symbol": self.identity[0],
+                    })
+            else:
+                self.account.record_external_event({
+                    "kind": "paper_mark_processing_paused", "symbol": self.identity[0],
+                    "market_data_health": status["state"],
+                    "reason": "unreconciled market data cannot change paper account state",
+                })
 
     def live_state(self, symbol: str, timeframe: str, *, visible: int = 500,
                    request_id: str | None = None) -> dict:
@@ -999,11 +1124,25 @@ class PriceActionLabRuntime:
         engine.ingest_closed_bars(rows[:warm_to])
         rules = self.market.usdm_contract_rules(symbol) if owns_replay else None
         for row in rows[warm_to:reveal]:
-            engine.process_closed_bar(row)
+            engine.process_closed_bar(row, market_data_health="HISTORICAL_REPLAY")
             if advances_session:
-                self.account.synchronize_strategy(engine.visual_state(candle_window=3000),
+                step_state = engine.visual_state(candle_window=3000)
+                step_state["data_provenance"] = {
+                    "mode": "HISTORICAL_REPLAY", "market_data_mode": "REPLAY",
+                    "market_data_source": "verified Binance USDⓈ-M Futures cache",
+                    "exchange": "Binance USDⓈ-M Futures", "symbol": symbol,
+                    "timeframe": timeframe, "real_execution_allowed": False,
+                }
+                step_state["metrics_scope"].update({
+                    "session_id": session.get("id"), "mode": "HISTORICAL_REPLAY",
+                })
+                self.account.synchronize_strategy(step_state,
                                                   contract_rules=rules, candle=row,
-                                                  feed_reliable=True)
+                                                  feed_reliable=True,
+                                                  feed_status={
+                                                      "state": "HISTORICAL_REPLAY",
+                                                      "health_reason": "verified cached completed candle",
+                                                  })
         state = engine.visual_state(candle_window=min(limit, reveal))
         if advances_session:
             self.account.set_replay_cursor(reveal, state.get("metrics"))
@@ -1036,7 +1175,92 @@ class PriceActionLabRuntime:
                     session.get("symbol"), session.get("timeframe")):
                 visual_state = self.engine.visual_state(candle_window=1500)
                 candle = self.engine.bars[-1] if self.engine.bars else None
-        return self.account.reconcile_pending_orders(visual_state, candle)
+        feed_reliable = True
+        if session.get("mode") == "LIVE_PAPER" and self.identity == (
+                session.get("symbol"), session.get("timeframe")):
+            feed_reliable = bool(self.stream.status()["reliable"])
+        return self.account.reconcile_pending_orders(
+            visual_state, candle, feed_reliable=feed_reliable)
+
+    def start_shadow(self, candidate_id: str) -> dict:
+        """Start an isolated PAPER-only candidate observer on the baseline bars."""
+        with self._lock:
+            if self.engine is None or self.identity is None:
+                raise RuntimeError("Price Action baseline engine is not initialized")
+            candidate = self.account.journal.candidate(candidate_id)
+            if candidate["status"] != "APPROVED_FOR_SHADOW":
+                raise ValueError("candidate requires explicit approval before shadow observation")
+            config = asdict(self.engine.config)
+            key = candidate["rule_key"]
+            if key not in config:
+                raise ValueError("candidate rule is not part of the native Price Action configuration")
+            config[key] = candidate["rule_value"]
+            config["execution_allowed"] = False
+            shadow = NativePriceActionEngine(PriceActionConfig(**config))
+            shadow.ingest_closed_bars(self.engine.bars)
+            run_id = f"pa-shadow-{uuid.uuid4().hex}"
+            self._shadow_runs[candidate_id] = {
+                "run_id": run_id, "engine": shadow, "session_id": self.account.session()["id"],
+                "started_after": self.engine.bars[-1].timestamp if self.engine.bars else None,
+            }
+            self.account.journal.candidate_transition(
+                candidate_id, action="start_shadow", reason="explicit PAPER shadow start",
+                initiated_by="authenticated_user")
+            return {"run_id": run_id, "candidate_id": candidate_id,
+                    "execution_mode": "PAPER", "official_account_affected": False,
+                    "real_execution_allowed": False}
+
+    def _advance_shadows(self, bar: Bar) -> None:
+        if self.engine is None:
+            return
+        baseline = self.engine.snapshots.get(bar.timestamp)
+        for candidate_id, run in list(self._shadow_runs.items()):
+            shadow: NativePriceActionEngine = run["engine"]
+            if bar.timestamp not in shadow.processed:
+                shadow.process_closed_bar(bar)
+            candidate = shadow.snapshots.get(bar.timestamp)
+            started_after = run.get("started_after")
+            baseline_proposals = [
+                asdict(self.engine.proposals[row]) for row in (baseline.proposal_ids if baseline else ())
+                if row in self.engine.proposals]
+            candidate_proposals = [
+                asdict(shadow.proposals[row]) for row in (candidate.proposal_ids if candidate else ())
+                if row in shadow.proposals]
+            self.account.journal.record_shadow(
+                run_id=run["run_id"], candidate_id=candidate_id,
+                session_id=run["session_id"], candle_identity=bar.timestamp.isoformat(),
+                baseline={
+                    "proposal_ids": list(baseline.proposal_ids) if baseline else [],
+                    "proposals": baseline_proposals,
+                    "setup_ids": list(baseline.setup_ids) if baseline else [],
+                    "structure_bias": baseline.structure_bias if baseline else None,
+                    "trades": [
+                        asdict(row) for row in self.engine.research_trades.values()
+                        if started_after is None or row.created_at > started_after],
+                },
+                candidate={
+                    "proposal_ids": list(candidate.proposal_ids) if candidate else [],
+                    "proposals": candidate_proposals,
+                    "setup_ids": list(candidate.setup_ids) if candidate else [],
+                    "structure_bias": candidate.structure_bias if candidate else None,
+                    "trades": [
+                        asdict(row) for row in shadow.research_trades.values()
+                        if started_after is None or row.created_at > started_after],
+                },
+            )
+
+    def stop_shadow(self, candidate_id: str) -> dict:
+        with self._lock:
+            run = self._shadow_runs.pop(candidate_id, None)
+            if not run:
+                raise KeyError(candidate_id)
+            self.account.journal.candidate_transition(
+                candidate_id, action="stop_shadow", reason="explicit PAPER shadow stop",
+                initiated_by="authenticated_user")
+        return self.account.journal.shadow_report(candidate_id)
+
+    def shadow_report(self, candidate_id: str) -> dict:
+        return self.account.journal.shadow_report(candidate_id)
 
     def stop(self) -> None:
         self.stream.stop()

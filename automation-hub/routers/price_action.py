@@ -11,7 +11,7 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
 from data.market_data_v2 import TIMEFRAMES
-from services.native_price_action import RESEARCH_ID, STRATEGIES, PriceActionConfig
+from services.native_price_action import RESEARCH_ID, STRATEGIES, STRATEGY_VERSION, PriceActionConfig
 from services.price_action_lab import PaperExecutionConfig, replay_state
 from services.price_action_research import controlled_pa_smc_report
 from services.price_action_reference_study import run_reference_study
@@ -57,7 +57,7 @@ def manifest():
     return {
         "research_id": RESEARCH_ID,
         "status": "RESEARCH_ONLY",
-        "version": "1.0.0",
+        "version": STRATEGY_VERSION,
         "native_engine_sha256": hashlib.sha256(engine_source.read_bytes()).hexdigest(),
         "strategies": list(STRATEGIES),
         "venue": "Binance USDⓈ-M Futures",
@@ -415,6 +415,164 @@ def reset_paper_account(body: ResetBody, x_webhook_secret: Optional[str] = Heade
     if body.confirmation != "RESET PRICE ACTION PAPER":
         raise HTTPException(422, "confirmation must exactly match RESET PRICE ACTION PAPER")
     return _wa.price_action_paper.reset()
+
+
+@router.get("/journal")
+def price_action_journal(
+        session_id: Optional[str] = None, strategy_id: Optional[str] = None,
+        symbol: Optional[str] = None, timeframe: Optional[str] = None,
+        direction: Optional[str] = None, result: Optional[str] = None,
+        trigger_type: Optional[str] = None, partition: Optional[str] = None,
+        data_quality: Optional[str] = None, strategy_version: Optional[str] = None,
+        zone_type: Optional[str] = None, touch_count: Optional[int] = None,
+        regime: Optional[str] = None, rule_compliance: Optional[bool] = None,
+        entry_model: Optional[str] = None,
+        date_from: Optional[str] = None, date_to: Optional[str] = None):
+    return _wa.price_action_paper.journal.list(
+        session_id=session_id, strategy_id=strategy_id, symbol=symbol,
+        timeframe=timeframe, direction=direction, result=result,
+        trigger_type=trigger_type, partition=partition, data_quality=data_quality,
+        strategy_version=strategy_version, zone_type=zone_type,
+        touch_count=touch_count, regime=regime, rule_compliance=rule_compliance,
+        entry_model=entry_model, date_from=date_from, date_to=date_to)
+
+
+@router.get("/journal/export")
+def export_price_action_journal(
+        session_id: Optional[str] = None, strategy_id: Optional[str] = None,
+        symbol: Optional[str] = None, timeframe: Optional[str] = None,
+        direction: Optional[str] = None, result: Optional[str] = None,
+        trigger_type: Optional[str] = None, partition: Optional[str] = None,
+        data_quality: Optional[str] = None, strategy_version: Optional[str] = None,
+        zone_type: Optional[str] = None, touch_count: Optional[int] = None,
+        regime: Optional[str] = None, rule_compliance: Optional[bool] = None,
+        entry_model: Optional[str] = None,
+        date_from: Optional[str] = None, date_to: Optional[str] = None):
+    return {
+        "format_version": "PRICE_ACTION_JOURNAL_V1",
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "journal": _wa.price_action_paper.journal.list(
+            session_id=session_id, strategy_id=strategy_id,
+            symbol=symbol, timeframe=timeframe, direction=direction,
+            result=result, trigger_type=trigger_type, partition=partition,
+            data_quality=data_quality, strategy_version=strategy_version,
+            zone_type=zone_type, touch_count=touch_count, regime=regime,
+            rule_compliance=rule_compliance, entry_model=entry_model,
+            date_from=date_from, date_to=date_to),
+        "immutable_source_records": True, "real_execution_allowed": False,
+    }
+
+
+@router.get("/journal/{journal_id}")
+def price_action_journal_record(journal_id: str):
+    try:
+        return _wa.price_action_paper.journal.get(journal_id)
+    except KeyError as exc:
+        _bad(exc, 404)
+
+
+class JournalRevisionBody(BaseModel):
+    notes: str = Field(default="", max_length=4000)
+    tags: list[str] = Field(default_factory=list, max_length=30)
+
+
+@router.post("/journal/{journal_id}/revisions")
+def revise_price_action_journal(journal_id: str, body: JournalRevisionBody,
+                                x_webhook_secret: Optional[str] = Header(default=None)):
+    _wa._check_secret(x_webhook_secret)
+    try:
+        return _wa.price_action_paper.journal.revise(
+            journal_id, notes=body.notes, tags=body.tags,
+            initiated_by="authenticated_admin")
+    except KeyError as exc:
+        _bad(exc, 404)
+
+
+@router.get("/learning/analysis")
+def price_action_learning_analysis(minimum_sample: int = Query(30, ge=10, le=1000)):
+    return _wa.price_action_paper.journal.analyze(
+        minimum_pattern_sample=minimum_sample)
+
+
+class LearningCandidateBody(BaseModel):
+    parent_strategy_version: str = STRATEGY_VERSION
+    rule_difference: dict
+    evidence_ids: list[str] = Field(default_factory=list)
+    contradicting_evidence: list[str] = Field(default_factory=list)
+    development_period: dict = Field(default_factory=dict)
+    validation_period: dict = Field(default_factory=dict)
+    code_fingerprint: str
+    dataset_fingerprint: str
+    expected_benefit: str
+    risks: list[str] = Field(default_factory=list)
+    source_partition: str = "development"
+
+
+@router.get("/learning/candidates")
+def price_action_learning_candidates():
+    candidates = _wa.price_action_paper.journal.candidates()
+    return {"candidates": [
+                {**row, "shadow_report": _wa.price_action_paper.journal.shadow_report(row["id"])}
+                for row in candidates],
+            "active_strategy_mutated": False, "real_execution_allowed": False}
+
+
+@router.post("/learning/candidates")
+def propose_price_action_candidate(
+        body: LearningCandidateBody,
+        x_webhook_secret: Optional[str] = Header(default=None)):
+    _wa._check_secret(x_webhook_secret)
+    try:
+        return _wa.price_action_paper.journal.propose_candidate(**body.model_dump())
+    except ValueError as exc:
+        _bad(exc, 409)
+
+
+class CandidateTransitionBody(BaseModel):
+    action: str
+    reason: str = Field(min_length=3, max_length=2000)
+
+
+@router.post("/learning/candidates/{candidate_id}/transition")
+def transition_price_action_candidate(
+        candidate_id: str, body: CandidateTransitionBody,
+        x_webhook_secret: Optional[str] = Header(default=None)):
+    _wa._check_secret(x_webhook_secret)
+    try:
+        return _wa.price_action_paper.journal.candidate_transition(
+            candidate_id, action=body.action, reason=body.reason,
+            initiated_by="authenticated_admin")
+    except KeyError as exc:
+        _bad(exc, 404)
+    except ValueError as exc:
+        _bad(exc, 409)
+
+
+@router.post("/learning/candidates/{candidate_id}/shadow/start")
+def start_price_action_shadow(candidate_id: str,
+                              x_webhook_secret: Optional[str] = Header(default=None)):
+    _wa._check_secret(x_webhook_secret)
+    try:
+        return _wa.price_action_runtime.start_shadow(candidate_id)
+    except KeyError as exc:
+        _bad(exc, 404)
+    except (ValueError, RuntimeError) as exc:
+        _bad(exc, 409)
+
+
+@router.post("/learning/candidates/{candidate_id}/shadow/stop")
+def stop_price_action_shadow(candidate_id: str,
+                             x_webhook_secret: Optional[str] = Header(default=None)):
+    _wa._check_secret(x_webhook_secret)
+    try:
+        return _wa.price_action_runtime.stop_shadow(candidate_id)
+    except KeyError as exc:
+        _bad(exc, 404)
+
+
+@router.get("/learning/candidates/{candidate_id}/shadow")
+def price_action_shadow_report(candidate_id: str):
+    return _wa.price_action_runtime.shadow_report(candidate_id)
 
 
 @router.get("/experiments")

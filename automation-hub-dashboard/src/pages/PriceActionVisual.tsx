@@ -6,7 +6,7 @@ import { apiDownload, apiGet, apiPostJson } from "../lib/api";
 import { useApp } from "../app-context";
 
 type Mode = "live" | "replay";
-type BottomTab = "positions" | "orders" | "trades" | "setups" | "rejected" | "session" | "connection";
+type BottomTab = "positions" | "orders" | "trades" | "setups" | "rejected" | "journal" | "learning" | "session" | "connection";
 type ChartPreset = "clean" | "structure" | "zones" | "strategy" | "trades" | "debug";
 type Direction = "bullish" | "bearish";
 interface Swing { id: string; kind: "high" | "low"; price: number; occurred_at: string; confirmed_at: string; label: string }
@@ -40,11 +40,41 @@ interface PaperState {
   activity: Record<string, any>[];
   order_audit?: { session_id: string; pending_paper_orders: number; pending_strategy_orders: number; pending_manual_orders: number; duplicate_strategy_orders: Record<string, any>[]; discrepancies: Record<string, any>[]; manual_orders_are_never_auto_cancelled: boolean };
 }
+interface PAJournalEntry {
+  revision_no: number;
+  identity: { journal_entry_id: string; session_id: string; strategy_id: string; strategy_version: string; configuration_fingerprint: string; dataset_fingerprint: string; symbol: string; timeframe: string; direction: string; research_partition: string };
+  market_context: { data_health_state: string; data_health_reason?: string; zone_role?: string | null };
+  setup: { setup_id: string; state: string; trigger_classification?: string | null; state_transitions: Record<string, any>[] };
+  order_risk: { requested_entry?: number | null; actual_simulated_fill?: number | null; stop?: number | null; target?: number | null; commission?: number | null; bid_ask_fill?: { bid?: number; ask?: number; mark?: number; source?: string } | null; fill_quote_evidence_status?: string; funding?: { amount_usdt?: number | null; normalized_r?: number | null; event_count: number; coverage: string } };
+  outcome: { status: string; result: string; net_r?: number | null; gross_r?: number | null; costs_r?: number | null; exit_timestamp?: string | null; exit_reason?: string | null; maximum_favourable_excursion?: number | null; maximum_adverse_excursion?: number | null; bars_to_entry?: number | null; bars_in_trade?: number | null; excursion_model?: string | null };
+  review: { learning_classification: string; classification_explanation: string; include_in_research_statistics: boolean; researcher_notes?: string; tags?: string[] };
+  chart_state: { candle_timestamp?: string | null; zone_id?: string | null; event_id?: string | null; entry?: number | null; stop?: number | null; target?: number | null };
+}
+interface PAJournalResponse {
+  entries: PAJournalEntry[];
+  statistics: { setups: number; completed: number; wins: number; losses: number; net_r: number; expectancy_r: number };
+  real_execution_allowed: false;
+}
+interface PALearningAnalysis {
+  classifications: Record<string, number>;
+  patterns: { dimension: string; segment: string; strategy_id: string; direction: string; symbol: string; timeframe: string; setups: number; completed: number; net_expectancy_r: number; uncertainty: string; candidate_eligible: boolean; confounding_factors: string[] }[];
+  minimum_pattern_sample: number; warning: string; active_strategy_mutated: false; real_execution_allowed: false;
+}
+interface PALearningCandidate {
+  id: string; parent_strategy_version: string; rule_key: string; rule_value: unknown;
+  status: string; expected_benefit: string; live_execution_allowed: false;
+  shadow_report?: { observations: number; shared_signals: number; baseline_only_signals: number;
+    candidate_only_signals: number; changed_entries: number; changed_stops: number;
+    avoided_losses: number; missed_winners: number; additional_costs_r: number;
+    net_effect_r: number; net_oos_effect_status: string; drawdown_effect_r: number;
+    trade_count_change: number; official_paper_account_affected: false };
+}
+type JournalFilters = { strategy_id: string; direction: string; result: string; trigger_type: string; zone_type: string; touch_count: string; regime: string; rule_compliance: string; data_quality: string; entry_model: string; partition: string; strategy_version: string; date_from: string; date_to: string };
 type OperatingMode = "signals_only" | "manual_approval" | "automatic";
 
 const STRATEGIES = ["PA1_SR_REJECTION", "PA2_TREND_PULLBACK", "PA3_FLIP_RETEST", "PA4_FALSE_BREAK_REVERSAL"];
 const TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"];
-const TABS: BottomTab[] = ["positions", "orders", "trades", "setups", "rejected", "session", "connection"];
+const TABS: BottomTab[] = ["positions", "orders", "trades", "setups", "rejected", "journal", "learning", "session", "connection"];
 const money = (value?: number) => Number(value ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const stamp = (value?: string | null) => value ? value.replace("T", " ").replace("+00:00", " UTC").slice(0, 22) : "—";
 const pretty = (value: string) => value.replace(/^PA\d_/, "").replace(/_/g, " ");
@@ -52,7 +82,7 @@ const age = (value?: number | null) => value == null ? "—" : value < 1 ? "<1s"
 const CLEAN_VISIBLE_BARS = 72;
 const ACTIVE_PAPER_PLAN_STATUSES = new Set(["ORDER_PENDING", "PARTIALLY_FILLED", "ENTERED"]);
 const OPEN_BROKER_ORDER_STATUSES = new Set(["open", "partially_filled", "triggered"]);
-const TERMINAL_SETUP_PHASES = new Set(["STOPPED", "TARGET_HIT", "CANCELLED", "INVALIDATED", "EXPIRED"]);
+const TERMINAL_SETUP_PHASES = new Set(["STOPPED", "TARGET_HIT", "CANCELLED", "INVALIDATED", "EXPIRED", "DATA_PAUSED", "LIQUIDATED_PAPER", "CLOSED_OTHER"]);
 const PRESET_FILTERS: Record<ChartPreset, NativeSMCOverlayFilters> = {
   clean: { pivots: false, internal: true, swing: true, structure: false, liquidity: false, fvg: false, orderBlocks: true, mitigated: false, labels: false },
   structure: { pivots: true, internal: true, swing: true, structure: true, liquidity: false, fvg: false, orderBlocks: false, mitigated: false, labels: false },
@@ -155,6 +185,72 @@ function DataTable({ rows, empty }: { rows: Record<string, any>[]; empty: string
   return <div className="pa-table-wrap"><table className="pa-table"><thead><tr>{columns.map((key) => <th key={key}>{pretty(key)}</th>)}</tr></thead><tbody>{rows.map((row, i) => <tr key={String(row.id ?? i)}>{columns.map((key) => <td key={key}>{typeof row[key] === "number" ? Number(row[key]).toLocaleString(undefined, { maximumFractionDigits: 6 }) : String(row[key] ?? "—")}</td>)}</tr>)}</tbody></table></div>;
 }
 
+function JournalPanel({ journal, selected, selectedId, onSelect, filters, onFilters, sessionId, symbol, timeframe }: {
+  journal: PAJournalResponse | null; selected: PAJournalEntry | null; selectedId: string;
+  onSelect: (id: string) => void; filters: JournalFilters;
+  onFilters: (next: JournalFilters) => void;
+  sessionId?: string; symbol: string; timeframe: string;
+}) {
+  const stats = journal?.statistics;
+  const queryFilters = { ...filters, date_to: filters.date_to ? `${filters.date_to}T23:59:59Z` : "" };
+  const query = new URLSearchParams({ session_id: sessionId ?? "", symbol, timeframe,
+    ...Object.fromEntries(Object.entries(queryFilters).filter(([, value]) => value)) });
+  return <div className="pa-governance">
+    <div className="pa-governance-bar"><b>Immutable setup journal · {symbol} {timeframe}</b>
+      <select aria-label="Journal strategy filter" value={filters.strategy_id} onChange={(event) => onFilters({ ...filters, strategy_id: event.target.value })}><option value="">All strategies</option>{STRATEGIES.map((row) => <option key={row} value={row}>{pretty(row)}</option>)}</select>
+      <select aria-label="Journal direction filter" value={filters.direction} onChange={(event) => onFilters({ ...filters, direction: event.target.value })}><option value="">Long &amp; short</option><option value="bullish">Long</option><option value="bearish">Short</option></select>
+      <select aria-label="Journal result filter" value={filters.result} onChange={(event) => onFilters({ ...filters, result: event.target.value })}><option value="">All results</option>{["open", "won", "lost", "cancelled", "rejected", "unfilled"].map((row) => <option key={row}>{row}</option>)}</select>
+      <select aria-label="Journal trigger filter" value={filters.trigger_type} onChange={(event) => onFilters({ ...filters, trigger_type: event.target.value })}><option value="">All triggers</option>{["zone_rejection", "flip_retest", "false_break_reclaim"].map((row) => <option key={row}>{row}</option>)}</select>
+      <select aria-label="Journal zone filter" value={filters.zone_type} onChange={(event) => onFilters({ ...filters, zone_type: event.target.value })}><option value="">All zones</option><option value="support">Support</option><option value="resistance">Resistance</option></select>
+      <select aria-label="Journal touch-count filter" value={filters.touch_count} onChange={(event) => onFilters({ ...filters, touch_count: event.target.value })}><option value="">Any touch</option><option value="1">First touch</option><option value="2">2 touches</option><option value="3">3 touches</option></select>
+      <select aria-label="Journal regime filter" value={filters.regime} onChange={(event) => onFilters({ ...filters, regime: event.target.value })}><option value="">All regimes</option><option value="bullish">Bullish</option><option value="bearish">Bearish</option><option value="neutral">Neutral</option></select>
+      <select aria-label="Journal compliance filter" value={filters.rule_compliance} onChange={(event) => onFilters({ ...filters, rule_compliance: event.target.value })}><option value="">Any compliance</option><option value="true">Rule valid</option><option value="false">Rule violating</option></select>
+      <select aria-label="Journal partition filter" value={filters.partition} onChange={(event) => onFilters({ ...filters, partition: event.target.value })}><option value="">All partitions</option>{["development", "validation", "untouched_oos", "paper_forward"].map((row) => <option key={row}>{row}</option>)}</select>
+      <select aria-label="Journal data-quality filter" value={filters.data_quality} onChange={(event) => onFilters({ ...filters, data_quality: event.target.value })}><option value="">All data health</option>{["SYNCHRONIZED", "HISTORICAL_REPLAY", "STALE_CANDLES", "DATA_PAUSED"].map((row) => <option key={row}>{row}</option>)}</select>
+      <select aria-label="Journal entry-model filter" value={filters.entry_model} onChange={(event) => onFilters({ ...filters, entry_model: event.target.value })}><option value="">All entries</option><option value="confirmation">Confirmation</option><option value="close">Close</option><option value="retracement_50">50% retracement</option></select>
+      <input aria-label="Journal strategy-version filter" value={filters.strategy_version} onChange={(event) => onFilters({ ...filters, strategy_version: event.target.value })} placeholder="Version" />
+      <input aria-label="Journal start-date filter" type="date" value={filters.date_from} onChange={(event) => onFilters({ ...filters, date_from: event.target.value })} />
+      <input aria-label="Journal end-date filter" type="date" value={filters.date_to} onChange={(event) => onFilters({ ...filters, date_to: event.target.value })} />
+      <button className="pa-export" onClick={() => void apiDownload(`/research/price-action/journal/export?${query.toString()}`, `price-action-journal-${sessionId ?? "all"}.json`)}>Export evidence</button>
+    </div>
+    <div className="pa-journal-stats"><span>Setups<b>{stats?.setups ?? 0}</b></span><span>Completed<b>{stats?.completed ?? 0}</b></span><span>W / L<b>{stats?.wins ?? 0} / {stats?.losses ?? 0}</b></span><span>Net R<b>{Number(stats?.net_r ?? 0).toFixed(2)}</b></span><span>Expectancy<b>{Number(stats?.expectancy_r ?? 0).toFixed(3)}R</b></span><span>Execution<b>PAPER ONLY</b></span></div>
+    <div className="pa-journal-grid"><div className="pa-table-wrap"><table className="pa-table"><thead><tr><th>Opened</th><th>Strategy</th><th>Direction</th><th>State</th><th>Result</th><th>Net R</th><th>Health</th><th>Partition</th></tr></thead><tbody>{(journal?.entries ?? []).map((row) => <tr key={row.identity.journal_entry_id} className={selectedId === row.identity.journal_entry_id ? "is-selected" : ""} onClick={() => onSelect(row.identity.journal_entry_id)}><td>{stamp(row.setup.state_transitions[0]?.timestamp as string)}</td><td>{pretty(row.identity.strategy_id)}</td><td>{row.identity.direction}</td><td>{row.setup.state}</td><td>{row.outcome.result}</td><td>{row.outcome.net_r == null ? "—" : row.outcome.net_r.toFixed(3)}</td><td>{row.market_context.data_health_state}</td><td>{pretty(row.identity.research_partition)}</td></tr>)}</tbody></table>{!journal?.entries.length ? <div className="pa-empty">No setup evidence matches these configuration-scoped filters.</div> : null}</div>
+      <div className="pa-journal-detail">{selected ? <><h3>{pretty(selected.identity.strategy_id)} · {selected.identity.direction}</h3><p><b>{selected.review.learning_classification}</b>{selected.review.classification_explanation}</p><dl><dt>Setup</dt><dd>{selected.setup.setup_id}</dd><dt>Version / revision</dt><dd>{selected.identity.strategy_version} / r{selected.revision_no}</dd><dt>Config</dt><dd>{selected.identity.configuration_fingerprint}</dd><dt>Dataset</dt><dd>{selected.identity.dataset_fingerprint}</dd><dt>Decision candle</dt><dd>{stamp(selected.chart_state.candle_timestamp)}</dd><dt>Zone / event</dt><dd>{selected.chart_state.zone_id ?? "—"} / {selected.chart_state.event_id ?? "—"}</dd><dt>Entry / fill</dt><dd>{selected.order_risk.requested_entry ?? "—"} / {selected.order_risk.actual_simulated_fill ?? "—"}</dd><dt>Fill quote</dt><dd>{selected.order_risk.bid_ask_fill ? `${selected.order_risk.bid_ask_fill.bid} / ${selected.order_risk.bid_ask_fill.ask} · mark ${selected.order_risk.bid_ask_fill.mark}` : `— · ${pretty(selected.order_risk.fill_quote_evidence_status ?? "not available")}`}</dd><dt>Stop / target</dt><dd>{selected.order_risk.stop ?? "—"} / {selected.order_risk.target ?? "—"}</dd><dt>Gross / costs / net</dt><dd>{selected.outcome.gross_r ?? "—"} / {selected.outcome.costs_r ?? "—"} / {selected.outcome.net_r ?? "—"} R</dd><dt>MFE / MAE</dt><dd>{selected.outcome.maximum_favourable_excursion ?? "—"} / {selected.outcome.maximum_adverse_excursion ?? "—"} R</dd><dt>Bars to entry / in trade</dt><dd>{selected.outcome.bars_to_entry ?? "—"} / {selected.outcome.bars_in_trade ?? "—"}</dd><dt>Funding</dt><dd>{selected.order_risk.funding?.amount_usdt == null ? `— · ${pretty(selected.order_risk.funding?.coverage ?? "not available")}` : `${selected.order_risk.funding.amount_usdt.toFixed(4)} USDT / ${selected.order_risk.funding.normalized_r?.toFixed(4) ?? "—"}R`}</dd><dt>Included in research</dt><dd>{selected.review.include_in_research_statistics ? "YES" : `NO · ${pretty(selected.review.learning_classification)}`}</dd><dt>Reviewer notes</dt><dd>{selected.review.researcher_notes || "—"}</dd><dt>Tags</dt><dd>{selected.review.tags?.join(", ") || "—"}</dd></dl><h4>Lifecycle</h4><ol>{selected.setup.state_transitions.map((row, index) => <li key={String(row.id ?? index)}><b>{String(row.to_phase ?? row.current_phase ?? "STATE")}</b>{String(row.reason ?? row.reason_code ?? "")}</li>)}</ol></> : <div className="pa-empty">Select a journal record to inspect its immutable lifecycle.</div>}</div>
+    </div>
+  </div>;
+}
+
+function LearningPanel({ analysis, candidates }: { analysis: PALearningAnalysis | null; candidates: PALearningCandidate[] }) {
+  const classifications = Object.entries(analysis?.classifications ?? {}).map(([classification, count]) => ({ classification, count }));
+  const signalRows = candidates.map((row) => ({
+    candidate: row.id.slice(0, 14), status: row.status,
+    observations: row.shadow_report?.observations ?? 0,
+    baseline_only: row.shadow_report?.baseline_only_signals ?? 0,
+    candidate_only: row.shadow_report?.candidate_only_signals ?? 0,
+    shared: row.shadow_report?.shared_signals ?? 0,
+    changed_entry_stop: `${row.shadow_report?.changed_entries ?? 0} / ${row.shadow_report?.changed_stops ?? 0}`,
+  }));
+  const outcomeRows = candidates.map((row) => ({
+    candidate: row.id.slice(0, 14), avoided_losses: row.shadow_report?.avoided_losses ?? 0,
+    missed_winners: row.shadow_report?.missed_winners ?? 0,
+    additional_costs_r: row.shadow_report?.additional_costs_r ?? 0,
+    net_effect_r: row.shadow_report?.net_effect_r ?? 0,
+    drawdown_effect_r: row.shadow_report?.drawdown_effect_r ?? 0,
+    trade_count_change: row.shadow_report?.trade_count_change ?? 0,
+    evidence_scope: row.shadow_report?.net_oos_effect_status ?? "NO_SHADOW_EVIDENCE",
+  }));
+  return <div className="pa-governance">
+    <div className="pa-learning-warning"><b>Governed research only</b><span>{analysis?.warning ?? "Waiting for journal evidence."}</span><span>No automatic parameter mutation · no automatic promotion · no live execution.</span></div>
+    <div className="pa-learning-grid">
+      <section><h3>Outcome classification</h3><DataTable rows={classifications} empty="No classified setup evidence yet." /></section>
+      <section><h3>Pattern evidence</h3><DataTable rows={(analysis?.patterns ?? []).map((row) => ({ dimension: pretty(row.dimension), segment: pretty(row.segment), strategy: pretty(row.strategy_id), market: `${row.symbol} ${row.timeframe}`, sample: row.completed, expectancy_r: row.net_expectancy_r, uncertainty: row.uncertainty, eligible_hypothesis: row.candidate_eligible ? "YES" : "NO" }))} empty="Minimum-sample pattern evidence is not available yet." /></section>
+      <section><h3>Candidate registry</h3><DataTable rows={candidates.map((row) => ({ candidate: row.id.slice(0, 14), parent: row.parent_strategy_version, isolated_rule: row.rule_key, value: JSON.stringify(row.rule_value), status: row.status, live_execution: "DISABLED" }))} empty="No manually governed candidate has been proposed." /></section>
+    </div>
+    <div className="pa-shadow-comparison"><section><h3>Baseline vs candidate signals</h3><DataTable rows={signalRows} empty="No shadow observations yet." /></section><section><h3>Shadow outcome deltas</h3><DataTable rows={outcomeRows} empty="No shadow outcomes yet." /></section></div>
+    <div className="pa-learning-warning"><b>Shadow interpretation</b><span>Avoided losses, missed winners, costs, drawdown and trade-count deltas are isolated PAPER observations—not untouched OOS evidence.</span><span>Official account affected: NO</span></div>
+  </div>;
+}
+
 export default function PriceActionVisual() {
   const { toast } = useApp();
   const [mode, setMode] = useState<Mode>("live");
@@ -184,6 +280,11 @@ export default function PriceActionVisual() {
   const [riskPct, setRiskPct] = useState("0.5");
   const [filters, setFilters] = useState<NativeSMCOverlayFilters>(PRESET_FILTERS.clean);
   const [order, setOrder] = useState({ side: "buy", type: "market", quantity: "0.001", limit_price: "" });
+  const [journal, setJournal] = useState<PAJournalResponse | null>(null);
+  const [selectedJournalId, setSelectedJournalId] = useState("");
+  const [journalFilters, setJournalFilters] = useState<JournalFilters>({ strategy_id: "", direction: "", result: "", trigger_type: "", zone_type: "", touch_count: "", regime: "", rule_compliance: "", data_quality: "", entry_model: "", partition: "", strategy_version: "", date_from: "", date_to: "" });
+  const [learning, setLearning] = useState<PALearningAnalysis | null>(null);
+  const [learningCandidates, setLearningCandidates] = useState<PALearningCandidate[]>([]);
   const [controlsOpen, setControlsOpen] = useState(() => typeof window === "undefined" || window.innerWidth > 820);
   const identityInitialized = useRef(false);
   const chartRequestSequence = useRef(0);
@@ -214,6 +315,25 @@ export default function PriceActionVisual() {
       }
     } catch { /* chart remains usable */ }
   }, [applyPaperIdentity]);
+  const loadGovernance = useCallback(async () => {
+    if (!paper?.session.id) return;
+    const queryFilters = { ...journalFilters,
+      date_to: journalFilters.date_to ? `${journalFilters.date_to}T23:59:59Z` : "" };
+    const query = new URLSearchParams({
+      session_id: paper.session.id, symbol, timeframe,
+      ...Object.fromEntries(Object.entries(queryFilters).filter(([, value]) => value)),
+    });
+    try {
+      const [journalState, analysis, candidates] = await Promise.all([
+        apiGet<PAJournalResponse>(`/research/price-action/journal?${query.toString()}`),
+        apiGet<PALearningAnalysis>("/research/price-action/learning/analysis?minimum_sample=30"),
+        apiGet<{ candidates: PALearningCandidate[] }>("/research/price-action/learning/candidates"),
+      ]);
+      setJournal(journalState); setLearning(analysis); setLearningCandidates(candidates.candidates);
+      setSelectedJournalId((current) => current && journalState.entries.some((row) => row.identity.journal_entry_id === current)
+        ? current : journalState.entries[0]?.identity.journal_entry_id ?? "");
+    } catch { /* research governance panels remain independently unavailable */ }
+  }, [paper?.session.id, symbol, timeframe, journalFilters]);
   const loadChart = useCallback(async () => {
     if (!paper?.session.id) return;
     const sequence = ++chartRequestSequence.current;
@@ -245,6 +365,7 @@ export default function PriceActionVisual() {
   useEffect(() => { void apiGet<{ contracts: string[] }>("/research/price-action/contracts?limit=500").then((row) => setContracts(row.contracts)).catch(() => undefined); }, []);
   useEffect(() => { if (!identityInitialized.current || !paper?.session.id) return; void loadChart(); if (mode !== "live") return; const timer = window.setInterval(() => void loadChart(), 3_000); return () => window.clearInterval(timer); }, [loadChart, mode, paper?.session.id]);
   useEffect(() => { void loadPaper(); const timer = window.setInterval(() => void loadPaper(), 5_000); return () => window.clearInterval(timer); }, [loadPaper]);
+  useEffect(() => { void loadGovernance(); const timer = window.setInterval(() => void loadGovernance(), 8_000); return () => window.clearInterval(timer); }, [loadGovernance]);
   useEffect(() => {
     if (mode !== "replay" || !replayPlaying) return;
     const timer = window.setInterval(() => setCursor((value) => {
@@ -268,8 +389,8 @@ export default function PriceActionVisual() {
   const chart = useMemo(() => displayed ? chartState(displayed, paper, chartPreset, focusedSetup) : null,
     [displayed, paper, chartPreset, focusedSetup]);
   const traces = state?.snapshot?.strategy_traces.filter((row) => row.strategy_id === activeStrategy) ?? [];
-  const ready = traces.filter((row) => row.state === "ENTRY_READY");
-  const rejected = traces.filter((row) => row.state !== "ENTRY_READY").map((row) => ({ strategy: row.strategy_id, direction: row.direction, missing: row.missing_conditions.join(", "), next: row.next_required_event }));
+  const ready = traces.filter((row) => row.state === "ORDER_PENDING");
+  const rejected = traces.filter((row) => row.state !== "ORDER_PENDING").map((row) => ({ strategy: row.strategy_id, direction: row.direction, missing: row.missing_conditions.join(", "), next: row.next_required_event }));
   const pendingPaperOrders = (paper?.orders ?? []).filter((row) => OPEN_BROKER_ORDER_STATUSES.has(String(row.status)));
   const researchOrderRows = (state?.orders ?? []).map((row) => ({ scope: "RESEARCH ENGINE · NOT PAPER BROKER", ...row }));
   const tradeRows = [
@@ -283,6 +404,7 @@ export default function PriceActionVisual() {
   const lastClosed = state?.candles[state.candles.length - 1];
   const marketSelection = pendingMarket ?? { symbol, timeframe, mode };
   const focusedObjectIds = focusedSetup ? [focusedSetup.id, focusedSetup.zone_id, focusedSetup.trigger_event_id].filter((row): row is string => Boolean(row)) : [];
+  const selectedJournal = journal?.entries.find((row) => row.identity.journal_entry_id === selectedJournalId) ?? null;
 
   const submitOrder = async () => {
     try {
@@ -316,6 +438,14 @@ export default function PriceActionVisual() {
   const focusSelectedSetup = () => {
     if (!selectedSetup) return;
     setFocusedSetupId(selectedSetup.id);
+    applyPreset("strategy");
+  };
+  const selectJournal = (journalId: string) => {
+    setSelectedJournalId(journalId);
+    const entry = journal?.entries.find((row) => row.identity.journal_entry_id === journalId);
+    if (!entry || !setupChoices.some((row) => row.id === entry.setup.setup_id)) return;
+    setActiveStrategy(entry.identity.strategy_id);
+    setSelectedSetupId(entry.setup.setup_id); setFocusedSetupId(entry.setup.setup_id);
     applyPreset("strategy");
   };
   const applyAutomation = async () => {
@@ -398,6 +528,12 @@ export default function PriceActionVisual() {
       <button type="button" className="pa-controls-toggle" onClick={() => setControlsOpen((open) => !open)} aria-expanded={controlsOpen}>Controls</button>
       <div className="pa-safety"><b>PAPER ONLY</b><span>REAL ORDERS DISABLED</span></div>
     </header>
+    <div className={`pa-health-scope ${feedReliable ? "is-healthy" : "is-stale"}`}>
+      <b>PRICE ACTION SESSION</b><span>Candles / quote / mark: {healthState}</span>
+      <span>Decision readiness: {feedReliable ? "CLOSED-BAR ELIGIBLE" : "PAUSED · FAIL CLOSED"}</span>
+      <span>Paper execution: {feedReliable ? "ELIGIBLE UNDER SAVED MODE" : "BLOCKED"}</span>
+      <small>The global footer reports the selected Trading Instance, not this independent Price Action session.</small>
+    </div>
 
     <div className="pa-workspace">
       <aside className={`pa-sidebar ${controlsOpen ? "is-open" : ""}`} aria-label="Price Action controls">
@@ -422,13 +558,15 @@ export default function PriceActionVisual() {
         </div>
 
         <div className="pa-bottom">
-          <nav>{TABS.map((row) => <button key={row} className={tab === row ? "active" : ""} onClick={() => setTab(row)}>{row}<em>{row === "positions" ? paper?.positions.length ?? 0 : row === "orders" ? pendingPaperOrders.length : row === "trades" ? tradeRows.length : row === "setups" ? state?.setups.length ?? 0 : row === "rejected" ? rejected.length : ""}</em></button>)}</nav>
-          <div className="pa-bottom-body">
+          <nav>{TABS.map((row) => <button key={row} className={tab === row ? "active" : ""} onClick={() => setTab(row)}>{row}<em>{row === "positions" ? paper?.positions.length ?? 0 : row === "orders" ? pendingPaperOrders.length : row === "trades" ? tradeRows.length : row === "setups" ? state?.setups.length ?? 0 : row === "rejected" ? rejected.length : row === "journal" ? journal?.statistics.setups ?? 0 : row === "learning" ? learningCandidates.length : ""}</em></button>)}</nav>
+          <div className={`pa-bottom-body ${tab === "journal" || tab === "learning" ? "is-governance" : ""}`}>
             {tab === "positions" ? <DataTable rows={paper?.positions ?? []} empty="No open Price Action paper positions." /> : null}
             {tab === "orders" ? <><div className="pa-order-ticket"><select aria-label="Paper order side" value={order.side} onChange={(e) => setOrder({ ...order, side: e.target.value })}><option value="buy">Buy / Long</option><option value="sell">Sell / Short</option></select><select aria-label="Paper order type" value={order.type} onChange={(e) => setOrder({ ...order, type: e.target.value })}><option value="market">Market</option><option value="limit">Limit</option><option value="stop">Stop</option></select><input aria-label="Paper order quantity" value={order.quantity} onChange={(e) => setOrder({ ...order, quantity: e.target.value })} inputMode="decimal" placeholder="Quantity" />{order.type !== "market" ? <input aria-label="Paper order trigger or limit price" value={order.limit_price} onChange={(e) => setOrder({ ...order, limit_price: e.target.value })} inputMode="decimal" placeholder="Trigger / limit price" /> : null}<button onClick={() => void submitOrder()}>Place paper order</button><button className="pa-reconcile" onClick={() => void reconcileOrders()}>Reconcile strategy orders</button><span>PAPER · {pendingPaperOrders.length} pending</span></div><div className="pa-order-audit"><b>Pending paper audit</b><span>Total {paper?.order_audit?.pending_paper_orders ?? pendingPaperOrders.length}</span><span>Strategy {paper?.order_audit?.pending_strategy_orders ?? 0}</span><span>Manual {paper?.order_audit?.pending_manual_orders ?? 0}</span><span>Duplicates {paper?.order_audit?.duplicate_strategy_orders.length ?? 0}</span><span>Discrepancies {paper?.order_audit?.discrepancies.length ?? 0}</span><small>Manual orders are never automatically cancelled by strategy reconciliation.</small></div>{(paper?.candidates ?? []).filter((row) => row.status === "PENDING_APPROVAL").map((row) => <div className="pa-order-ticket" key={row.proposal_id}><b>{String(row.payload.proposal?.strategy_id ?? "Strategy")} · {String(row.payload.proposal?.direction ?? "—")}</b><span>{String(row.payload.reason ?? "Awaiting approval")}</span><button onClick={() => void approve(row.source_proposal_id)}>Approve paper order</button></div>)}<h3 className="pa-table-heading">Pending paper broker orders</h3><DataTable rows={pendingPaperOrders} empty="No pending paper broker orders." /><h3 className="pa-table-heading">Research-engine orders · not paper broker orders</h3><DataTable rows={researchOrderRows} empty="No normalized research-engine orders in this candle window." /></> : null}
             {tab === "trades" ? <DataTable rows={tradeRows} empty="No completed paper fills or normalized research outcomes." /> : null}
             {tab === "setups" ? <DataTable rows={(state?.setups ?? []) as unknown as Record<string, any>[]} empty="No confirmed setups in the visible engine state." /> : null}
             {tab === "rejected" ? <DataTable rows={rejected} empty="No rejected or waiting strategy traces." /> : null}
+            {tab === "journal" ? <JournalPanel journal={journal} selected={selectedJournal} selectedId={selectedJournalId} onSelect={selectJournal} filters={journalFilters} onFilters={setJournalFilters} sessionId={paper?.session.id} symbol={symbol} timeframe={timeframe} /> : null}
+            {tab === "learning" ? <LearningPanel analysis={learning} candidates={learningCandidates} /> : null}
             {tab === "session" ? <><div className="pa-session"><span>Session ID<b>{paper?.session.id ?? "—"}</b></span><span>Started<b>{stamp(paper?.session.started_at)}</b></span><span>Starting balance<b>{money(paper?.session.starting_balance)} USDT</b></span><span>Status<b>{paper?.session.status?.toUpperCase() ?? "—"}</b></span><span>Operating mode<b>{pretty(paper?.session.operating_mode ?? "signals_only")}</b></span></div><div className="pa-order-ticket"><select aria-label="Saved Price Action session" value={selectedSession} onChange={(event) => setSelectedSession(event.target.value)}>{sessions.map((row) => <option key={row.id} value={row.id}>{row.symbol} · {row.timeframe} · {row.status} · {stamp(row.started_at)}</option>)}</select><button onClick={() => void sessionAction("start")}>Start new</button><button disabled={!selectedSession} onClick={() => void sessionAction("resume")}>Resume</button><button disabled={!selectedSession} onClick={() => void sessionAction("duplicate")}>Duplicate</button><button disabled={!paper?.session.id} onClick={() => void sessionAction("end")}>End</button><button className="pa-export" onClick={() => void apiDownload("/research/price-action/paper/export", `price-action-session-${paper?.session.id ?? "current"}.json`)}>Export</button><button className="btn-danger" onClick={() => void resetSession()}>Reset</button></div><DataTable rows={paper?.activity ?? []} empty="No session audit events yet." /></> : null}
             {tab === "connection" ? <div className="pa-session"><span>Exchange<b>Binance USDⓈ-M Futures</b></span><span>Overall health<b>{healthState}</b></span><span>Transport<b>{state?.live_display?.transport_state ?? (mode === "replay" ? "ISOLATED" : "CONNECTING")}</b></span><span>Candle stream<b>{age(state?.live_display?.candle_age_seconds)}</b></span><span>Bid / ask stream<b>{age(state?.live_display?.quote_age_seconds)}</b></span><span>Mark stream<b>{age(state?.live_display?.mark_age_seconds)}</b></span><span>Reconciliation<b>{state?.live_display?.health_reason ?? "—"}</b></span><span>New entries<b>{state?.live_display?.new_entries_paused ? "PAUSED · FAIL CLOSED" : "CLOSED BARS ONLY"}</b></span><span>Real execution<b>DISABLED</b></span></div> : null}
           </div>

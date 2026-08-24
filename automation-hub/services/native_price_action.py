@@ -11,11 +11,13 @@ import json
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import Enum
+from pathlib import Path
 from typing import Iterable, Literal
 
 from bot.types import Bar
 
 RESEARCH_ID = "PRICE_ACTION_NATIVE_V1_RESEARCH"
+STRATEGY_VERSION = "1.1.0"
 EXECUTION_ALLOWED = False
 STRATEGIES = (
     "PA1_SR_REJECTION",
@@ -34,13 +36,15 @@ class SetupPhase(str, Enum):
     LOCATION_REACHED = "LOCATION_REACHED"
     REJECTION_DETECTED = "REJECTION_DETECTED"
     WAITING_FOR_CONFIRMATION = "WAITING_FOR_CONFIRMATION"
-    ENTRY_READY = "ENTRY_READY"
     ORDER_PENDING = "ORDER_PENDING"
     ENTERED = "ENTERED"
     STOPPED = "STOPPED"
     TARGET_HIT = "TARGET_HIT"
     CANCELLED = "CANCELLED"
     INVALIDATED = "INVALIDATED"
+    DATA_PAUSED = "DATA_PAUSED"
+    LIQUIDATED_PAPER = "LIQUIDATED_PAPER"
+    CLOSED_OTHER = "CLOSED_OTHER"
     EXPIRED = "EXPIRED"
 
 
@@ -131,6 +135,15 @@ class SetupTransition:
     timestamp: datetime
     reason: str
     object_id: str | None = None
+    candle_identity: str | None = None
+    market_data_health: str = "HISTORICAL_RECONCILED"
+    reason_code: str = "STATE_TRANSITION"
+    zone_id: str | None = None
+    order_id: str | None = None
+    position_id: str | None = None
+    strategy_version: str = STRATEGY_VERSION
+    configuration_fingerprint: str | None = None
+    relevant_prices: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -149,6 +162,7 @@ class PriceActionSetup:
     invalidation_reason: str | None = None
     transitions: list[SetupTransition] = field(default_factory=list)
     pattern_metadata: list[dict] = field(default_factory=list)
+    context_snapshot: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -181,16 +195,19 @@ class ResearchTrade:
     setup_id: str
     strategy_id: str
     direction: Literal["bullish", "bearish"]
-    status: Literal["PENDING", "OPEN", "WON", "LOST", "EXPIRED"]
+    status: Literal["PENDING", "OPEN", "WON", "LOST", "EXPIRED", "CANCELLED", "INVALIDATED", "DATA_PAUSED"]
     requested_entry: float
     stop: float
     target: float
     created_at: datetime
     valid_until_index: int
+    created_index: int = 0
     filled_at: datetime | None = None
+    filled_index: int | None = None
     raw_fill_price: float | None = None
     fill_price: float | None = None
     closed_at: datetime | None = None
+    closed_index: int | None = None
     exit_price: float | None = None
     raw_exit_price: float | None = None
     gross_r: float | None = None
@@ -203,6 +220,11 @@ class ResearchTrade:
     stop_model: str = "rejection_extreme"
     config_snapshot: dict = field(default_factory=dict)
     intrabar_ambiguous: bool = False
+    maximum_favourable_excursion_r: float | None = None
+    maximum_adverse_excursion_r: float | None = None
+    bars_to_entry: int | None = None
+    bars_in_trade: int | None = None
+    excursion_model: str = "completed_ohlc_conservative"
     live_execution_allowed: bool = False
 
 
@@ -275,6 +297,9 @@ class NativePriceActionEngine:
         if not 0 <= config.confusion_candles <= 3:
             raise ValueError("confusion_candles must be between zero and three")
         self.config = config
+        self.configuration_fingerprint = hashlib.sha256(
+            json.dumps(asdict(config), sort_keys=True, default=str).encode()).hexdigest()
+        self._market_data_health = "HISTORICAL_RECONCILED"
         self.bars: list[Bar] = []
         self.processed: set[datetime] = set()
         self.swings: dict[str, ConfirmedSwing] = {}
@@ -293,7 +318,8 @@ class NativePriceActionEngine:
         self._htf_bucket: list[Bar] = []
         self._htf_bucket_key: int | None = None
 
-    def process_closed_bar(self, bar: Bar) -> PriceActionSnapshot:
+    def process_closed_bar(self, bar: Bar, *,
+                           market_data_health: str = "HISTORICAL_RECONCILED") -> PriceActionSnapshot:
         if bar.timestamp in self.processed:
             if self.latest_snapshot is None:
                 raise RuntimeError("duplicate candle before first snapshot")
@@ -303,14 +329,15 @@ class NativePriceActionEngine:
         if min(bar.open, bar.high, bar.low, bar.close) <= 0 or bar.high < max(bar.open, bar.close) or bar.low > min(bar.open, bar.close):
             raise ValueError("invalid OHLC candle")
 
+        self._market_data_health = str(market_data_health or "UNKNOWN")
         self.processed.add(bar.timestamp)
         self.bars.append(bar)
         index = len(self.bars) - 1
-        self._advance_research_trades(bar, index)
         self._advance_higher_timeframe(bar)
         self._confirm_swings(index)
         self._expire_zones(index)
         self._expire_setups(index)
+        self._advance_research_trades(bar, index)
         bar_events = self._detect_events(bar, index)
         traces, setup_ids, proposal_ids = self._evaluate_strategies(bar, index, bar_events)
         snapshot = PriceActionSnapshot(
@@ -338,8 +365,9 @@ class NativePriceActionEngine:
         self.latest_snapshot = snapshot
         return snapshot
 
-    def ingest_closed_bars(self, bars: Iterable[Bar]) -> list[PriceActionSnapshot]:
-        return [self.process_closed_bar(row) for row in bars]
+    def ingest_closed_bars(self, bars: Iterable[Bar], *,
+                           market_data_health: str = "HISTORICAL_RECONCILED") -> list[PriceActionSnapshot]:
+        return [self.process_closed_bar(row, market_data_health=market_data_health) for row in bars]
 
     @property
     def structure_bias(self) -> Literal["bullish", "bearish", "neutral"]:
@@ -456,7 +484,8 @@ class NativePriceActionEngine:
 
     def _expire_setups(self, index: int) -> None:
         terminal = {SetupPhase.STOPPED, SetupPhase.TARGET_HIT, SetupPhase.CANCELLED,
-                    SetupPhase.EXPIRED, SetupPhase.INVALIDATED}
+                    SetupPhase.EXPIRED, SetupPhase.INVALIDATED, SetupPhase.DATA_PAUSED,
+                    SetupPhase.LIQUIDATED_PAPER, SetupPhase.CLOSED_OTHER}
         for setup in self.setups.values():
             if setup.phase in terminal:
                 continue
@@ -468,15 +497,22 @@ class NativePriceActionEngine:
                 setup.transitions.append(SetupTransition(
                     _id("transition", setup.id, "INVALIDATED", self.bars[index].timestamp), setup.id,
                     previous.value, SetupPhase.INVALIDATED.value, self.bars[index].timestamp,
-                    setup.invalidation_reason, zone.id))
-            elif index > setup.expires_index and setup.phase in {
-                    SetupPhase.WAITING_FOR_CONFIRMATION, SetupPhase.ENTRY_READY}:
+                    setup.invalidation_reason, zone.id,
+                    candle_identity=self.bars[index].timestamp.isoformat(),
+                    market_data_health=self._market_data_health,
+                    reason_code="ZONE_TERMINAL", zone_id=zone.id,
+                    configuration_fingerprint=self.configuration_fingerprint))
+            elif index > setup.expires_index and setup.phase == SetupPhase.WAITING_FOR_CONFIRMATION:
                 previous = setup.phase
                 setup.phase = SetupPhase.EXPIRED
                 setup.transitions.append(SetupTransition(
                     _id("transition", setup.id, "EXPIRED", self.bars[index].timestamp), setup.id,
                     previous.value, SetupPhase.EXPIRED.value, self.bars[index].timestamp,
-                    "setup confirmation window expired", setup.trigger_event_id))
+                    "setup confirmation window expired", setup.trigger_event_id,
+                    candle_identity=self.bars[index].timestamp.isoformat(),
+                    market_data_health=self._market_data_health,
+                    reason_code="SETUP_WINDOW_EXPIRED", zone_id=setup.zone_id,
+                    configuration_fingerprint=self.configuration_fingerprint))
 
     def _pattern(self, bar: Bar, index: int) -> str | None:
         rows = self._patterns(bar, index)
@@ -653,33 +689,41 @@ class NativePriceActionEngine:
                 matching = [row for row in self.events.values()
                             if row.direction == direction and
                             0 <= index - row.bar_index <= self.config.confusion_candles]
-                zone_event = next((row for row in matching if row.zone_id), None)
-                zone = self.zones.get(zone_event.zone_id) if zone_event and zone_event.zone_id else None
                 if strategy == "PA1_SR_REJECTION":
-                    trigger = next((row for row in matching if row.event_type == "zone_rejection"), None)
+                    trigger = next((row for row in reversed(matching) if row.event_type == "zone_rejection"), None)
+                    zone = self.zones.get(trigger.zone_id or "") if trigger else None
+                    directional_zone = bool(zone and (
+                        (direction == "bullish" and zone.role == "support") or
+                        (direction == "bearish" and zone.role == "resistance")))
                     conditions = [
-                        self._condition("zone", zone is not None, "confirmed support/resistance zone is present", zone.id if zone else None),
+                        self._condition("zone", directional_zone, "confirmed directional support/resistance zone is present", zone.id if zone else None),
                         self._condition("rejection", trigger is not None, "closed-candle rejection is required", trigger.id if trigger else None),
                     ]
                     next_event = "Wait for a directional closed-candle rejection at a confirmed zone"
                 elif strategy == "PA2_TREND_PULLBACK":
-                    trigger = next((row for row in matching if row.event_type == "zone_rejection"), None)
+                    trigger = next((row for row in reversed(matching) if row.event_type == "zone_rejection"), None)
+                    zone = self.zones.get(trigger.zone_id or "") if trigger else None
                     trend_ok = bias == direction
+                    directional_zone = bool(zone and (
+                        (direction == "bullish" and zone.role == "support") or
+                        (direction == "bearish" and zone.role == "resistance")))
                     conditions = [
                         self._condition("trend", trend_ok, f"confirmed HH/HL or LH/LL structure must be {direction}"),
-                        self._condition("pullback_zone", zone is not None, "pullback must reach a confirmed zone", zone.id if zone else None),
+                        self._condition("pullback_zone", directional_zone, "pullback must reach a directional confirmed zone", zone.id if zone else None),
                         self._condition("pullback_rejection", trigger is not None, "pullback must reject on a closed candle", trigger.id if trigger else None),
                     ]
                     next_event = "Wait for a closed-candle pullback rejection aligned with confirmed structure"
                 elif strategy == "PA3_FLIP_RETEST":
-                    trigger = next((row for row in matching if row.event_type == "flip_retest"), None)
+                    trigger = next((row for row in reversed(matching) if row.event_type == "flip_retest"), None)
+                    zone = self.zones.get(trigger.zone_id or "") if trigger else None
                     conditions = [
                         self._condition("role_flip", bool(zone and zone.flipped), "a confirmed support/resistance role flip is required", zone.id if zone else None),
                         self._condition("retest", trigger is not None, "the flipped zone must hold on a later closed candle", trigger.id if trigger else None),
                     ]
                     next_event = "Wait for a closed-candle retest of a confirmed role flip"
                 else:
-                    trigger = next((row for row in matching if row.event_type == "false_break_reclaim"), None)
+                    trigger = next((row for row in reversed(matching) if row.event_type == "false_break_reclaim"), None)
+                    zone = self.zones.get(trigger.zone_id or "") if trigger else None
                     conditions = [
                         self._condition("false_break", trigger is not None, "breakout must fail and reclaim within the configured window", trigger.id if trigger else None),
                         self._condition("reversal_close", trigger is not None, "reversal is confirmed only by the closing price", trigger.id if trigger else None),
@@ -702,50 +746,60 @@ class NativePriceActionEngine:
                         "first_touch_only", bool(zone and zone.touch_count <= 1),
                         "experiment accepts only the first recorded interaction with the zone",
                         zone.id if zone else None))
-                dominance = self._dominance(bar, direction)
-                conditions.append(self._condition(
-                    "dominance_break_close", dominance,
-                    "entry requires a directional body covering at least half the range and a close in the outer 30%",
-                ))
                 missing = [row["key"] for row in conditions if row["status"] != "PASS"]
                 supporting = tuple(row["object_id"] for row in conditions if row.get("object_id"))
                 setup_id = None
-                if trigger is not None and set(missing).issubset({"dominance_break_close"}):
+                if trigger is not None and not missing:
                     setup_id = _id("setup", strategy, direction, trigger.id)
                     setup = self.setups.get(setup_id)
                     if setup is None:
                         setup = PriceActionSetup(
                             id=setup_id, strategy_id=strategy, direction=direction,
-                            phase=SetupPhase.ENTRY_READY if not missing else SetupPhase.WAITING_FOR_CONFIRMATION,
-                            created_at=bar.timestamp, created_index=index, zone_id=trigger.zone_id,
-                            trigger_event_id=trigger.id, expires_index=index + self.config.setup_expiry_bars,
+                            phase=SetupPhase.WAITING_FOR_CONFIRMATION,
+                            created_at=trigger.occurred_at, created_index=trigger.bar_index,
+                            zone_id=trigger.zone_id, trigger_event_id=trigger.id,
+                            expires_index=trigger.bar_index + self.config.setup_expiry_bars,
                             reasons=[row["detail"] for row in conditions], missing_conditions=list(missing),
                             pattern_metadata=trigger_patterns,
+                            context_snapshot={
+                                "structure_state": bias,
+                                "relevant_swings": [
+                                    asdict(row) for row in self.swings.values()
+                                    if row.id in (zone.source_swing_ids if zone else [])
+                                ],
+                                "zone": asdict(zone) if zone else None,
+                                "zone_age": (
+                                    trigger.bar_index - next(
+                                        (bar_index for bar_index, row in enumerate(self.bars)
+                                         if zone and row.timestamp >= zone.confirmed_at),
+                                        trigger.bar_index,
+                                    ) if zone else None
+                                ),
+                                "trigger_event": asdict(trigger),
+                                "market_data_health": self._market_data_health,
+                                "decision_candle": trigger.occurred_at.isoformat(),
+                            },
                         )
                         chain = (
                             (SetupPhase.WATCHING_LOCATION, SetupPhase.LOCATION_REACHED,
                              "price reached a confirmed structural zone", setup.zone_id),
                             (SetupPhase.LOCATION_REACHED, SetupPhase.REJECTION_DETECTED,
                              "closed-candle rejection or reclaim was detected", trigger.id),
-                            (SetupPhase.REJECTION_DETECTED, setup.phase,
-                             ("all frozen strategy conditions passed on a closed candle" if not missing
-                              else "location and rejection are valid; waiting for dominance confirmation"), trigger.id),
+                            (SetupPhase.REJECTION_DETECTED, SetupPhase.WAITING_FOR_CONFIRMATION,
+                             "reaction is closed; confirmation must occur on a later candle", trigger.id),
                         )
                         for previous, current, reason, object_id in chain:
                             setup.transitions.append(SetupTransition(
-                                _id("transition", setup_id, current.value, bar.timestamp), setup_id,
-                                previous.value, current.value, bar.timestamp, reason, object_id))
+                                _id("transition", setup_id, current.value, trigger.occurred_at), setup_id,
+                                previous.value, current.value, trigger.occurred_at, reason, object_id,
+                                candle_identity=trigger.occurred_at.isoformat(), zone_id=setup.zone_id,
+                                market_data_health=self._market_data_health,
+                                reason_code=current.value,
+                                configuration_fingerprint=self.configuration_fingerprint))
                         self.setups[setup_id] = setup
-                    elif not missing and setup.phase == SetupPhase.WAITING_FOR_CONFIRMATION:
-                        setup.transitions.append(SetupTransition(
-                            _id("transition", setup_id, "ENTRY_READY", bar.timestamp), setup_id,
-                            setup.phase.value, SetupPhase.ENTRY_READY.value, bar.timestamp,
-                            "dominance confirmation closed beyond the trigger boundary", trigger.id))
-                        setup.phase = SetupPhase.ENTRY_READY
-                        setup.missing_conditions = []
                     setup_ids.append(setup_id)
                     existing = next((row for row in self.proposals.values() if row.setup_id == setup_id), None)
-                    proposal = existing or (self._propose(setup, trigger, bar) if not missing else None)
+                    proposal = existing or self._propose(setup, trigger, self.bars[trigger.bar_index])
                     if proposal is not None and proposal.id not in self.proposals:
                         self.proposals[proposal.id] = proposal
                         trade = ResearchTrade(
@@ -753,20 +807,33 @@ class NativePriceActionEngine:
                             setup_id=proposal.setup_id, strategy_id=proposal.strategy_id,
                             direction=proposal.direction, status="PENDING",
                             requested_entry=proposal.entry, stop=proposal.stop, target=proposal.target,
-                            created_at=proposal.signal_at, valid_until_index=proposal.valid_until_index,
+                            created_at=proposal.signal_at, created_index=proposal.signal_index,
+                            valid_until_index=proposal.valid_until_index,
                             entry_model=proposal.entry_model, stop_model=self.config.stop_model,
                             config_snapshot=asdict(self.config),
                         )
                         self.research_trades[trade.id] = trade
+                        setup.transitions.append(SetupTransition(
+                            _id("transition", setup_id, "ORDER_PENDING", trigger.occurred_at), setup.id,
+                            SetupPhase.WAITING_FOR_CONFIRMATION.value, SetupPhase.ORDER_PENDING.value,
+                            trigger.occurred_at,
+                            "confirmation stop staged beyond the completed reaction boundary", trade.id,
+                            candle_identity=trigger.occurred_at.isoformat(), zone_id=setup.zone_id,
+                            order_id=trade.id, market_data_health=self._market_data_health,
+                            reason_code="CONFIRMATION_ORDER_STAGED",
+                            configuration_fingerprint=self.configuration_fingerprint,
+                            relevant_prices={"entry": proposal.entry, "stop": proposal.stop,
+                                             "target": proposal.target}))
                         setup.phase = SetupPhase.ORDER_PENDING
                     if proposal is not None:
                         proposal_ids.append(proposal.id)
                 traces.append(StrategyTrace(
                     strategy_id=strategy, direction=direction,
-                    state="ENTRY_READY" if not missing else "WATCHING",
+                    state="ORDER_PENDING" if setup_id else "WATCHING",
                     conditions=tuple(conditions), missing_conditions=tuple(missing),
                     supporting_object_ids=supporting, setup_id=setup_id,
-                    next_required_event="Signal complete; paper/manual review only" if not missing else next_event,
+                    next_required_event=("Wait for a later candle to cross the confirmation stop; paper only"
+                                         if setup_id else next_event),
                 ))
         return traces, setup_ids, proposal_ids
 
@@ -811,7 +878,17 @@ class NativePriceActionEngine:
         slip = (self.config.slippage_bps + self.config.spread_bps / 2) / 10_000
         fee = self.config.commission_bps / 10_000
         for trade in self.research_trades.values():
+            just_filled = False
             if trade.status == "PENDING":
+                setup = self.setups.get(trade.setup_id)
+                zone = self.zones.get(setup.zone_id or "") if setup else None
+                if setup and setup.phase in {
+                        SetupPhase.INVALIDATED, SetupPhase.CANCELLED, SetupPhase.DATA_PAUSED}:
+                    trade.status = setup.phase.value
+                    trade.closed_at = bar.timestamp
+                    trade.outcome = "UNFILLED"
+                    trade.reason = setup.invalidation_reason or "setup became terminal before activation"
+                    continue
                 if index > trade.valid_until_index:
                     trade.status = "EXPIRED"
                     trade.closed_at = bar.timestamp
@@ -823,7 +900,37 @@ class NativePriceActionEngine:
                         setup.transitions.append(SetupTransition(
                             _id("transition", setup.id, "EXPIRED", bar.timestamp), setup.id,
                             SetupPhase.ORDER_PENDING.value, SetupPhase.EXPIRED.value, bar.timestamp,
-                            trade.reason, trade.id))
+                            trade.reason, trade.id, candle_identity=bar.timestamp.isoformat(),
+                            zone_id=setup.zone_id, order_id=trade.id,
+                            market_data_health=self._market_data_health,
+                            reason_code="PENDING_DURATION_EXPIRED",
+                            configuration_fingerprint=self.configuration_fingerprint))
+                    continue
+                # The stop is the saved structural invalidation boundary.  If
+                # both entry and invalidation occur inside one OHLC bar, their
+                # sequence is unknowable and the adverse invalidation is
+                # applied first; an unfilled stop order is cancelled, not
+                # invented as a fill-and-loss.
+                stop_breached = (bar.low <= trade.stop if trade.direction == "bullish"
+                                 else bar.high >= trade.stop)
+                if stop_breached:
+                    trade.status = "INVALIDATED"
+                    trade.closed_at = bar.timestamp
+                    trade.outcome = "UNFILLED"
+                    trade.reason = "structural invalidation touched before a provable confirmation fill"
+                    if setup:
+                        previous = setup.phase
+                        setup.phase = SetupPhase.INVALIDATED
+                        setup.invalidation_reason = trade.reason
+                        setup.transitions.append(SetupTransition(
+                            _id("transition", setup.id, "INVALIDATED", bar.timestamp), setup.id,
+                            previous.value, SetupPhase.INVALIDATED.value, bar.timestamp,
+                            trade.reason, trade.id, candle_identity=bar.timestamp.isoformat(),
+                            zone_id=zone.id if zone else setup.zone_id, order_id=trade.id,
+                            market_data_health=self._market_data_health,
+                            reason_code="INVALIDATION_BEFORE_ENTRY",
+                            configuration_fingerprint=self.configuration_fingerprint,
+                            relevant_prices={"entry": trade.requested_entry, "stop": trade.stop}))
                     continue
                 if trade.entry_model == "retracement_50":
                     touched = bar.low <= trade.requested_entry if trade.direction == "bullish" else bar.high >= trade.requested_entry
@@ -843,19 +950,48 @@ class NativePriceActionEngine:
                 trade.target = trade.fill_price + risk_from_fill * self.config.rr_ratio * \
                     (1 if trade.direction == "bullish" else -1)
                 trade.filled_at = bar.timestamp
+                trade.filled_index = index
+                trade.bars_to_entry = max(0, index - trade.created_index)
+                trade.maximum_favourable_excursion_r = 0.0
+                trade.maximum_adverse_excursion_r = 0.0
                 trade.status = "OPEN"
+                just_filled = True
                 setup = self.setups.get(trade.setup_id)
                 if setup:
                     setup.phase = SetupPhase.ENTERED
                     setup.transitions.append(SetupTransition(
                         _id("transition", setup.id, "ENTERED", bar.timestamp), setup.id,
                         SetupPhase.ORDER_PENDING.value, SetupPhase.ENTERED.value, bar.timestamp,
-                        "confirmation order filled using the first available candle price", trade.id))
+                        "confirmation order filled using the first available candle price", trade.id,
+                        candle_identity=bar.timestamp.isoformat(), zone_id=setup.zone_id,
+                        order_id=trade.id, position_id=trade.id,
+                        market_data_health=self._market_data_health,
+                        reason_code="REALISTIC_PAPER_FILL",
+                        configuration_fingerprint=self.configuration_fingerprint,
+                        relevant_prices={"requested_entry": trade.requested_entry,
+                                         "fill": trade.fill_price, "stop": trade.stop,
+                                         "target": trade.target}))
             if trade.status != "OPEN" or trade.fill_price is None:
                 continue
             stop_hit = bar.low <= trade.stop if trade.direction == "bullish" else bar.high >= trade.stop
             target_hit = bar.high >= trade.target if trade.direction == "bullish" else bar.low <= trade.target
             if not stop_hit and not target_hit:
+                # The order of prices inside the activation candle is unknown,
+                # so its extremes are not attributed to a newly filled trade.
+                # Every later completed candle was fully observed while the
+                # position was open and may safely update excursion evidence.
+                if not just_filled:
+                    risk = abs(trade.fill_price - trade.stop)
+                    favourable = (bar.high - trade.fill_price if trade.direction == "bullish"
+                                  else trade.fill_price - bar.low)
+                    adverse = (trade.fill_price - bar.low if trade.direction == "bullish"
+                               else bar.high - trade.fill_price)
+                    trade.maximum_favourable_excursion_r = max(
+                        float(trade.maximum_favourable_excursion_r or 0), favourable / risk)
+                    trade.maximum_adverse_excursion_r = max(
+                        float(trade.maximum_adverse_excursion_r or 0), adverse / risk)
+                filled_index = trade.filled_index if trade.filled_index is not None else index
+                trade.bars_in_trade = max(0, index - filled_index)
                 continue
             # If both extremes occurred in one candle their order is unknowable;
             # the adverse stop is intentionally applied first.
@@ -876,6 +1012,16 @@ class NativePriceActionEngine:
             trade.costs_r = fee * (trade.fill_price + trade.exit_price) / risk
             trade.net_r = trade.gross_r - trade.costs_r
             trade.closed_at = bar.timestamp
+            trade.closed_index = index
+            filled_index = trade.filled_index if trade.filled_index is not None else index
+            trade.bars_in_trade = max(0, index - filled_index)
+            # On an exit candle only the executed exit is sequence-proven.
+            # Do not claim an OHLC extreme that may have occurred after exit.
+            if trade.gross_r is not None:
+                trade.maximum_favourable_excursion_r = max(
+                    float(trade.maximum_favourable_excursion_r or 0), trade.gross_r, 0)
+                trade.maximum_adverse_excursion_r = max(
+                    float(trade.maximum_adverse_excursion_r or 0), -trade.gross_r, 0)
             trade.outcome = outcome
             trade.intrabar_ambiguous = bool(stop_hit and target_hit)
             trade.reason = ("stop and target both touched; adverse stop applied first"
@@ -887,7 +1033,14 @@ class NativePriceActionEngine:
                 terminal = SetupPhase.STOPPED if stop_hit else SetupPhase.TARGET_HIT
                 setup.transitions.append(SetupTransition(
                     _id("transition", setup.id, terminal.value, bar.timestamp), setup.id,
-                    SetupPhase.ENTERED.value, terminal.value, bar.timestamp, trade.reason or outcome, trade.id))
+                    SetupPhase.ENTERED.value, terminal.value, bar.timestamp, trade.reason or outcome, trade.id,
+                    candle_identity=bar.timestamp.isoformat(), zone_id=setup.zone_id,
+                    order_id=trade.id, position_id=trade.id,
+                    market_data_health=self._market_data_health,
+                    reason_code="ADVERSE_STOP_FIRST" if trade.intrabar_ambiguous else terminal.value,
+                    configuration_fingerprint=self.configuration_fingerprint,
+                    relevant_prices={"fill": trade.fill_price, "exit": trade.exit_price,
+                                     "stop": trade.stop, "target": trade.target}))
                 setup.phase = terminal
 
     def visual_state(self, *, candle_at: datetime | None = None, candle_window: int = 500) -> dict:
@@ -910,6 +1063,10 @@ class NativePriceActionEngine:
         completed = [row for row in research_trades if row.status in {"WON", "LOST"}]
         config_payload = asdict(self.config)
         config_id = hashlib.sha256(json.dumps(config_payload, sort_keys=True, default=str).encode()).hexdigest()
+        dataset_id = hashlib.sha256("|".join(
+            f"{row.timestamp.isoformat()}:{row.open}:{row.high}:{row.low}:{row.close}:{row.volume}"
+            for row in self.bars).encode()).hexdigest()
+        engine_id = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         strategy_metrics = {}
         for strategy_id in STRATEGIES:
             strategy_trades = [row for row in research_trades if row.strategy_id == strategy_id]
@@ -917,7 +1074,8 @@ class NativePriceActionEngine:
             strategy_metrics[strategy_id] = {
                 "closed": len(rows), "wins": sum(row.status == "WON" for row in rows),
                 "losses": sum(row.status == "LOST" for row in rows),
-                "unfilled": sum(row.status == "EXPIRED" for row in strategy_trades),
+                "unfilled": sum(row.status in {"EXPIRED", "CANCELLED", "INVALIDATED", "DATA_PAUSED"}
+                                for row in strategy_trades),
                 "gross_r": sum(float(row.gross_r or 0) for row in rows),
                 "net_r": sum(float(row.net_r or 0) for row in rows),
                 "costs_r": sum(float(row.costs_r or 0) for row in rows),
@@ -926,6 +1084,7 @@ class NativePriceActionEngine:
             row.phase in {SetupPhase.CANCELLED, SetupPhase.INVALIDATED} for row in setups)
         return {
             "research_id": RESEARCH_ID,
+            "strategy_version": STRATEGY_VERSION,
             "research_only": True,
             "execution_allowed": False,
             "paper_execution_allowed": True,
@@ -946,12 +1105,14 @@ class NativePriceActionEngine:
             ],
             "proposals": [asdict(row) for row in proposals],
             "orders": [asdict(row) for row in research_trades if row.status in {"PENDING", "OPEN"}],
-            "trades": [asdict(row) for row in research_trades if row.status in {"WON", "LOST", "EXPIRED"}],
+            "trades": [asdict(row) for row in research_trades if row.status in {
+                "WON", "LOST", "EXPIRED", "CANCELLED", "INVALIDATED", "DATA_PAUSED"}],
             "metrics": {
                 "closed": len(completed),
                 "wins": sum(row.status == "WON" for row in completed),
                 "losses": sum(row.status == "LOST" for row in completed),
-                "unfilled": sum(row.status == "EXPIRED" for row in research_trades),
+                "unfilled": sum(row.status in {"EXPIRED", "CANCELLED", "INVALIDATED", "DATA_PAUSED"}
+                                for row in research_trades),
                 "cancelled": cancelled_setups,
                 "rejected": 0,
                 "gross_r": sum(float(row.gross_r or 0) for row in completed),
@@ -976,6 +1137,9 @@ class NativePriceActionEngine:
                 "dataset_end": self.bars[-1].timestamp.isoformat() if self.bars else None,
                 "closed_candles": len(self.bars),
                 "configuration_id": config_id,
+                "dataset_fingerprint": dataset_id,
+                "engine_fingerprint": engine_id,
+                "strategy_version": STRATEGY_VERSION,
                 "experiment_id": None,
                 "cost_model": {
                     "commission_bps": self.config.commission_bps,

@@ -76,7 +76,7 @@ def test_signals_manual_approval_duplicate_and_unreliable_feed_are_explicit(tmp_
     account.configure(execution_config=PaperExecutionConfig(operating_mode="automatic"))
     account.synchronize_strategy(visual(), contract_rules=RULES, candle=bar(1), feed_reliable=False)
     rejected = account.state()["candidates"][0]
-    assert rejected["status"] == "REJECTED"
+    assert rejected["status"] == "DATA_PAUSED"
     assert "unreliable" in rejected["payload"]["reason"]
 
 

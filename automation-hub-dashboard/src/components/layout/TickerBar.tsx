@@ -34,8 +34,8 @@ export default function TickerBar() {
     ? Math.max(0, (Date.now() - parsedStart) / 1000)
     : selected?.engine?.uptime_s ?? undefined;
   const items: [string, string][] = data ? [
-    ["Mode", "PAPER (simulation)"], ["Instances", `${runningCount} / ${data.max_active_slots} running · ${data.active_slots} workers`],
-    ["Market data", data.market_data_status], ["Open positions", String(data.total_open_positions)],
+    ["Global instance mode", "PAPER (simulation)"], ["Global instances", `${runningCount} / ${data.max_active_slots} running · ${data.active_slots} workers`],
+    ["Global instance data", data.market_data_status], ["Open positions", String(data.total_open_positions)],
     ["Open risk", `$${data.current_global_risk_amount.toLocaleString()} / $${data.max_global_risk_amount.toLocaleString()}`],
     ["Bot active time", activeSeconds === undefined ? "—" : uptime(activeSeconds)],
     ["Active", selected ? `${selected.symbol} · ${selected.strategy_label} · ${selected.timeframe}` : instances],
