@@ -54,6 +54,42 @@ def test_stop_loss_and_persistence(tmp_path):
     assert restored.fills() and restored.account()["balance"] == 994
 
 
+@pytest.mark.parametrize("side,stop,ratio", [("buy", 95, 2.5), ("sell", 105, 3.0)])
+def test_fill_bound_protection_preserves_rr_from_actual_entry(tmp_path, side, stop, ratio):
+    broker = PaperBrokerV2(tmp_path / f"{side}.db", starting_balance=10_000,
+                           fee_rate=0, spread_bps=2, slippage_bps=3,
+                           participation_rate=1)
+    order = broker.submit(symbol="BTCUSDT", side=side, order_type="market", quantity=1)
+    result = broker.process_candle("BTCUSDT", _bar(open_=100, high=101, low=99, close=100),
+                                   protections={order["id"]: {
+                                       "stop_loss": stop, "take_profit": 120 if side == "buy" else 80,
+                                       "target_r": ratio, "tick_size": 0.1,
+                                   }})
+    position = broker.positions()[0]
+    effective = abs(position["take_profit"] - position["entry_price"]) / abs(position["entry_price"] - stop)
+    assert effective >= ratio
+    assert effective < ratio + 0.03
+    assert result["events"][0]["risk_reward"] == ratio
+    assert result["events"][0]["stop_loss"] == stop
+    assert result["events"][0]["take_profit"] == position["take_profit"]
+
+
+def test_entry_is_rejected_if_gap_or_slippage_crosses_protective_stop(tmp_path):
+    broker = _broker(tmp_path)
+    order = broker.submit(symbol="BTCUSDT", side="buy", order_type="stop",
+                          quantity=1, stop_price=100)
+    result = broker.process_candle("BTCUSDT", _bar(open_=95, high=101, low=94, close=99),
+                                   protections={order["id"]: {
+                                       "stop_loss": 100.1, "take_profit": 106,
+                                       "target_r": 2, "tick_size": .1,
+                                   }})
+    assert result["events"] == []
+    assert broker.positions() == []
+    rejected = broker.order(order["id"])
+    assert rejected["status"] == "rejected"
+    assert "protective stop" in rejected["reason"]
+
+
 def test_bad_candle_is_rejected(tmp_path):
     broker = _broker(tmp_path)
     broker.submit(symbol="BTCUSDT", side="buy", order_type="market", quantity=1)

@@ -48,7 +48,10 @@ def test_automatic_paper_lifecycle_sizes_rounds_protects_and_stops_first(tmp_pat
                                  candle=bar(2, 104, 106, 103, 105), feed_reliable=True)
     position = account.state()["positions"][0]
     assert position["stop_loss"] == 99.0
-    assert position["take_profit"] == 120.0
+    assert position["take_profit"] > 120.0
+    assert position["planned_rr"] == 2.5
+    assert position["effective_rr"] >= 2.5
+    assert position["protection_status"] == "PROTECTED"
 
     # Both stop and target occur inside this candle; protective handling is adverse-first.
     account.synchronize_strategy(visual(count=12), contract_rules=RULES,
@@ -70,7 +73,8 @@ def test_restart_repairs_missing_strategy_protection_without_touching_manual_pos
                                  candle=bar(2, 104, 106, 103, 105), feed_reliable=True)
     protected = account.state()["positions"][0]
     assert protected["stop_loss"] == 99.0
-    assert protected["take_profit"] == 120.0
+    assert protected["take_profit"] > 120.0
+    protected_target = protected["take_profit"]
 
     # Simulate a legacy/restored row whose strategy protection was lost.
     account.broker._c.execute(
@@ -79,7 +83,8 @@ def test_restart_repairs_missing_strategy_protection_without_touching_manual_pos
     reopened = PriceActionPaperAccount(path)
     repaired = reopened.state()["positions"][0]
     assert repaired["stop_loss"] == 99.0
-    assert repaired["take_profit"] == 120.0
+    assert repaired["take_profit"] == protected_target
+    assert repaired["effective_rr"] >= 2.5
     assert any(row["kind"] == "paper_position_protection_repaired"
                for row in reopened.state()["activity"])
 
@@ -91,6 +96,25 @@ def test_restart_repairs_missing_strategy_protection_without_touching_manual_pos
     manual_position = manual_reopened.state()["positions"][0]
     assert manual_position["stop_loss"] is None
     assert manual_position["take_profit"] is None
+
+
+def test_price_action_blocks_same_symbol_stacking_that_would_overwrite_protection(tmp_path):
+    account = PriceActionPaperAccount(tmp_path / "stacking.db")
+    account.configure(execution_config=PaperExecutionConfig(
+        operating_mode="automatic", risk_pct=.5))
+    account.synchronize_strategy(visual(), contract_rules=RULES,
+                                 candle=bar(1), feed_reliable=True)
+    account.synchronize_strategy(visual(count=11), contract_rules=RULES,
+                                 candle=bar(2, 104, 106, 103, 105), feed_reliable=True)
+
+    second = visual(count=12)
+    second["setups"][0] = {**second["setups"][0], "id": "setup-2", "zone_id": "zone-2"}
+    second["proposals"][0] = {**second["proposals"][0], "id": "proposal-2", "setup_id": "setup-2"}
+    result = account.synchronize_strategy(second, contract_rules=RULES,
+                                          candle=bar(3, 105, 106, 104, 105), feed_reliable=True)
+    assert result["created"] == []
+    assert "stacking is blocked" in result["rejected"][0]["reason"]
+    assert len(account.state()["positions"]) == 1
 
 
 def test_signals_manual_approval_duplicate_and_unreliable_feed_are_explicit(tmp_path):

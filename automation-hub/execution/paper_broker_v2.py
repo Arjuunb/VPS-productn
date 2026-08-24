@@ -7,6 +7,7 @@ generator and no client-provided fill-price escape hatch.
 """
 from __future__ import annotations
 
+import math
 import sqlite3
 import threading
 import uuid
@@ -297,16 +298,64 @@ class PaperBrokerV2:
                     self._c.execute("UPDATE v2_orders SET status='triggered',triggered_at=?,updated_at=? WHERE id=?", (_now(), _now(), order["id"]))
                     continue
                 if price is not None:
-                    self._fill(order, order["side"], price, bar, events, bool(order["reduce_only"]))
                     protection = (protections or {}).get(order["id"])
+                    stop_loss = protection.get("stop_loss") if protection else None
+                    simulated_fill = self._price(order["side"], price)
+                    invalid_stop_geometry = stop_loss is not None and (
+                        (order["side"] == "buy" and simulated_fill <= float(stop_loss)) or
+                        (order["side"] == "sell" and simulated_fill >= float(stop_loss))
+                    )
+                    if not order["reduce_only"] and invalid_stop_geometry:
+                        self._c.execute(
+                            "UPDATE v2_orders SET status='rejected',reason=?,updated_at=? WHERE id=?",
+                            ("simulated gap/slippage crossed the protective stop; entry rejected fail-closed",
+                             _now(), order["id"]),
+                        )
+                        continue
+                    self._fill(order, order["side"], price, bar, events, bool(order["reduce_only"]))
                     if protection and any(event.get("order_id") == order["id"] for event in events):
+                        position = self._c.execute(
+                            "SELECT * FROM v2_positions WHERE symbol=?", (symbol,)
+                        ).fetchone()
+                        stop_loss, take_profit = self._resolved_protection(
+                            dict(position) if position else None, protection
+                        )
                         self._c.execute(
                             "UPDATE v2_positions SET stop_loss=?,take_profit=? WHERE symbol=?",
-                            (protection.get("stop_loss"), protection.get("take_profit"), symbol),
+                            (stop_loss, take_profit, symbol),
                         )
+                        for event in events:
+                            if event.get("order_id") == order["id"]:
+                                event["stop_loss"] = stop_loss
+                                event["take_profit"] = take_profit
+                                event["risk_reward"] = protection.get("target_r")
             events.extend(self._process_protection(symbol, bar))
             self._c.commit()
         return {"symbol": symbol, "events": events, "account": self.account({symbol: bar["close"]})}
+
+    @staticmethod
+    def _resolved_protection(position: Optional[dict], protection: dict) -> tuple[Optional[float], Optional[float]]:
+        """Resolve protection from the actual simulated fill when a frozen R is supplied."""
+        stop_loss = protection.get("stop_loss")
+        take_profit = protection.get("take_profit")
+        target_r = protection.get("target_r")
+        if not position or stop_loss is None or target_r is None:
+            return stop_loss, take_profit
+        entry, stop, ratio = (
+            float(position["entry_price"]), float(stop_loss), float(target_r)
+        )
+        if ratio <= 0 or entry == stop:
+            raise ValueError("risk-reward protection requires a positive stop distance and target R")
+        is_long = position["side"] == "long"
+        if (is_long and stop >= entry) or (not is_long and stop <= entry):
+            raise ValueError("protective stop is on the wrong side of the simulated fill")
+        raw_target = entry + abs(entry - stop) * ratio * (1 if is_long else -1)
+        tick = float(protection.get("tick_size") or 0)
+        if tick > 0:
+            units = (math.ceil(raw_target / tick - 1e-12) if is_long
+                     else math.floor(raw_target / tick + 1e-12))
+            raw_target = units * tick
+        return stop, round(raw_target, 12)
 
     def _process_protection(self, symbol: str, bar: dict) -> list[dict]:
         pos = self._c.execute("SELECT * FROM v2_positions WHERE symbol=?", (symbol,)).fetchone()

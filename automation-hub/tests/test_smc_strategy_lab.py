@@ -50,8 +50,42 @@ def test_manual_order_is_idempotent_and_protection_survives_fill(tmp_path):
     assert result["duplicate"] is False
     position = account.broker.positions()[0]
     assert position["stop_loss"] == 90
-    assert position["take_profit"] == 130
+    assert position["take_profit"] > 130
+    visible = account.state()["positions"][0]
+    assert visible["planned_rr"] == 3
+    assert visible["effective_rr"] >= 3
+    assert visible["protection_status"] == "PROTECTED"
     assert account.process_candle("BTCUSDT", candle)["duplicate"] is True
+
+
+def test_smc_restart_repairs_strategy_protection_and_blocks_stacking(tmp_path):
+    path = tmp_path / "smc-repair.db"
+    account = SMCPaperAccount(path)
+    account.configure(config=SMCPaperConfig(operating_mode="automatic"))
+    evaluation = evaluate(seeded_engine())
+    account.synchronize_candidate(evaluation, rules=RULES,
+                                  reference_price=evaluation["trade_plan"]["entry"],
+                                  feed_reliable=True)
+    entry = evaluation["trade_plan"]["entry"]
+    account.process_candle("BTCUSDT", Bar(datetime(2026, 8, 24, 12, tzinfo=timezone.utc),
+                                            entry, entry + 1, entry - 1, entry, 10_000))
+    original = account.state()["positions"][0]
+    account.broker._c.execute(
+        "UPDATE v2_positions SET stop_loss=NULL,take_profit=NULL WHERE symbol='BTCUSDT'")
+    account.broker._c.commit()
+
+    reopened = SMCPaperAccount(path)
+    repaired = reopened.state()["positions"][0]
+    assert repaired["stop_loss"] == original["stop_loss"]
+    assert repaired["take_profit"] == original["take_profit"]
+    assert repaired["effective_rr"] >= repaired["planned_rr"]
+    assert any(row["kind"] == "paper_position_protection_repaired"
+               for row in reopened.state()["activity"])
+    with pytest.raises(ValueError, match="stacking is blocked"):
+        reopened.submit_order(symbol="BTCUSDT", side="buy", order_type="market",
+                              rules=RULES, reference_price=entry, quantity=.1,
+                              stop_loss=entry - 10, target_1=entry + 20,
+                              target_2=entry + 30, idempotency_key="blocked-stack")
 
 
 def test_risk_sizing_and_session_identity_guards(tmp_path):

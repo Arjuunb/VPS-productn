@@ -350,8 +350,6 @@ class PriceActionPaperAccount:
                 "SELECT * FROM pa_order_meta WHERE session_id=? AND status IN ('ENTERED','PARTIALLY_FILLED') ORDER BY created_at",
                 (session_id,))]
             for position in self.broker.positions():
-                if position.get("stop_loss") is not None and position.get("take_profit") is not None:
-                    continue
                 owners: list[tuple[dict, dict]] = []
                 for meta in entered:
                     try:
@@ -366,7 +364,12 @@ class PriceActionPaperAccount:
                 meta, _order = owners[0]
                 cfg = json.loads(meta["config_json"])
                 try:
-                    stop, target = float(cfg["stop"]), float(cfg["target"])
+                    stop, target = self.broker._resolved_protection(position, {
+                        "stop_loss": float(cfg["stop"]),
+                        "take_profit": float(cfg["target"]),
+                        "target_r": float(cfg.get("target_r", 2.5)),
+                        "tick_size": (cfg.get("contract_rules") or {}).get("tick_size"),
+                    })
                     entry = float(position["entry_price"])
                 except (KeyError, TypeError, ValueError):
                     continue
@@ -379,20 +382,26 @@ class PriceActionPaperAccount:
                     continue
                 missing_stop = position.get("stop_loss") is None
                 missing_target = position.get("take_profit") is None
+                stop_changed = missing_stop or abs(float(position["stop_loss"]) - float(stop)) > 1e-9
+                target_changed = missing_target or abs(float(position["take_profit"]) - float(target)) > 1e-9
+                if not stop_changed and not target_changed:
+                    continue
                 repaired = self.broker.set_protection(
                     position["symbol"],
-                    stop_loss=stop if missing_stop else None,
-                    take_profit=target if missing_target else None,
+                    stop_loss=stop if stop_changed else None,
+                    take_profit=target if target_changed else None,
                 )
                 action = {
                     "order_id": meta["order_id"],
                     "symbol": position["symbol"],
-                    "action": "restored_missing_strategy_protection",
+                    "action": "reconciled_strategy_protection",
                     "stop_loss_restored": missing_stop,
                     "take_profit_restored": missing_target,
+                    "stop_loss_adjusted": stop_changed and not missing_stop,
+                    "take_profit_adjusted": target_changed and not missing_target,
                     "stop_loss": repaired.get("stop_loss"),
                     "take_profit": repaired.get("take_profit"),
-                    "source": "immutable_pa_order_configuration",
+                    "source": "immutable_pa_order_configuration_and_actual_fill",
                 }
                 actions.append(action)
                 self._audit("paper_position_protection_repaired",
@@ -424,7 +433,7 @@ class PriceActionPaperAccount:
             "live_execution_allowed": False,
             "session": self._decode_session(dict(current)) if current else {},
             "account": self.broker.account(marks),
-            "positions": self.broker.positions(),
+            "positions": self._positions_with_protection(),
             "orders": self.broker.orders(),
             "trades": self.broker.fills(limit=500),
             "candidates": [{**row, "payload": json.loads(row["payload"])} for row in candidates],
@@ -433,6 +442,39 @@ class PriceActionPaperAccount:
             "funding_events": funding,
             "order_audit": self.audit_pending_orders(),
         }
+
+    def _positions_with_protection(self) -> list[dict]:
+        current = self.session()
+        metadata = [dict(row) for row in self._db.execute(
+            "SELECT * FROM pa_order_meta WHERE session_id=? AND status IN ('PARTIALLY_FILLED','ENTERED') ORDER BY created_at",
+            (current.get("id", ""),),
+        )]
+        rows = []
+        for position in self.broker.positions():
+            owners = []
+            for meta in metadata:
+                try:
+                    order = self.broker.order(meta["order_id"])
+                except KeyError:
+                    continue
+                if order.get("symbol") == position.get("symbol") and order.get("status") in {"partially_filled", "filled"}:
+                    owners.append(meta)
+            config = json.loads(owners[0]["config_json"]) if len(owners) == 1 else {}
+            stop, target, entry = position.get("stop_loss"), position.get("take_profit"), position.get("entry_price")
+            effective_rr = None
+            if stop is not None and target is not None and entry is not None and abs(float(entry) - float(stop)) > 0:
+                effective_rr = abs(float(target) - float(entry)) / abs(float(entry) - float(stop))
+            rows.append({
+                "symbol": position["symbol"], "side": position["side"], "size": position["size"],
+                "entry_price": entry, "stop_loss": stop, "take_profit": target,
+                "planned_rr": config.get("target_r") or config.get("planned_rr"),
+                "effective_rr": round(effective_rr, 6) if effective_rr is not None else None,
+                "protection_status": "PROTECTED" if stop is not None and target is not None else "UNPROTECTED",
+                "protection_order_id": owners[0]["order_id"] if len(owners) == 1 else None,
+                "peak_price": position.get("peak_price"), "opened_at": position.get("opened_at"),
+                "estimated_liquidation_price": position.get("estimated_liquidation_price"),
+            })
+        return rows
 
     def reset(self) -> dict:
         with self._lock:
@@ -618,6 +660,13 @@ class PriceActionPaperAccount:
             reason = "duplicate trade blocked for the same session, zone and direction"
             self._candidate(proposal, setup, rules, "REJECTED", reason, config)
             return {"accepted": False, "reason": reason, "duplicate_order_id": duplicate["order_id"]}
+        open_entries = [row for row in self.broker.orders()
+                        if row.get("status") in OPEN_BROKER_ORDER_STATUSES and not row.get("reduce_only")]
+        if self.broker.positions() or open_entries:
+            reason = ("another Price Action entry or protected position is already active; "
+                      "same-symbol stacking is blocked so stop, target and R:R ownership cannot be overwritten")
+            self._candidate(proposal, setup, rules, "REJECTED", reason, config)
+            return {"accepted": False, "reason": reason}
         account = self.broker.account()
         risk_pct = min(config.risk_pct, config.max_risk_pct)
         risk_amount = account["equity"] * risk_pct / 100
@@ -640,7 +689,11 @@ class PriceActionPaperAccount:
         entry = self._round_step(float(proposal["entry"]), tick, upward=is_long)
         stop = self._round_step(float(proposal["stop"]), tick, upward=not is_long)
         actual_risk = abs(entry - stop)
-        target = self._round_step(entry + actual_risk * 2.5 * (1 if is_long else -1), tick,
+        if actual_risk <= 0 or (is_long and stop >= entry) or (not is_long and stop <= entry):
+            reason = "rounded entry and protective stop do not form valid directional risk"
+            self._candidate(proposal, setup, rules, "REJECTED", reason, config)
+            return {"accepted": False, "reason": reason}
+        target = self._round_step(entry + actual_risk * config.target_r * (1 if is_long else -1), tick,
                                   upward=is_long)
         quantity = self._round_step(risk_amount / actual_risk, step)
         margin_cap = account["free_margin"] * self.broker.leverage / max(entry, 1e-12)
@@ -664,6 +717,7 @@ class PriceActionPaperAccount:
             "execution": asdict(config), "contract_rules": rules,
             "risk_amount": risk_amount, "risk_pct": risk_pct, "quantity": quantity,
             "entry": entry, "stop": stop, "target": target,
+            "target_r": config.target_r, "planned_rr": config.target_r,
             "leverage": self.broker.leverage, "execution_mode": "PAPER",
             "live_execution_allowed": False,
         }
@@ -705,7 +759,11 @@ class PriceActionPaperAccount:
             protections = {}
             for meta in open_meta:
                 cfg = json.loads(meta["config_json"])
-                protections[meta["order_id"]] = {"stop_loss": cfg["stop"], "take_profit": cfg["target"]}
+                protections[meta["order_id"]] = {
+                    "stop_loss": cfg["stop"], "take_profit": cfg["target"],
+                    "target_r": cfg.get("target_r", 2.5),
+                    "tick_size": (cfg.get("contract_rules") or {}).get("tick_size"),
+                }
             result = (self.broker.process_candle(
                 current.get("symbol", "BTCUSDT"), candle, protections=protections)
                 if feed_reliable else {

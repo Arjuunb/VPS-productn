@@ -30,6 +30,18 @@ SESSION_MODES = {"LIVE_PAPER", "HISTORICAL"}
 ACTIVE_MODEL_IDS = {row.id for row in ENTRY_MODELS if row.status == "ACTIVE"}
 
 
+def _configured_r(config: dict, target_key: str) -> float | None:
+    explicit = config.get(f"{target_key}_r")
+    if explicit is not None:
+        return float(explicit)
+    entry = config.get("reference_price")
+    stop = config.get("stop_loss")
+    target = config.get(target_key)
+    if entry is None or stop is None or target is None or float(entry) == float(stop):
+        return None
+    return abs(float(target) - float(entry)) / abs(float(entry) - float(stop))
+
+
 @dataclass(frozen=True)
 class SMCPaperConfig:
     operating_mode: Literal["signals_only", "manual_approval", "automatic"] = "signals_only"
@@ -107,6 +119,7 @@ class SMCPaperAccount:
             self.broker.leverage = float(self._db.execute(
                 "SELECT leverage FROM smc_settings WHERE id=1").fetchone()[0])
             self._snapshot()
+        self.reconcile_orders()
 
     def _insert_session(self, *, starting_balance: float, mode: str = "LIVE_PAPER",
                         symbol: str = "BTCUSDT", timeframe: str = "5m",
@@ -162,7 +175,7 @@ class SMCPaperAccount:
         current = self.session()
         sid = current.get("id", "")
         account = self.broker.account(marks)
-        positions = self.broker.positions()
+        positions = self._positions_with_protection()
         open_risk = 0.0
         for position in positions:
             stop = position.get("stop_loss")
@@ -186,6 +199,39 @@ class SMCPaperAccount:
             "candidates": candidates, "order_metadata": metadata, "activity": activity,
             "funding_events": funding,
         }
+
+    def _positions_with_protection(self) -> list[dict]:
+        current = self.session()
+        metadata = [dict(row) for row in self._db.execute(
+            "SELECT * FROM smc_order_meta WHERE session_id=? AND ownership!='strategy_target_1' AND status IN ('PARTIALLY_FILLED','ENTERED') ORDER BY created_at",
+            (current.get("id", ""),),
+        )]
+        rows = []
+        for position in self.broker.positions():
+            owners = []
+            for meta in metadata:
+                try:
+                    order = self.broker.order(meta["order_id"])
+                except KeyError:
+                    continue
+                if order.get("symbol") == position.get("symbol") and order.get("status") in {"partially_filled", "filled"}:
+                    owners.append(meta)
+            config = json.loads(owners[0]["config_json"]) if len(owners) == 1 else {}
+            stop, target, entry = position.get("stop_loss"), position.get("take_profit"), position.get("entry_price")
+            effective_rr = None
+            if stop is not None and target is not None and entry is not None and abs(float(entry) - float(stop)) > 0:
+                effective_rr = abs(float(target) - float(entry)) / abs(float(entry) - float(stop))
+            rows.append({
+                "symbol": position["symbol"], "side": position["side"], "size": position["size"],
+                "entry_price": entry, "stop_loss": stop, "take_profit": target,
+                "planned_rr": _configured_r(config, "target_2"),
+                "effective_rr": round(effective_rr, 6) if effective_rr is not None else None,
+                "protection_status": "PROTECTED" if stop is not None and target is not None else "UNPROTECTED",
+                "protection_order_id": owners[0]["order_id"] if len(owners) == 1 else None,
+                "peak_price": position.get("peak_price"), "opened_at": position.get("opened_at"),
+                "estimated_liquidation_price": position.get("estimated_liquidation_price"),
+            })
+        return rows
 
     def configure(self, *, mode: str | None = None, symbol: str | None = None,
                   timeframe: str | None = None, replay_cursor: int | None = None,
@@ -349,6 +395,13 @@ class SMCPaperAccount:
         if existing:
             return {"accepted": True, "duplicate": True, "order": self.broker.order(existing["order_id"]),
                     "real_execution_allowed": False}
+        open_entries = [row for row in self.broker.orders()
+                        if row.get("status") in OPEN_STATUSES and not row.get("reduce_only")]
+        if self.broker.positions() or open_entries:
+            raise ValueError(
+                "another SMC entry or protected position is already active; same-symbol stacking is blocked "
+                "so stop, targets and R:R ownership cannot be overwritten"
+            )
         side = "buy" if side.lower() in {"buy", "long", "bullish"} else "sell" if side.lower() in {"sell", "short", "bearish"} else ""
         if not side:
             raise ValueError("side must be buy/long or sell/short")
@@ -361,6 +414,8 @@ class SMCPaperAccount:
                 raise ValueError("risk-based sizing requires a protective stop")
             if not 0 < float(risk_pct) <= 1:
                 raise ValueError("risk percentage must be above 0% and no greater than 1%")
+            if abs(entry - float(protective_stop)) <= 1e-12:
+                raise ValueError("risk-based sizing requires a positive entry-to-stop distance")
             risk_amount = self.broker.account()["equity"] * float(risk_pct) / 100
             quantity = self._rounded_down(risk_amount / abs(entry - float(protective_stop)), rules["quantity_step"])
         if quantity is None or quantity <= 0:
@@ -387,13 +442,21 @@ class SMCPaperAccount:
         if target_1 is not None and target_2 is not None and (
                 (side == "buy" and target_2 <= target_1) or (side == "sell" and target_2 >= target_1)):
             raise ValueError("T2 must be farther than T1")
+        if ownership == "strategy" and (protective_stop is None or target_1 is None or target_2 is None):
+            raise ValueError("SMC strategy orders require a protective stop, target 1 and target 2")
+        risk_distance = abs(entry - float(protective_stop)) if protective_stop is not None else None
+        target_1_r = (abs(float(target_1) - entry) / risk_distance
+                      if target_1 is not None and risk_distance else None)
+        target_2_r = (abs(float(target_2) - entry) / risk_distance
+                      if target_2 is not None and risk_distance else None)
         order = self.broker.submit(symbol=symbol, side=side, order_type=order_type,
                                    quantity=quantity, limit_price=limit_price,
                                    stop_price=trigger_price if order_type in {"stop", "stop_limit"} else None,
                                    reduce_only=False, market_open=True)
         now = _iso()
         config = {"reference_price": entry, "stop_loss": protective_stop,
-                  "target_1": target_1, "target_2": target_2, "rules": rules}
+                  "target_1": target_1, "target_2": target_2,
+                  "target_1_r": target_1_r, "target_2_r": target_2_r, "rules": rules}
         self._db.execute(
             "INSERT INTO smc_order_meta(order_id,session_id,ownership,idempotency_key,proposal_id,setup_id,poi_id,model_id,model_version,direction,entry,stop,target_1,target_2,risk_pct,creation_candle,expiry_candle,status,reason,config_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (order["id"], current["id"], ownership, idempotency_key, proposal_id, setup_id, poi_id,
@@ -439,6 +502,45 @@ class SMCPaperAccount:
                                  (mapped, f"reconciled from broker status {order['status']}", _iso(), meta["order_id"]))
                 actions.append({"order_id": meta["order_id"], "action": "status_reconciled",
                                 "from": meta["status"], "to": mapped, "ownership": meta["ownership"]})
+        strategy_owners = [dict(row) for row in self._db.execute(
+            "SELECT * FROM smc_order_meta WHERE session_id=? AND ownership='strategy' AND status IN ('PARTIALLY_FILLED','ENTERED') ORDER BY created_at",
+            (sid,),
+        )]
+        for position in self.broker.positions():
+            owners = []
+            for meta in strategy_owners:
+                order = broker_orders.get(meta["order_id"])
+                if order and order.get("symbol") == position.get("symbol") and order.get("status") in {"partially_filled", "filled"}:
+                    owners.append(meta)
+            if len(owners) != 1:
+                continue
+            meta = owners[0]
+            config = json.loads(meta.get("config_json") or "{}")
+            try:
+                stop, target = self.broker._resolved_protection(position, {
+                    "stop_loss": float(config["stop_loss"]),
+                    "take_profit": float(config.get("target_2") or config["target_1"]),
+                    "target_r": _configured_r(config, "target_2") or _configured_r(config, "target_1"),
+                    "tick_size": (config.get("rules") or {}).get("tick_size"),
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
+            stop_changed = position.get("stop_loss") is None or abs(float(position["stop_loss"]) - float(stop)) > 1e-9
+            target_changed = position.get("take_profit") is None or abs(float(position["take_profit"]) - float(target)) > 1e-9
+            if not stop_changed and not target_changed:
+                continue
+            repaired = self.broker.set_protection(
+                position["symbol"], stop_loss=stop if stop_changed else None,
+                take_profit=target if target_changed else None,
+            )
+            action = {
+                "order_id": meta["order_id"], "action": "restored_strategy_protection",
+                "stop_loss": repaired.get("stop_loss"), "take_profit": repaired.get("take_profit"),
+                "planned_rr": _configured_r(config, "target_2") or _configured_r(config, "target_1"),
+                "source": "immutable_smc_order_configuration_and_actual_fill",
+            }
+            actions.append(action)
+            self._audit("paper_position_protection_repaired", object_id=meta["order_id"], payload=action)
         if actions:
             self._audit("paper_orders_reconciled", payload={"actions": actions, "manual_orders_cancelled": 0})
             self._snapshot()
@@ -489,8 +591,12 @@ class SMCPaperAccount:
                 "SELECT order_id,config_json FROM smc_order_meta WHERE session_id=? AND status IN ('ORDER_PENDING','PARTIALLY_FILLED')",
                 (current["id"],)).fetchall():
             config = json.loads(row["config_json"] or "{}")
-            protections[row["order_id"]] = {"stop_loss": config.get("stop_loss"),
-                                             "take_profit": config.get("target_2") or config.get("target_1")}
+            protections[row["order_id"]] = {
+                "stop_loss": config.get("stop_loss"),
+                "take_profit": config.get("target_2") or config.get("target_1"),
+                "target_r": _configured_r(config, "target_2") or _configured_r(config, "target_1"),
+                "tick_size": (config.get("rules") or {}).get("tick_size"),
+            }
         result = self.broker.process_candle(symbol, candle, protections=protections)
         self._db.execute("INSERT INTO smc_processed_candles VALUES (?,?,?)", key)
         for event in result["events"]:
@@ -507,18 +613,32 @@ class SMCPaperAccount:
             quantity = self._rounded_down(float(event["quantity"]) * 0.5, step)
             if quantity <= 0:
                 continue
+            position = next((row for row in self.broker.positions()
+                             if row["symbol"] == key[1]), None)
+            target_1_r = _configured_r(config, "target_1")
+            if position and config.get("stop_loss") is not None and target_1_r is not None:
+                _stop, target_1 = self.broker._resolved_protection(position, {
+                    "stop_loss": config["stop_loss"], "take_profit": target_1,
+                    "target_r": target_1_r,
+                    "tick_size": (config.get("rules") or {}).get("tick_size"),
+                })
             side = "sell" if parent["direction"] == "bullish" else "buy"
             child = self.broker.submit(symbol=key[1], side=side, order_type="limit",
                                        quantity=quantity, limit_price=float(target_1),
                                        reduce_only=True, market_open=True)
             now = _iso()
-            child_config = {**config, "parent_order_id": parent["order_id"], "scale_out_fraction": 0.5}
+            child_config = {**config, "planned_target_1": config.get("target_1"),
+                            "planned_target_2": config.get("target_2"),
+                            "target_1": target_1,
+                            "target_2": position.get("take_profit") if position else config.get("target_2"),
+                            "actual_entry": position.get("entry_price") if position else None,
+                            "parent_order_id": parent["order_id"], "scale_out_fraction": 0.5}
             self._db.execute(
                 "INSERT INTO smc_order_meta(order_id,session_id,ownership,idempotency_key,proposal_id,setup_id,poi_id,model_id,model_version,direction,entry,stop,target_1,target_2,risk_pct,creation_candle,expiry_candle,status,reason,config_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (child["id"], current["id"], "strategy_target_1", f"target1:{parent['order_id']}",
                  parent["proposal_id"], parent["setup_id"], parent["poi_id"], parent["model_id"],
                  parent["model_version"], parent["direction"], parent["entry"], parent["stop"],
-                 parent["target_1"], parent["target_2"], parent["risk_pct"], parent["creation_candle"],
+                 target_1, child_config.get("target_2"), parent["risk_pct"], parent["creation_candle"],
                  parent["expiry_candle"], "ORDER_PENDING", "50% scale-out at deterministic T1",
                  json.dumps(child_config, sort_keys=True), now, now),
             )
