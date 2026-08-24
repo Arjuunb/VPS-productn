@@ -14,7 +14,13 @@ from typing import Literal
 from bot.types import Bar
 from data.market_data_v2 import TF_MS, MarketDataService, normalize_symbol
 from execution.paper_broker_v2 import PaperBrokerV2
-from services.native_price_action import STRATEGIES, NativePriceActionEngine, PriceActionConfig
+from services.native_price_action import (
+    RESEARCH_ID as PRICE_ACTION_RESEARCH_ID,
+    STRATEGIES,
+    STRATEGY_VERSION as PRICE_ACTION_STRATEGY_VERSION,
+    NativePriceActionEngine,
+    PriceActionConfig,
+)
 from services.price_action_governance import PriceActionJournalStore
 from services.price_action_stream import PriceActionPublicStream
 
@@ -702,6 +708,53 @@ class PriceActionPaperAccount:
         current = self.session()
         return PaperExecutionConfig(**json.loads(current.get("execution_config_json") or "{}")) .validated()
 
+    @staticmethod
+    def _assert_native_state_identity(visual_state: dict, current: dict) -> None:
+        """Accept decisions only from the active native Price Action core."""
+        if visual_state.get("research_id") != PRICE_ACTION_RESEARCH_ID or \
+                visual_state.get("strategy_version") != PRICE_ACTION_STRATEGY_VERSION:
+            raise ValueError("Price Action decision state is not attested to the active native core version")
+        state_identity = (
+            normalize_symbol(visual_state.get("symbol") or ""),
+            str(visual_state.get("timeframe") or ""),
+        )
+        session_identity = (
+            normalize_symbol(current.get("symbol") or ""),
+            str(current.get("timeframe") or ""),
+        )
+        if state_identity != session_identity:
+            raise ValueError(
+                "Price Action decision identity does not match the active paper session"
+            )
+
+    @staticmethod
+    def _proposal_attestation_error(proposal: dict, setup: dict,
+                                    config: PaperExecutionConfig) -> str | None:
+        if not setup or setup.get("id") != proposal.get("setup_id"):
+            return "native proposal has no matching setup"
+        if setup.get("phase") != "ORDER_PENDING":
+            return "native setup is not at the closed-bar ORDER_PENDING boundary"
+        if setup.get("strategy_id") != proposal.get("strategy_id") or \
+                setup.get("direction") != proposal.get("direction"):
+            return "native setup and proposal ownership do not match"
+        try:
+            entry = float(proposal["entry"])
+            stop = float(proposal["stop"])
+            target = float(proposal["target"])
+            direction = proposal["direction"]
+            risk = abs(entry - stop)
+            ratio = abs(target - entry) / risk
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            return "native proposal has incomplete risk geometry"
+        valid = (
+            stop < entry < target if direction == "bullish"
+            else target < entry < stop if direction == "bearish"
+            else False
+        )
+        if not valid or abs(ratio - config.target_r) > 1e-6:
+            return "native proposal does not preserve the configured directional R:R"
+        return None
+
     def _candidate(self, proposal: dict, setup: dict, rules: dict, status: str,
                    reason: str, config: PaperExecutionConfig) -> dict:
         current, now = self.session(), _iso()
@@ -821,6 +874,7 @@ class PriceActionPaperAccount:
         current = self.session()
         if not current:
             raise ValueError("no active Price Action session")
+        self._assert_native_state_identity(visual_state, current)
         proposals = {row["id"]: row for row in visual_state.get("proposals", [])}
         setups = {row["id"]: row for row in visual_state.get("setups", [])}
         reconciliation = self.reconcile_pending_orders(
@@ -892,7 +946,13 @@ class PriceActionPaperAccount:
                                     (current["id"], proposal["id"])).fetchone():
                     continue
                 setup = setups.get(proposal["setup_id"], {})
-                if not feed_reliable:
+                attestation_error = self._proposal_attestation_error(proposal, setup, config)
+                if attestation_error:
+                    self._candidate(proposal, setup, contract_rules, "REJECTED",
+                                    attestation_error, config)
+                    rejected.append({"proposal_id": proposal["id"],
+                                     "reason": attestation_error})
+                elif not feed_reliable:
                     self._candidate(proposal, setup, contract_rules, "DATA_PAUSED",
                                     "new entry paused because market feed is unreliable", config)
                     rejected.append({"proposal_id": proposal["id"], "reason": "feed unreliable"})
@@ -900,9 +960,20 @@ class PriceActionPaperAccount:
                     self._candidate(proposal, setup, contract_rules, "SIGNAL_ONLY", "signals-only mode does not create an order", config)
                 elif config.operating_mode == "manual_approval":
                     self._candidate(proposal, setup, contract_rules, "PENDING_APPROVAL", "waiting for explicit paper-order approval", config)
-                else:
-                    placed = self._place_proposal(proposal, setup, contract_rules, config, source="automatic")
+                elif config.operating_mode == "automatic":
+                    try:
+                        placed = self._place_proposal(
+                            proposal, setup, contract_rules, config, source="automatic")
+                    except (ValueError, RuntimeError) as exc:
+                        reason = f"automatic paper placement rejected: {exc}"
+                        self._candidate(proposal, setup, contract_rules, "REJECTED", reason, config)
+                        placed = {"accepted": False, "proposal_id": proposal["id"],
+                                  "reason": reason}
                     (created if placed["accepted"] else rejected).append(placed)
+                else:
+                    reason = "saved Price Action operating mode is invalid; execution failed closed"
+                    self._candidate(proposal, setup, contract_rules, "DATA_PAUSED", reason, config)
+                    rejected.append({"proposal_id": proposal["id"], "reason": reason})
             self._snapshot_current(metrics=visual_state.get("metrics", {}))
         observed_health = feed_status or {
             "state": "SYNCHRONIZED" if feed_reliable else "DATA_PAUSED",
@@ -1077,9 +1148,13 @@ def replay_state(market: MarketDataService, symbol: str, timeframe: str, *,
 class PriceActionLabRuntime:
     """One durable public-data/engine/executor owner for the Visual Lab."""
 
-    def __init__(self, market: MarketDataService, account: PriceActionPaperAccount):
+    def __init__(self, market: MarketDataService, account: PriceActionPaperAccount, *,
+                 poll_seconds: float = 5.0, autostart: bool = False):
         self.market, self.account = market, account
+        self.poll_seconds = max(1.0, float(poll_seconds))
         self._lock = threading.RLock()
+        self._supervisor_stop = threading.Event()
+        self._supervisor_thread: threading.Thread | None = None
         self.engine: NativePriceActionEngine | None = None
         self.identity: tuple[str, str] | None = None
         self.config_signature = ""
@@ -1088,23 +1163,62 @@ class PriceActionLabRuntime:
             market.public_usdm_window, event_sink=account.record_external_event,
             bar_sink=self._on_closed_bar,
         )
+        if autostart:
+            self._supervisor_thread = threading.Thread(
+                target=self._run_supervisor, name="price-action-paper-runtime", daemon=True)
+            self._supervisor_thread.start()
 
     def ensure(self, symbol: str, timeframe: str) -> None:
         identity = (normalize_symbol(symbol), timeframe)
         config = self._engine_config(*identity)
         signature = json.dumps(asdict(config), sort_keys=True)
         with self._lock:
-            if self.identity == identity and self.engine is not None and self.config_signature == signature:
+            engine_matches = (
+                self.identity == identity and self.engine is not None and
+                self.config_signature == signature
+            )
+            if engine_matches and self.stream.running and (
+                    self.stream.symbol, self.stream.timeframe) == identity:
                 return
-            self.identity = identity
-            self.config_signature = signature
-            self.engine = NativePriceActionEngine(config)
+            if not engine_matches:
+                self.identity = identity
+                self.config_signature = signature
+                self.engine = NativePriceActionEngine(config)
             started = self.stream.start(*identity)
             if started:
+                # A restarted stream may have closed bars that arrived while
+                # the worker was down. Rebuild the core from its reconciled
+                # REST bootstrap, but do not execute historical proposals.
+                self.engine = NativePriceActionEngine(config)
                 self.engine.ingest_closed_bars(
                     self.stream.snapshot()["closed_bars"],
                     market_data_health="LIVE_BOOTSTRAP_RECONCILED",
                 )
+
+    def _maintain_live_session(self) -> dict:
+        """Keep the saved LIVE_PAPER session running without any browser client."""
+        session = self.account.session()
+        if not session:
+            return {"active": False, "reason": "no active Price Action session"}
+        if session.get("mode") != "LIVE_PAPER":
+            return {"active": False, "reason": "active session is not LIVE_PAPER"}
+        identity = (normalize_symbol(session.get("symbol") or "BTCUSDT"),
+                    session.get("timeframe") or "5m")
+        self.ensure(*identity)
+        return {"active": self.stream.running, "symbol": identity[0],
+                "timeframe": identity[1], "connection": self.stream.status()["state"]}
+
+    def _run_supervisor(self) -> None:
+        while not self._supervisor_stop.is_set():
+            try:
+                self._maintain_live_session()
+            except Exception as exc:
+                self.account.record_external_event({
+                    "kind": "paper_runtime_paused",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "new_orders_created": 0,
+                })
+            self._supervisor_stop.wait(self.poll_seconds)
 
     def _session_identity(self, expected_mode: str) -> tuple[dict, tuple[str, str]]:
         session = self.account.session()
@@ -1454,4 +1568,8 @@ class PriceActionLabRuntime:
         return self.account.journal.shadow_report(candidate_id)
 
     def stop(self) -> None:
+        self._supervisor_stop.set()
+        thread = self._supervisor_thread
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=3)
         self.stream.stop()

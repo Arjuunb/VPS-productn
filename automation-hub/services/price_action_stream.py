@@ -206,6 +206,12 @@ class PriceActionPublicStream:
         self._set_state("DISCONNECTED")
 
     @property
+    def running(self) -> bool:
+        """Whether the websocket worker is alive for the current identity."""
+        thread = self._thread
+        return bool(thread and thread.is_alive() and not self._stop.is_set())
+
+    @property
     def market_url(self) -> str:
         lower = self.symbol.lower()
         streams = f"{lower}@kline_{self.timeframe}/{lower}@markPrice@1s"

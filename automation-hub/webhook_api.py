@@ -971,7 +971,11 @@ if _os.path.abspath(settings.smc_paper_db) == _os.path.abspath(settings.price_ac
     raise RuntimeError("HUB_SMC_PAPER_DB must not share the Price Action paper database")
 smc_paper = SMCPaperAccount(settings.smc_paper_db, starting_balance=10_000.0)
 smc_runtime = SMCStrategyLabRuntime(v2_market_data, smc_paper)
-price_action_runtime = PriceActionLabRuntime(v2_market_data, price_action_paper)
+# Price Action must remain autonomous after a server restart even when no
+# browser has opened the lab page. The supervisor owns stream initialization;
+# UI requests are read-only observers of the same server-side runtime.
+price_action_runtime = PriceActionLabRuntime(
+    v2_market_data, price_action_paper, autostart=True)
 price_action_experiments = PriceActionExperimentStore(settings.price_action_research_db)
 price_action_research = PriceActionExperimentRunner(price_action_experiments)
 v2_market_update_job = MarketDataUpdateJob(v2_market_data)

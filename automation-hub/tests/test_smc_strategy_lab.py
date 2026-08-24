@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 import json
+import math
 
 import pytest
 
@@ -193,6 +194,58 @@ def test_strategy_candidate_obeys_saved_operating_mode(tmp_path, mode, expected,
     if mode == "manual_approval":
         account.approve_candidate(evaluation["proposal_id"])
         assert len(account.broker.orders()) == 1
+
+
+def test_smc_automatic_uses_saved_risk_and_attested_core_identity(tmp_path):
+    account = SMCPaperAccount(tmp_path / "saved-risk.db")
+    account.configure(config=SMCPaperConfig(operating_mode="automatic", risk_pct=.25))
+    evaluation = evaluate(seeded_engine())
+    reference = float(evaluation["trade_plan"]["entry"])
+    stop = float(evaluation["trade_plan"]["stop"])
+    result = account.synchronize_candidate(
+        evaluation, rules=RULES, reference_price=reference, feed_reliable=True)
+    assert result["candidate_status"] == "APPROVED_AUTOMATIC"
+    metadata = account.state()["order_metadata"][0]
+    expected = math.floor(
+        (10_000 * .25 / 100) /
+        abs(float(metadata["entry"]) - float(metadata["stop"])) / .001 + 1e-12
+    ) * .001
+    assert result["order"]["order"]["quantity"] == pytest.approx(expected)
+    assert metadata["risk_pct"] == .25
+
+    other = SMCPaperAccount(tmp_path / "identity-rejected.db")
+    other.configure(config=SMCPaperConfig(operating_mode="automatic"))
+    mismatched = json.loads(json.dumps(evaluation, default=str))
+    mismatched["data_identity"]["symbol"] = "ETHUSDT"
+    with pytest.raises(ValueError, match="identity does not match"):
+        other.synchronize_candidate(
+            mismatched, rules=RULES, reference_price=reference, feed_reliable=True)
+    assert other.broker.orders() == []
+
+
+def test_smc_invalid_mode_and_failed_automatic_placement_fail_closed(tmp_path):
+    invalid = SMCPaperAccount(tmp_path / "invalid-mode.db")
+    invalid._db.execute(
+        "UPDATE smc_sessions SET operating_mode='unexpected' WHERE id=?",
+        (invalid.session()["id"],),
+    )
+    evaluation = evaluate(seeded_engine())
+    result = invalid.synchronize_candidate(
+        evaluation, rules=RULES,
+        reference_price=evaluation["trade_plan"]["entry"], feed_reliable=True)
+    assert result["candidate_status"] == "DATA_PAUSED"
+    assert invalid.broker.orders() == []
+
+    rejected = SMCPaperAccount(tmp_path / "placement-rejected.db")
+    rejected.configure(config=SMCPaperConfig(operating_mode="automatic"))
+    direction = evaluation["proposal"]["direction"]
+    stop = float(evaluation["trade_plan"]["stop"])
+    crossed_reference = stop - 1 if direction == "bullish" else stop + 1
+    failed = rejected.synchronize_candidate(
+        evaluation, rules=RULES, reference_price=crossed_reference, feed_reliable=True)
+    assert failed["candidate_status"] == "REJECTED"
+    assert "automatic paper placement rejected" in failed["reason"]
+    assert rejected.broker.orders() == []
 
 
 def test_unreliable_feed_cannot_create_strategy_order(tmp_path):

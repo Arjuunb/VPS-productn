@@ -132,7 +132,11 @@ def test_unreliable_feed_cancels_strategy_order_and_never_infers_fill(tmp_path):
             operating_mode="automatic", strategy_id="PA1_SR_REJECTION"),
     )
     state = {
-        "symbol": "BTCUSDT", "timeframe": "5m", "setups": [],
+        "research_id": "PRICE_ACTION_NATIVE_V1_RESEARCH", "strategy_version": "1.1.0",
+        "symbol": "BTCUSDT", "timeframe": "5m", "setups": [{
+            "id": "setup-1", "strategy_id": "PA1_SR_REJECTION",
+            "direction": "bullish", "phase": "ORDER_PENDING", "zone_id": "zone-1",
+        }],
         "proposals": [{
             "id": "proposal-1", "setup_id": "setup-1", "strategy_id": "PA1_SR_REJECTION",
             "direction": "bullish", "entry": 105, "stop": 100, "target": 117.5,
@@ -170,7 +174,11 @@ def test_reconciled_fill_quote_and_funding_are_order_scoped_and_persistent(tmp_p
             operating_mode="automatic", strategy_id="PA1_SR_REJECTION"),
     )
     state = {
-        "symbol": "BTCUSDT", "timeframe": "5m", "setups": [],
+        "research_id": "PRICE_ACTION_NATIVE_V1_RESEARCH", "strategy_version": "1.1.0",
+        "symbol": "BTCUSDT", "timeframe": "5m", "setups": [{
+            "id": "setup-evidence", "strategy_id": "PA1_SR_REJECTION",
+            "direction": "bullish", "phase": "ORDER_PENDING", "zone_id": "zone-evidence",
+        }],
         "proposals": [{
             "id": "proposal-evidence", "setup_id": "setup-evidence",
             "strategy_id": "PA1_SR_REJECTION", "direction": "bullish",

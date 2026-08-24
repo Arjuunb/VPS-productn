@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 
 from bot.types import Bar
@@ -22,11 +23,13 @@ RULES = {"tick_size": .1, "quantity_step": .001, "min_quantity": .001,
 
 def visual(proposal=True, count=10):
     setup = {"id": "setup-1", "zone_id": "zone-1", "strategy_id": "PA1_SR_REJECTION",
-             "direction": "bullish", "phase": "ENTRY_READY"}
+             "direction": "bullish", "phase": "ORDER_PENDING"}
     trade = {"id": "proposal-1", "setup_id": "setup-1", "strategy_id": "PA1_SR_REJECTION",
              "direction": "bullish", "entry": 105.0, "stop": 99.0, "target": 120.0,
              "risk_distance": 6.0, "rr_ratio": 2.5, "valid_until_index": count + 2}
-    return {"candles": [{}] * count, "setups": [setup], "proposals": [trade] if proposal else [],
+    return {"research_id": "PRICE_ACTION_NATIVE_V1_RESEARCH", "strategy_version": "1.1.0",
+            "symbol": "BTCUSDT", "timeframe": "5m",
+            "candles": [{}] * count, "setups": [setup], "proposals": [trade] if proposal else [],
             "metrics": {"closed": 0}}
 
 
@@ -376,6 +379,68 @@ def test_runtime_rejects_view_identity_that_differs_from_the_active_session(tmp_
     except ValueError as exc:
         assert "does not match active Price Action session" in str(exc)
     assert runtime.stream.state == "DISCONNECTED"
+
+
+def test_runtime_supervisor_starts_saved_live_session_without_browser_request(tmp_path):
+    class Market:
+        def public_usdm_window(self, *_args, **_kwargs):
+            return []
+
+    account = PriceActionPaperAccount(tmp_path / "pa-autonomous.db")
+    runtime = PriceActionLabRuntime(Market(), account, autostart=False)
+    maintained = []
+    runtime.ensure = lambda symbol, timeframe: maintained.append((symbol, timeframe))  # type: ignore[method-assign]
+
+    runtime._maintain_live_session()
+    assert maintained == [("BTCUSDT", "5m")]
+
+    account.configure(mode="HISTORICAL")
+    runtime._maintain_live_session()
+    assert maintained == [("BTCUSDT", "5m")]
+
+
+def test_price_action_runtime_autostart_invokes_server_supervisor(monkeypatch, tmp_path):
+    started = threading.Event()
+
+    class Market:
+        def public_usdm_window(self, *_args, **_kwargs):
+            return []
+
+    monkeypatch.setattr(
+        PriceActionLabRuntime, "_maintain_live_session",
+        lambda _self: started.set() or {"active": True},
+    )
+    runtime = PriceActionLabRuntime(
+        Market(), PriceActionPaperAccount(tmp_path / "pa-server-autostart.db"),
+        poll_seconds=1, autostart=True,
+    )
+    try:
+        assert started.wait(1)
+    finally:
+        runtime.stop()
+
+
+def test_price_action_rejects_unattested_or_detached_core_proposals(tmp_path):
+    account = PriceActionPaperAccount(tmp_path / "pa-core-boundary.db")
+    account.configure(execution_config=PaperExecutionConfig(operating_mode="automatic"))
+
+    wrong_version = visual()
+    wrong_version["strategy_version"] = "unknown"
+    try:
+        account.synchronize_strategy(wrong_version, contract_rules=RULES,
+                                     candle=bar(1), feed_reliable=True)
+        assert False, "unattested native state must fail closed"
+    except ValueError as exc:
+        assert "not attested" in str(exc)
+    assert account.broker.orders() == []
+
+    detached = visual()
+    detached["setups"][0]["phase"] = "WAITING_FOR_CONFIRMATION"
+    result = account.synchronize_strategy(detached, contract_rules=RULES,
+                                          candle=bar(1), feed_reliable=True)
+    assert result["created"] == []
+    assert result["rejected"][0]["reason"].startswith("native setup")
+    assert account.broker.orders() == []
 
 
 def test_visual_metrics_expose_honest_aggregate_and_strategy_scopes():

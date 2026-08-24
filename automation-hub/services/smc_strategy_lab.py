@@ -727,23 +727,46 @@ class SMCPaperAccount:
         current = self.session()
         if not current:
             raise ValueError("no active SMC paper session")
+        identity = evaluation.get("data_identity") or {}
+        model = evaluation.get("model") or {}
+        if evaluation.get("strategy_id") != STRATEGY_ID or \
+                evaluation.get("version") != STRATEGY_VERSION:
+            raise ValueError("SMC decision is not attested to the active source strategy version")
+        if model.get("id") != current.get("model_id") or model.get("status") != "ACTIVE":
+            raise ValueError("SMC decision model does not match the active paper session")
+        if (normalize_symbol(identity.get("symbol") or ""), identity.get("timeframe")) != (
+                normalize_symbol(current.get("symbol") or ""), current.get("timeframe")):
+            raise ValueError("SMC decision identity does not match the active paper session")
         proposal = evaluation.get("proposal")
         plan = evaluation.get("trade_plan")
         if evaluation.get("state") != "ENTRY_READY" or not proposal or not plan:
             return {"created": False, "reason": evaluation.get("next_required_event", "not ready"),
                     "real_execution_allowed": False}
+        if (normalize_symbol(proposal.get("symbol") or ""), proposal.get("timeframe")) != (
+                normalize_symbol(current.get("symbol") or ""), current.get("timeframe")):
+            raise ValueError("SMC proposal identity does not match the active paper session")
+        try:
+            if abs(float(plan["entry"]) - float(proposal["entry"])) > 1e-9 or \
+                    abs(float(plan["stop"]) - float(proposal["stop"])) > 1e-9:
+                raise ValueError("SMC trade plan is detached from its native proposal")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("SMC trade plan is detached from its native proposal") from exc
         proposal_id = proposal["id"]
         existing = self._db.execute("SELECT * FROM smc_candidates WHERE proposal_id=?", (proposal_id,)).fetchone()
         if existing:
             return {"created": False, "duplicate": True, "candidate": {**dict(existing),
                     "payload": json.loads(existing["payload"])}, "real_execution_allowed": False}
         mode = current["operating_mode"]
-        status, reason = (
-            ("DATA_PAUSED", "market data is not reliable") if not feed_reliable else
-            ("SIGNAL_ONLY", "signals-only mode cannot create an order") if mode == "signals_only" else
-            ("PENDING_APPROVAL", "waiting for explicit paper approval") if mode == "manual_approval" else
-            ("APPROVED_AUTOMATIC", "automatic paper mode passed the candidate boundary")
-        )
+        if not feed_reliable:
+            status, reason = "DATA_PAUSED", "market data is not reliable"
+        elif mode == "signals_only":
+            status, reason = "SIGNAL_ONLY", "signals-only mode cannot create an order"
+        elif mode == "manual_approval":
+            status, reason = "PENDING_APPROVAL", "waiting for explicit paper approval"
+        elif mode == "automatic":
+            status, reason = "APPROVED_AUTOMATIC", "automatic paper mode passed the candidate boundary"
+        else:
+            status, reason = "DATA_PAUSED", "saved SMC operating mode is invalid; execution failed closed"
         payload = {"evaluation": evaluation, "rules": rules, "reference_price": reference_price}
         now = _iso()
         self._db.execute(
@@ -756,19 +779,33 @@ class SMCPaperAccount:
                              "native_object_ids": evaluation.get("native_object_ids", [])})
         placed = None
         if status == "APPROVED_AUTOMATIC":
-            placed = self._place_candidate(payload, proposal_id, source="automatic")
+            try:
+                placed = self._place_candidate(payload, proposal_id, source="automatic")
+            except (ValueError, RuntimeError) as exc:
+                status = "REJECTED"
+                reason = f"automatic paper placement rejected: {exc}"
+                self._db.execute(
+                    "UPDATE smc_candidates SET status=?,reason=?,updated_at=? WHERE proposal_id=?",
+                    (status, reason, _iso(), proposal_id),
+                )
+                self._audit("paper_order_rejected", object_id=proposal_id,
+                            payload={"reason": reason, "source": "automatic"})
         return {"created": True, "candidate_status": status, "order": placed,
+                "reason": reason,
                 "real_execution_allowed": False}
 
     def _place_candidate(self, payload: dict, proposal_id: str, *, source: str) -> dict:
         evaluation = payload["evaluation"]
         proposal, plan = evaluation["proposal"], evaluation["trade_plan"]
+        current = self.session()
+        if not current:
+            raise ValueError("no active SMC paper session")
         tick = float(payload["rules"]["tick_size"])
         normalized = lambda value: round(round(float(value) / tick) * tick, 12) if tick > 0 else float(value)
         result = self.submit_order(
             symbol=proposal["symbol"], side=proposal["direction"], order_type="market",
             rules=payload["rules"], reference_price=float(payload["reference_price"]),
-            risk_pct=float(plan["risk_percent"]), stop_loss=normalized(plan["stop"]),
+            risk_pct=float(current["risk_pct"]), stop_loss=normalized(plan["stop"]),
             target_1=normalized(plan["target_1"]), target_2=normalized(plan["target_2"]),
             idempotency_key=f"strategy:{proposal_id}", ownership="strategy",
             proposal_id=proposal_id, setup_id=proposal.get("setup_id"),
