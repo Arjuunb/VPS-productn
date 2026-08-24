@@ -20,6 +20,12 @@ class PublicMarket:
     def public_usdm_window(self, symbol, timeframe, *, limit):
         return bars()
 
+    def public_usdm_quote(self, symbol):
+        return {"symbol": symbol, "bid": 119.9, "ask": 120.1, "mark": 120,
+                "funding_rate": .0001, "last_funding_time": NOW.isoformat(),
+                "next_funding_time": (NOW + timedelta(hours=8)).isoformat(),
+                "provider_time": NOW.isoformat()}
+
 
 def test_live_visual_keeps_forming_candle_outside_native_engine():
     state = binance_visual_state(PublicMarket(), "BTCUSDT", "5m", observed_at=NOW)
@@ -28,6 +34,9 @@ def test_live_visual_keeps_forming_candle_outside_native_engine():
     assert state["snapshot"]["candle_open"] == bars()[-2].timestamp
     assert state["data_provenance"]["forming_candle_excluded"] is True
     assert state["execution_allowed"] is False
+    assert state["live_display"]["connection_state"] == "SYNCHRONIZED"
+    assert state["live_display"]["transport_state"] == "REST_POLL"
+    assert state["live_display"]["reliable"] is True
 
 
 def test_replay_reveals_only_cursor_prefix(monkeypatch, tmp_path):

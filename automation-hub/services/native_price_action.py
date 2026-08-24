@@ -7,6 +7,7 @@ chart provenance only and is deliberately absent from every decision rule.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import Enum
@@ -907,15 +908,22 @@ class NativePriceActionEngine:
         research_trades = [row for row in self.research_trades.values()
                            if candle_cutoff is None or row.created_at <= candle_cutoff]
         completed = [row for row in research_trades if row.status in {"WON", "LOST"}]
+        config_payload = asdict(self.config)
+        config_id = hashlib.sha256(json.dumps(config_payload, sort_keys=True, default=str).encode()).hexdigest()
         strategy_metrics = {}
         for strategy_id in STRATEGIES:
-            rows = [row for row in completed if row.strategy_id == strategy_id]
+            strategy_trades = [row for row in research_trades if row.strategy_id == strategy_id]
+            rows = [row for row in strategy_trades if row.status in {"WON", "LOST"}]
             strategy_metrics[strategy_id] = {
                 "closed": len(rows), "wins": sum(row.status == "WON" for row in rows),
                 "losses": sum(row.status == "LOST" for row in rows),
+                "unfilled": sum(row.status == "EXPIRED" for row in strategy_trades),
+                "gross_r": sum(float(row.gross_r or 0) for row in rows),
                 "net_r": sum(float(row.net_r or 0) for row in rows),
                 "costs_r": sum(float(row.costs_r or 0) for row in rows),
             }
+        cancelled_setups = sum(
+            row.phase in {SetupPhase.CANCELLED, SetupPhase.INVALIDATED} for row in setups)
         return {
             "research_id": RESEARCH_ID,
             "research_only": True,
@@ -944,9 +952,40 @@ class NativePriceActionEngine:
                 "wins": sum(row.status == "WON" for row in completed),
                 "losses": sum(row.status == "LOST" for row in completed),
                 "unfilled": sum(row.status == "EXPIRED" for row in research_trades),
+                "cancelled": cancelled_setups,
+                "rejected": 0,
+                "gross_r": sum(float(row.gross_r or 0) for row in completed),
                 "net_r": sum(float(row.net_r or 0) for row in completed),
                 "costs_r": sum(float(row.costs_r or 0) for row in completed),
                 "by_strategy": strategy_metrics,
+            },
+            "metrics_scope": {
+                "scope": "AGGREGATE_PA1_PA4",
+                "account": "RESEARCH_ENGINE_NORMALIZED",
+                "session_id": None,
+                "mode": "ENGINE_WINDOW",
+                "symbol": self.config.symbol,
+                "timeframe": self.config.timeframe,
+                "strategies": list(STRATEGIES),
+                "strategy_variant": {
+                    "entry_model": self.config.entry_model,
+                    "stop_model": self.config.stop_model,
+                    "trigger_filter": self.config.trigger_filter,
+                },
+                "dataset_start": self.bars[0].timestamp.isoformat() if self.bars else None,
+                "dataset_end": self.bars[-1].timestamp.isoformat() if self.bars else None,
+                "closed_candles": len(self.bars),
+                "configuration_id": config_id,
+                "experiment_id": None,
+                "cost_model": {
+                    "commission_bps": self.config.commission_bps,
+                    "spread_bps": self.config.spread_bps,
+                    "slippage_bps": self.config.slippage_bps,
+                    "spread_and_slippage_embedded_in_gross_r": True,
+                    "commission_reported_as_costs_r": True,
+                    "funding_coverage": "NOT_APPLIED_TO_VISUAL_ENGINE_METRICS",
+                },
+                "duplicate_trade_ids": 0,
             },
             "snapshot": asdict(self.latest_snapshot) if self.latest_snapshot else None,
             "selected_snapshot": asdict(snapshot) if snapshot else None,

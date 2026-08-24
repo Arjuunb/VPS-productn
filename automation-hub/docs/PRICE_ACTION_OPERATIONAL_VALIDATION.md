@@ -59,7 +59,10 @@ The command must exit zero and the report must contain:
 - `execution_mode: PAPER`
 - `private_credentials_used: false`
 - `real_execution_allowed: false`
-- final WebSocket state `CONNECTED`, `reliable: true`, and a non-null `last_update`
+- final market-data state `SYNCHRONIZED`, transport state `CONNECTED`, and
+  `reliable: true`
+- non-null independent candle, bid/ask and mark update timestamps after the
+  controlled reconnect
 - the last completed candle advances during the soak
 - zero duplicate completed candles
 - a completed controlled WebSocket reconnect

@@ -106,9 +106,11 @@ def contract_rules(symbol: str):
 @router.get("/live-chart")
 def live_chart(symbol: str = "BTCUSDT", timeframe: str = "5m",
                window: int = Query(800, ge=50, le=1500),
-               visible: int = Query(400, ge=50, le=1500)):
+               visible: int = Query(400, ge=50, le=1500),
+               request_id: Optional[str] = Query(default=None, max_length=100)):
     try:
-        return _wa.price_action_runtime.live_state(symbol, timeframe, visible=visible)
+        return _wa.price_action_runtime.live_state(
+            symbol, timeframe, visible=visible, request_id=request_id)
     except (ValueError, RuntimeError) as exc:
         _bad(exc, 503)
 
@@ -351,6 +353,16 @@ def cancel_paper_order(order_id: str, x_webhook_secret: Optional[str] = Header(d
         return _wa.price_action_paper.broker.cancel(order_id)
     except (KeyError, ValueError) as exc:
         _bad(exc)
+
+
+@router.post("/paper/orders/reconcile")
+def reconcile_paper_orders(x_webhook_secret: Optional[str] = Header(default=None)):
+    """Reconcile strategy-generated paper orders without touching manual orders."""
+    _wa._check_secret(x_webhook_secret)
+    try:
+        return _wa.price_action_runtime.reconcile_paper_orders()
+    except (KeyError, ValueError, RuntimeError) as exc:
+        _bad(exc, 409)
 
 
 @router.post("/paper/process/{symbol}")

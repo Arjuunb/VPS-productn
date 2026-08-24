@@ -37,6 +37,25 @@ def test_exact_reset_confirmation_is_required(monkeypatch, tmp_path):
     assert good.json()["execution_mode"] == "PAPER"
 
 
+def test_strategy_order_reconciliation_is_protected_and_preserves_manual_orders(monkeypatch):
+    class Runtime:
+        def reconcile_paper_orders(self):
+            return {"actions": [], "records_deleted": 0, "manual_orders_changed": 0}
+
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+    monkeypatch.setattr(webhook_api, "price_action_runtime", Runtime())
+
+    assert client.post("/research/price-action/paper/orders/reconcile").status_code == 401
+    response = client.post(
+        "/research/price-action/paper/orders/reconcile",
+        headers={"x-webhook-secret": webhook_api.settings.admin_key},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"actions": [], "records_deleted": 0, "manual_orders_changed": 0}
+
+
 def test_session_api_configures_paper_modes_and_resumes_without_live_path(monkeypatch, tmp_path):
     app = FastAPI()
     app.include_router(router)

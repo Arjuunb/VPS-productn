@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -215,3 +216,6 @@ def test_supabase_factory_reset_sql_is_allowlisted_and_preserves_identity():
     assert "drop table" not in sql
     assert "truncate" not in sql
     assert "live" not in sql
+    deletes = re.findall(r"delete\s+from\s+public\.[a-z_]+[^;]*;", sql)
+    assert len(deletes) == 15
+    assert all(" where true" in statement for statement in deletes)

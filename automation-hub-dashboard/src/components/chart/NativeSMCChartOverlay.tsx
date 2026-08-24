@@ -7,7 +7,7 @@ export type Direction = "bullish" | "bearish" | "neutral";
 export interface NativeCandle { timestamp: string; open: number; high: number; low: number; close: number; volume: number }
 export interface NativePivot { id: string; scope: "internal" | "swing"; kind: "high" | "low"; price: number; occurred_at: string; confirmed_at: string; strength: "strong" | "weak" }
 export interface NativeEvent { id: string; direction: Direction; event_type?: string; scope?: string; label?: string; level: number; occurred_at?: string; confirmed_at?: string; timestamp?: string; source_pivot_id?: string }
-export interface NativeZone { id: string; direction: Direction; label?: string; top?: number; bottom?: number; high?: number; low?: number; created_at: string; active: boolean; mitigated: boolean; mitigation_at?: string | null; source_pivot_id?: string; source_structure_id?: string }
+export interface NativeZone { id: string; direction: Direction; label?: string; top?: number; bottom?: number; high?: number; low?: number; created_at: string; active: boolean; mitigated: boolean; mitigation_at?: string | null; source_pivot_id?: string; source_structure_id?: string; lifecycle?: "active" | "invalidated" | "expired" }
 export interface NativeProposal { id: string; setup_id: string; snapshot_id: string; direction: Direction; entry: number; stop: number; target: number; rr_ratio: number; execution_allowed: false; risk_status: string }
 export interface NativeSnapshot {
   id: string; candle_open: string; candle_close: string; htf_bias: number; htf_ema: number | null;
@@ -270,7 +270,14 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
   const obAreas = orderBlocks.map((row) => [{
     name: row.label ?? `${row.direction === "bullish" ? "Bull" : "Bear"} OB`,
     xAxis: spanStart(row.created_at), yAxis: row.low,
-    itemStyle: { color: row.direction === "bullish" ? "rgba(59,130,246,.14)" : "rgba(168,85,247,.14)", borderColor: isHighlighted(row.id) ? "#ffffff" : undefined, borderWidth: isHighlighted(row.id) ? 2 : 0 },
+    itemStyle: {
+      color: row.mitigated
+        ? row.direction === "bullish" ? "rgba(59,130,246,.035)" : "rgba(168,85,247,.035)"
+        : row.direction === "bullish" ? "rgba(59,130,246,.11)" : "rgba(168,85,247,.11)",
+      borderColor: isHighlighted(row.id) ? "#ffffff" : row.mitigated ? "rgba(148,163,184,.30)" : undefined,
+      borderWidth: isHighlighted(row.id) ? 2 : row.mitigated ? 1 : 0,
+      borderType: row.mitigated ? "dashed" : "solid",
+    },
   }, { xAxis: spanEnd(row.mitigation_at), yAxis: row.high }]);
   const pivotData = visiblePivots.map((row) => ({
     name: `${row.strength === "strong" ? "Strong" : "Weak"} ${row.kind === "high" ? "High" : "Low"}`,
@@ -383,12 +390,12 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
           itemStyle: hasFormingCandle && index === candles.length - 1 ? { opacity: 0.78, borderWidth: 2 } : undefined,
         })), ...futureSlots.map(() => "-")], barMaxWidth: 18,
         itemStyle: { color: "#089981", color0: "#f23645", borderColor: "#089981", borderColor0: "#f23645" },
-        markArea: { silent: true, label: { color: "#bac4d5", fontSize: 10 }, data: [...rangeAreas, ...fvgAreas, ...obAreas] },
+        markArea: { silent: true, label: { show: filters.labels, color: "#bac4d5", fontSize: 10 }, data: [...rangeAreas, ...fvgAreas, ...obAreas] },
         markLine: { silent: true, symbol: "none", label: { color: "#cfd6e4", fontSize: 10 }, data: [
           ...(range ? [
-            { yAxis: range.high, name: `${timeframe} range high`, lineStyle: { color: "#ef5b5b", type: "dotted" } },
-            { yAxis: range.equilibrium, name: `${timeframe} equilibrium ${range.equilibrium}`, lineStyle: { color: "#eab54f", type: "dashed" } },
-            { yAxis: range.low, name: `${timeframe} range low`, lineStyle: { color: "#21c77a", type: "dotted" } },
+            { yAxis: range.high, name: `${timeframe} range high`, lineStyle: { color: "#ef5b5b", type: "dotted" }, label: { show: filters.labels } },
+            { yAxis: range.equilibrium, name: `${timeframe} equilibrium ${range.equilibrium}`, lineStyle: { color: "#eab54f", type: "dashed" }, label: { show: filters.labels } },
+            { yAxis: range.low, name: `${timeframe} range low`, lineStyle: { color: "#21c77a", type: "dotted" }, label: { show: filters.labels } },
           ] : []),
           ...(livePrice !== null ? [{
             yAxis: livePrice,
@@ -405,8 +412,8 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
         ] },
       },
       { id: "smc-volume", type: "bar", name: "Volume", xAxisIndex: 1, yAxisIndex: 1, data: [...candles.map((row, index) => ({ value: row.volume, itemStyle: { color: row.close >= row.open ? "rgba(8,153,129,.70)" : "rgba(242,54,69,.70)", opacity: hasFormingCandle && index === candles.length - 1 ? 0.72 : 1 } })), ...futureSlots.map(() => "-")], barMaxWidth: 18 },
-      { id: "smc-pivots", type: "scatter", name: "Native pivots", xAxisIndex: 0, yAxisIndex: 0, data: pivotData as any[], symbolSize: 8, label: { show: filters.labels, formatter: (row: any) => row.data.name, color: "#d7deea", fontSize: 9, position: "top" }, z: 8 },
-      { id: "smc-structure", type: "scatter", name: "Native structure", xAxisIndex: 0, yAxisIndex: 0, data: structureData as any[], symbol: "diamond", symbolSize: 11, label: { show: filters.labels, formatter: (row: any) => row.data.name, color: "#d7deea", fontSize: 9, position: "bottom" }, z: 9 },
+      { id: "smc-pivots", type: "scatter", name: "Native pivots", xAxisIndex: 0, yAxisIndex: 0, data: pivotData as any[], symbolSize: 8, label: { show: filters.labels, formatter: (row: any) => row.data.name, color: "#d7deea", fontSize: 9, position: "top" }, labelLayout: { hideOverlap: true }, z: 8 },
+      { id: "smc-structure", type: "scatter", name: "Native structure", xAxisIndex: 0, yAxisIndex: 0, data: structureData as any[], symbol: "diamond", symbolSize: 11, label: { show: filters.labels, formatter: (row: any) => row.data.name, color: "#d7deea", fontSize: 9, position: "bottom" }, labelLayout: { hideOverlap: true }, z: 9 },
     ],
   } as EChartsOption, priceAxisRange, livePrice, liveDirection };
 }

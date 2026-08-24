@@ -69,25 +69,35 @@ const PA_CHART = {
   research_id: "PRICE_ACTION_NATIVE_V1_RESEARCH", research_only: true,
   execution_allowed: false, paper_execution_allowed: true, symbol: "BTCUSDT", timeframe: "5m",
   candles: PA_CANDLES, swings: [], zones: [], events: [], setups: [], proposals: [], orders: [], trades: [],
-  metrics: { closed: 0, wins: 0, losses: 0, unfilled: 0, net_r: 0, costs_r: 0 },
+  metrics: { closed: 0, wins: 0, losses: 0, unfilled: 0, cancelled: 0, rejected: 0, gross_r: 0, net_r: 0, costs_r: 0,
+    by_strategy: { PA1_SR_REJECTION: { closed: 0, wins: 0, losses: 0, unfilled: 0, gross_r: 0, net_r: 0, costs_r: 0 } } },
+  metrics_scope: { dataset_start: PA_CANDLES[0].timestamp, dataset_end: PA_CANDLES.at(-1)?.timestamp,
+    configuration_id: "mock-price-action-config", cost_model: { funding_coverage: "NOT_APPLIED_TO_VISUAL_ENGINE_METRICS" } },
   snapshot: { candle_open: PA_CANDLES.at(-1)?.timestamp, candle_close: PA_CANDLES.at(-1)?.timestamp,
     structure_bias: "neutral", pattern: null, proposal_ids: [], strategy_traces: [] },
   selected_snapshot: null, forming_candle: { ...PA_CANDLES.at(-1), close: 109 },
   live_display: { is_forming: true, observed_at: "2026-01-01T07:00:00Z", last_update: "2026-01-01T07:00:00Z",
     refresh_interval_seconds: 0, candle_closes_at: "2026-01-01T07:05:00Z", last_price: 109,
     bid: 108.9, ask: 109.1, mark: 109, funding_rate: .0001, next_funding_time: "2026-01-01T08:00:00Z",
-    connection_state: "CONNECTED", new_entries_paused: false, execution_uses_closed_bars_only: true },
+    connection_state: "SYNCHRONIZED", transport_state: "CONNECTED", reliable: true,
+    health_reason: "candles, bid/ask and mark are reconciled and fresh",
+    quote_source: "PUBLIC_WEBSOCKET", candle_age_seconds: .2, quote_age_seconds: .1,
+    mark_age_seconds: .3, closed_candle_age_seconds: 120, candle_quote_deviation_bps: 2,
+    new_entries_paused: false, execution_uses_closed_bars_only: true },
   data_provenance: { exchange: "Binance USDⓈ-M Futures", closed_candles_used: 80 },
 };
 const PA_PAPER = {
   account_scope: "PRICE_ACTION_VISUAL_LAB_ONLY", currency: "USDT", execution_mode: "PAPER",
   real_funds: false, live_execution_allowed: false,
-  session: { id: "pa-session-1", started_at: "2026-01-01T00:00:00Z", status: "active",
+  session: { id: "pa-session-1", started_at: "2026-01-01T00:00:00Z", status: "active", mode: "LIVE_PAPER",
     starting_balance: 10000, symbol: "BTCUSDT", timeframe: "5m", operating_mode: "signals_only",
     execution_config: { strategy_id: "PA1_SR_REJECTION", risk_pct: .5 } },
   account: { starting_balance: 10000, balance: 10000, equity: 10000, unrealized_pnl: 0,
     fees_paid: 0, free_margin: 10000, leverage: 1 }, positions: [], orders: [], trades: [],
-  candidates: [], activity: [],
+  candidates: [], order_metadata: [], activity: [],
+  order_audit: { session_id: "pa-session-1", pending_paper_orders: 0, pending_strategy_orders: 0,
+    pending_manual_orders: 0, duplicate_strategy_orders: [], discrepancies: [],
+    manual_orders_are_never_auto_cancelled: true },
 };
 
 const JOURNAL_FULL = {
@@ -503,10 +513,39 @@ function bodyFor(pathname: string): unknown {
 }
 
 export async function mockApi(page: Page) {
+  let paPaper: any = structuredClone(PA_PAPER);
   await page.route(
     (url) => url.host === "localhost:8000",
     async (route: Route) => {
       const url = new URL(route.request().url());
+      if (url.pathname.includes("/research/price-action/live-chart")) {
+        const symbol = url.searchParams.get("symbol") ?? paPaper.session.symbol;
+        const timeframe = url.searchParams.get("timeframe") ?? paPaper.session.timeframe;
+        const chart: any = structuredClone(PA_CHART);
+        chart.symbol = symbol; chart.timeframe = timeframe;
+        chart.data_identity = { request_id: url.searchParams.get("request_id"),
+          session_id: paPaper.session.id, mode: paPaper.session.mode ?? "LIVE_PAPER", symbol, timeframe };
+        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(chart) });
+      }
+      if (url.pathname.endsWith("/research/price-action/paper") && route.request().method() === "GET") {
+        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(paPaper) });
+      }
+      if (url.pathname.endsWith("/research/price-action/paper/orders/reconcile") && route.request().method() === "POST") {
+        const audit = structuredClone(paPaper.order_audit);
+        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+          actions: [], before: audit, after: audit, records_deleted: 0, manual_orders_changed: 0,
+        }) });
+      }
+      if (url.pathname.includes("/research/price-action/sessions/current/configuration") && route.request().method() === "POST") {
+        const body = route.request().postDataJSON() as Record<string, any>;
+        paPaper = { ...paPaper, session: { ...paPaper.session,
+          symbol: body.symbol ?? paPaper.session.symbol, timeframe: body.timeframe ?? paPaper.session.timeframe,
+          mode: body.mode ?? paPaper.session.mode, operating_mode: body.operating_mode ?? paPaper.session.operating_mode,
+          execution_config: { ...paPaper.session.execution_config,
+            strategy_id: body.strategy_id ?? paPaper.session.execution_config.strategy_id,
+            risk_pct: body.risk_pct ?? paPaper.session.execution_config.risk_pct } } };
+        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(paPaper) });
+      }
       // POST/PUT actions succeed with an echo so save/toggle flows show success
       if (route.request().method() !== "GET") {
         return route.fulfill({ status: 200, contentType: "application/json",

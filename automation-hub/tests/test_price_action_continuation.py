@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 from bot.types import Bar
 from services.native_price_action import NativePriceActionEngine, PriceActionConfig, PriceZone
-from services.price_action_lab import PaperExecutionConfig, PriceActionPaperAccount
+from services.price_action_lab import PaperExecutionConfig, PriceActionLabRuntime, PriceActionPaperAccount
 from services.price_action_research import PriceActionExperimentRunner, PriceActionExperimentStore, controlled_pa_smc_report
 from services.price_action_stream import PriceActionPublicStream
 
@@ -104,8 +104,11 @@ def test_global_factory_reset_erases_price_action_session_history(tmp_path):
 
 def test_public_stream_dedupes_closed_candles_and_marks_gaps_unreliable():
     history = [bar(0), bar(1)]
-    stream = PriceActionPublicStream(lambda *_args, **_kwargs: history, stale_after_seconds=60)
+    clock = lambda: bar(3).timestamp + timedelta(minutes=5)
+    stream = PriceActionPublicStream(lambda *_args, **_kwargs: history, stale_after_seconds=60,
+                                     clock=clock)
     stream.bootstrap("BTCUSDT", "5m")
+    stream.reconciliation_complete = True
     stream._set_state("CONNECTED")
     stream.ingest_event({"data": {"e": "bookTicker", "s": "BTCUSDT", "b": "100", "a": "100.1"}})
     stream.ingest_event({"data": {"e": "markPriceUpdate", "p": "100.05", "r": ".0001", "T": 1767225600000}})
@@ -116,25 +119,144 @@ def test_public_stream_dedupes_closed_candles_and_marks_gaps_unreliable():
     gap = {"e": "kline", "k": {**closed["k"], "t": int(bar(4).timestamp.timestamp() * 1000)}}
     stream.ingest_event({"data": gap})
     status = stream.status()
-    assert status["state"] == "DELAYED"
+    assert status["state"] == "RECONCILING"
     assert status["new_entries_paused"] is True
     assert status["duplicate_events"] >= 1
 
 
 def test_public_stream_rest_reconciles_a_missing_closed_candle_once():
     history = [bar(0), bar(1), bar(2)]
-    stream = PriceActionPublicStream(lambda *_args, **_kwargs: history, stale_after_seconds=60)
+    clock = lambda: bar(3).timestamp + timedelta(minutes=5)
+    stream = PriceActionPublicStream(lambda *_args, **_kwargs: history, stale_after_seconds=60,
+                                     clock=clock)
     stream.bootstrap("BTCUSDT", "5m")
     stream._bars.remove(history[1])
     stream.missing_candles += 1
-    stream.last_update = datetime.now(timezone.utc)
     stream._set_state("DELAYED", "controlled test gap")
 
     assert asyncio.run(stream.reconcile()) == 1
     assert [row.timestamp for row in stream.snapshot()["closed_bars"]] == [
         row.timestamp for row in history]
+    forming = {"e": "kline", "k": {"t": int(bar(3).timestamp.timestamp() * 1000),
+               "o": "101", "h": "103", "l": "100", "c": "102", "v": "1000", "x": False}}
+    stream.ingest_event({"data": forming})
+    stream.ingest_event({"data": {"e": "bookTicker", "s": "BTCUSDT", "b": "101.9", "a": "102.1"}})
+    stream.ingest_event({"data": {"e": "markPriceUpdate", "s": "BTCUSDT", "p": "102", "r": ".0001", "T": 1767225600000}})
+    assert stream.status()["state"] == "SYNCHRONIZED"
     assert stream.status()["reliable"] is True
     assert asyncio.run(stream.reconcile()) == 0
+
+
+def test_public_stream_fails_closed_until_all_identity_bound_channels_are_fresh():
+    clock_now = [bar(3).timestamp + timedelta(minutes=5)]
+    stream = PriceActionPublicStream(lambda *_args, **_kwargs: [bar(0), bar(1), bar(2)],
+                                     stale_after_seconds=10, clock=lambda: clock_now[0])
+    stream.bootstrap("BTCUSDT", "5m")
+    stream.reconciliation_complete = True
+    stream._set_state("CONNECTED")
+    assert stream.status()["state"] == "STALE_CANDLES"
+
+    kline = {"e": "kline", "s": "BTCUSDT", "k": {
+        "s": "BTCUSDT", "i": "5m", "t": int(bar(3).timestamp.timestamp() * 1000),
+        "o": "100", "h": "102", "l": "98", "c": "101", "v": "1000", "x": False,
+    }}
+    stream.ingest_event({"data": kline})
+    assert stream.status()["state"] == "STALE_QUOTE"
+    stream.ingest_event({"data": {"e": "bookTicker", "s": "BTCUSDT", "b": "100.9", "a": "101.1"}})
+    assert stream.status()["state"] == "STALE_MARK"
+    stream.ingest_event({"data": {"e": "markPriceUpdate", "s": "BTCUSDT", "p": "101", "r": "0", "T": 1767225600000}})
+    assert stream.status()["state"] == "SYNCHRONIZED"
+
+    clock_now[0] += timedelta(seconds=11)
+    stale = stream.status()
+    assert stale["state"] == "STALE_CANDLES"
+    assert stale["new_entries_paused"] is True
+
+
+def test_public_stream_rejects_old_symbol_or_timeframe_events_and_quote_mismatch():
+    clock = lambda: bar(3).timestamp + timedelta(minutes=5)
+    stream = PriceActionPublicStream(lambda *_args, **_kwargs: [bar(0), bar(1), bar(2)],
+                                     stale_after_seconds=60, clock=clock,
+                                     quote_mismatch_bps=50)
+    stream.bootstrap("BTCUSDT", "5m")
+    stream.reconciliation_complete = True
+    stream._set_state("CONNECTED")
+    wrong = stream.ingest_event({"data": {"e": "bookTicker", "s": "ETHUSDT", "b": "100", "a": "101"}})
+    assert wrong["identity_mismatch"] is True
+    wrong_tf = stream.ingest_event({"data": {"e": "kline", "s": "BTCUSDT", "k": {
+        "s": "BTCUSDT", "i": "15m", "t": int(bar(3).timestamp.timestamp() * 1000),
+        "o": "100", "h": "102", "l": "98", "c": "101", "v": "1000", "x": False,
+    }}})
+    assert wrong_tf["identity_mismatch"] is True
+
+    stream.ingest_event({"data": {"e": "kline", "s": "BTCUSDT", "k": {
+        "s": "BTCUSDT", "i": "5m", "t": int(bar(3).timestamp.timestamp() * 1000),
+        "o": "100", "h": "102", "l": "98", "c": "101", "v": "1000", "x": False,
+    }}})
+    stream.ingest_event({"data": {"e": "bookTicker", "s": "BTCUSDT", "b": "120", "a": "120.1"}})
+    stream.ingest_event({"data": {"e": "markPriceUpdate", "s": "BTCUSDT", "p": "120", "r": "0", "T": 1767225600000}})
+    assert stream.status()["state"] == "QUOTE_MISMATCH"
+    assert stream.status()["reliable"] is False
+
+
+def test_pending_order_reconciliation_expires_strategy_only_and_preserves_manual(tmp_path):
+    account = PriceActionPaperAccount(tmp_path / "reconcile.db")
+    account.configure(execution_config=PaperExecutionConfig(operating_mode="automatic"))
+    account.synchronize_strategy(visual(count=10), contract_rules=RULES,
+                                 candle=bar(1), feed_reliable=True)
+    manual = account.broker.submit(symbol="BTCUSDT", side="buy", order_type="limit",
+                                   quantity=.1, limit_price=90)
+
+    result = account.reconcile_pending_orders(visual(proposal=False, count=14), bar(4))
+
+    assert result["actions"][0]["to"] == "EXPIRED"
+    assert account.broker.order(manual["id"])["status"] == "open"
+    assert result["after"]["pending_strategy_orders"] == 0
+    assert result["after"]["pending_manual_orders"] == 1
+    assert result["manual_orders_changed"] == 0
+    assert any(row["kind"] == "paper_order_reconciled" for row in account.state()["activity"])
+
+
+def test_session_identity_change_is_blocked_while_paper_exposure_exists(tmp_path):
+    account = PriceActionPaperAccount(tmp_path / "identity.db")
+    account.broker.submit(symbol="BTCUSDT", side="buy", order_type="limit",
+                          quantity=.1, limit_price=90)
+    try:
+        account.configure(symbol="ETHUSDT")
+        assert False, "identity change must fail while an order is pending"
+    except ValueError as exc:
+        assert "pending orders" in str(exc)
+    assert account.session()["symbol"] == "BTCUSDT"
+
+
+def test_runtime_rejects_view_identity_that_differs_from_the_active_session(tmp_path):
+    class Market:
+        def public_usdm_window(self, *_args, **_kwargs):
+            raise AssertionError("identity must be rejected before market I/O")
+
+    account = PriceActionPaperAccount(tmp_path / "runtime-identity.db")
+    runtime = PriceActionLabRuntime(Market(), account)
+    try:
+        runtime.live_state("ETHUSDT", "15m")
+        assert False, "mismatched view identity must fail closed"
+    except ValueError as exc:
+        assert "does not match active Price Action session" in str(exc)
+    assert runtime.stream.state == "DISCONNECTED"
+
+
+def test_visual_metrics_expose_honest_aggregate_and_strategy_scopes():
+    engine = NativePriceActionEngine(PriceActionConfig(symbol="BTCUSDT", timeframe="5m"))
+    engine.ingest_closed_bars([bar(index) for index in range(12)])
+    state = engine.visual_state()
+    assert state["metrics_scope"]["scope"] == "AGGREGATE_PA1_PA4"
+    assert state["metrics_scope"]["symbol"] == "BTCUSDT"
+    assert state["metrics_scope"]["timeframe"] == "5m"
+    assert state["metrics_scope"]["configuration_id"]
+    assert set(state["metrics"]["by_strategy"]) == {
+        "PA1_SR_REJECTION", "PA2_TREND_PULLBACK", "PA3_FLIP_RETEST", "PA4_FALSE_BREAK_REVERSAL",
+    }
+    assert state["metrics"]["net_r"] == sum(
+        row["net_r"] for row in state["metrics"]["by_strategy"].values())
 
 
 def test_pattern_combinations_are_metadata_and_generic_rejection_has_no_pattern_gate():

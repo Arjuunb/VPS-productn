@@ -41,21 +41,24 @@ BEGIN
     END IF;
 
     -- Explicit operational-data allowlist. FK children are removed first.
-    DELETE FROM public.instance_engine_logs;
-    DELETE FROM public.instance_metrics;
-    DELETE FROM public.instance_market_state;
-    DELETE FROM public.simulation_account_audit;
-    DELETE FROM public.positions;
-    DELETE FROM public.paper_trades;
-    DELETE FROM public.simulation_sessions;
-    DELETE FROM public.webhook_events;
-    DELETE FROM public.bot_logs;
-    DELETE FROM public.alerts;
-    DELETE FROM public.trade_memories;
-    DELETE FROM public.memory_reviews;
-    DELETE FROM public.trading_instances;
-    DELETE FROM public.trading_instance_platform_settings;
-    DELETE FROM public.user_settings;
+    -- Supabase's safe-update hook requires a syntactic WHERE clause even for
+    -- an intentional all-row reset; WHERE TRUE preserves that protection on
+    -- every other statement while making this reviewed allowlist explicit.
+    DELETE FROM public.instance_engine_logs WHERE TRUE;
+    DELETE FROM public.instance_metrics WHERE TRUE;
+    DELETE FROM public.instance_market_state WHERE TRUE;
+    DELETE FROM public.simulation_account_audit WHERE TRUE;
+    DELETE FROM public.positions WHERE TRUE;
+    DELETE FROM public.paper_trades WHERE TRUE;
+    DELETE FROM public.simulation_sessions WHERE TRUE;
+    DELETE FROM public.webhook_events WHERE TRUE;
+    DELETE FROM public.bot_logs WHERE TRUE;
+    DELETE FROM public.alerts WHERE TRUE;
+    DELETE FROM public.trade_memories WHERE TRUE;
+    DELETE FROM public.memory_reviews WHERE TRUE;
+    DELETE FROM public.trading_instances WHERE TRUE;
+    DELETE FROM public.trading_instance_platform_settings WHERE TRUE;
+    DELETE FROM public.user_settings WHERE TRUE;
 
     RETURN jsonb_build_object('ok', true, 'reset_id', p_reset_id);
 END;

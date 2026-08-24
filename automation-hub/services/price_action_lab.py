@@ -28,6 +28,8 @@ def _candle(row: Bar) -> dict:
 
 
 OPERATING_MODES = {"signals_only", "manual_approval", "automatic"}
+OPEN_BROKER_ORDER_STATUSES = {"open", "partially_filled", "triggered"}
+OPEN_STRATEGY_ORDER_STATUSES = {"ORDER_PENDING", "PARTIALLY_FILLED", "ENTERED"}
 
 
 @dataclass(frozen=True)
@@ -188,6 +190,17 @@ class PriceActionPaperAccount:
         }
         if values["timeframe"] not in TF_MS:
             raise ValueError("unsupported session timeframe")
+        current_identity = (current.get("mode") or "LIVE_PAPER", current.get("symbol") or "BTCUSDT",
+                            current.get("timeframe") or "5m")
+        next_identity = (values["mode"], values["symbol"], values["timeframe"])
+        if next_identity != current_identity:
+            open_orders = [row for row in self.broker.orders()
+                           if row.get("status") in OPEN_BROKER_ORDER_STATUSES]
+            if self.broker.positions() or open_orders:
+                raise ValueError(
+                    "cannot change the Price Action session market, timeframe or mode while "
+                    "paper positions or pending orders exist"
+                )
         with self._lock, self._db:
             self._db.execute(
                 "UPDATE pa_sessions SET mode=:mode,symbol=:symbol,timeframe=:timeframe,replay_cursor=:replay_cursor,operating_mode=:operating_mode,strategy_config_json=:strategy_config_json,execution_config_json=:execution_config_json,updated_at=:updated_at WHERE id=:id",
@@ -196,6 +209,126 @@ class PriceActionPaperAccount:
             self._audit("session_configuration_changed", symbol=values["symbol"],
                         strategy_id=execution.strategy_id, payload=values)
         return self.state()
+
+    def audit_pending_orders(self) -> dict:
+        """Read-only ownership/status audit for strategy-generated paper orders."""
+        current = self.session()
+        session_id = current.get("id", "")
+        with self._lock:
+            metadata = [dict(row) for row in self._db.execute(
+                "SELECT * FROM pa_order_meta WHERE session_id=? ORDER BY created_at", (session_id,))]
+        broker_orders = {row["id"]: row for row in self.broker.orders()}
+        meta_by_order = {row["order_id"]: row for row in metadata}
+        duplicate_keys: dict[tuple[str, str], list[str]] = {}
+        discrepancies: list[dict] = []
+        for row in metadata:
+            order = broker_orders.get(row["order_id"])
+            meta_open = row["status"] in OPEN_STRATEGY_ORDER_STATUSES
+            broker_open = bool(order and order.get("status") in OPEN_BROKER_ORDER_STATUSES)
+            if broker_open or row["status"] in {"ORDER_PENDING", "PARTIALLY_FILLED"}:
+                duplicate_keys.setdefault((row["zone_id"], row["direction"]), []).append(row["order_id"])
+            if meta_open and order is None:
+                discrepancies.append({"order_id": row["order_id"], "kind": "metadata_order_missing"})
+            elif meta_open != broker_open and not (row["status"] == "ENTERED" and order and order.get("status") == "filled"):
+                discrepancies.append({
+                    "order_id": row["order_id"], "kind": "status_mismatch",
+                    "metadata_status": row["status"],
+                    "broker_status": order.get("status") if order else None,
+                })
+        duplicate_strategy_orders = [
+            {"zone_id": key[0], "direction": key[1], "order_ids": ids}
+            for key, ids in duplicate_keys.items() if len(ids) > 1
+        ]
+        pending_paper = [row for row in broker_orders.values()
+                         if row.get("status") in OPEN_BROKER_ORDER_STATUSES]
+        pending_strategy = [row for row in pending_paper if row["id"] in meta_by_order]
+        pending_manual = [row for row in pending_paper if row["id"] not in meta_by_order]
+        return {
+            "session_id": session_id,
+            "symbol": current.get("symbol"), "timeframe": current.get("timeframe"),
+            "pending_paper_orders": len(pending_paper),
+            "pending_strategy_orders": len(pending_strategy),
+            "pending_manual_orders": len(pending_manual),
+            "duplicate_strategy_orders": duplicate_strategy_orders,
+            "discrepancies": discrepancies,
+            "safe_to_reconcile": True,
+            "manual_orders_are_never_auto_cancelled": True,
+        }
+
+    def reconcile_pending_orders(self, visual_state: dict | None = None,
+                                 candle: Bar | None = None) -> dict:
+        """Safely reconcile strategy metadata; manual paper orders are untouched."""
+        before = self.audit_pending_orders()
+        current = self.session()
+        session_id = current.get("id", "")
+        zones = {row["id"]: row for row in (visual_state or {}).get("zones", [])}
+        index = len((visual_state or {}).get("candles", [])) - 1
+        positions = {row["symbol"]: row for row in self.broker.positions()}
+        actions: list[dict] = []
+        with self._lock, self._db:
+            metadata = [dict(row) for row in self._db.execute(
+                "SELECT * FROM pa_order_meta WHERE session_id=? ORDER BY created_at", (session_id,))]
+            for meta in metadata:
+                try:
+                    broker_order = self.broker.order(meta["order_id"])
+                except KeyError:
+                    broker_order = None
+                meta_open = meta["status"] in OPEN_STRATEGY_ORDER_STATUSES
+                broker_open = bool(broker_order and broker_order.get("status") in OPEN_BROKER_ORDER_STATUSES)
+                terminal_status = None
+                reason = None
+                if meta_open and broker_order is None:
+                    terminal_status, reason = "ORPHANED", "strategy metadata has no corresponding paper broker order"
+                elif meta_open and broker_order and not broker_open:
+                    broker_status = str(broker_order.get("status") or "unknown")
+                    if broker_status == "filled":
+                        terminal_status = "ENTERED" if broker_order.get("symbol") in positions else "COMPLETED"
+                    else:
+                        terminal_status = {
+                            "cancelled": "CANCELLED", "rejected": "REJECTED", "expired": "EXPIRED",
+                        }.get(broker_status, "CLOSED")
+                    reason = f"metadata reconciled to broker status {broker_status}"
+                elif not meta_open and broker_open:
+                    try:
+                        self.broker.cancel(meta["order_id"])
+                        action = {"order_id": meta["order_id"], "action": "cancelled_stale_broker_order",
+                                  "reason": f"metadata is already terminal ({meta['status']})"}
+                        actions.append(action)
+                        self._audit("paper_order_reconciled", object_id=meta["order_id"], payload=action)
+                    except (KeyError, ValueError):
+                        pass
+                elif meta_open and broker_open and visual_state is not None:
+                    config = json.loads(meta["config_json"])
+                    zone = zones.get(meta["zone_id"])
+                    if index > int(meta["valid_until_index"]):
+                        terminal_status, reason = "EXPIRED", "setup confirmation order expired"
+                    elif zone is not None and not zone.get("active", True):
+                        terminal_status, reason = "INVALIDATED", "structural zone invalidated before entry"
+                    elif candle is not None:
+                        is_long = meta["direction"] == "bullish"
+                        entry_touched = candle.high >= config["entry"] if is_long else candle.low <= config["entry"]
+                        stop_breached = candle.low <= config["stop"] if is_long else candle.high >= config["stop"]
+                        if stop_breached and not entry_touched:
+                            terminal_status, reason = "CANCELLED", "protective premise breached before entry"
+                    if terminal_status:
+                        try:
+                            self.broker.cancel(meta["order_id"])
+                        except (KeyError, ValueError):
+                            pass
+                if terminal_status and (terminal_status != meta["status"] or reason != meta["reason"]):
+                    self._db.execute(
+                        "UPDATE pa_order_meta SET status=?,reason=?,updated_at=? WHERE order_id=?",
+                        (terminal_status, reason, _iso(), meta["order_id"]),
+                    )
+                    action = {"order_id": meta["order_id"], "action": "metadata_reconciled",
+                              "from": meta["status"], "to": terminal_status, "reason": reason}
+                    actions.append(action)
+                    self._audit("paper_order_reconciled", object_id=meta["order_id"], payload=action)
+            if actions:
+                self._snapshot_current()
+        return {"before": before, "after": self.audit_pending_orders(), "actions": actions,
+                "records_deleted": 0, "manual_orders_changed": 0,
+                "real_execution_allowed": False}
 
     def state(self, marks: dict[str, float] | None = None) -> dict:
         current = self.session()
@@ -220,6 +353,7 @@ class PriceActionPaperAccount:
             "candidates": [{**row, "payload": json.loads(row["payload"])} for row in candidates],
             "order_metadata": [{**row, "config": json.loads(row["config_json"])} for row in metadata],
             "activity": [{**row, "payload": json.loads(row["payload"])} for row in activity],
+            "order_audit": self.audit_pending_orders(),
         }
 
     def reset(self) -> dict:
@@ -314,6 +448,7 @@ class PriceActionPaperAccount:
             self.broker.leverage = float(self._db.execute("SELECT leverage FROM pa_settings WHERE id=1").fetchone()[0])
             self._db.execute("UPDATE pa_sessions SET status='active',ended_at=NULL,end_reason=NULL,updated_at=? WHERE id=?", (_iso(), session_id))
             self._audit("session_resumed", session_id=session_id, payload={"restored": True})
+        self.reconcile_pending_orders()
         return self.state()
 
     def duplicate(self, session_id: str) -> dict:
@@ -480,34 +615,11 @@ class PriceActionPaperAccount:
             raise ValueError("no active Price Action session")
         proposals = {row["id"]: row for row in visual_state.get("proposals", [])}
         setups = {row["id"]: row for row in visual_state.get("setups", [])}
-        index = len(visual_state.get("candles", [])) - 1
+        reconciliation = self.reconcile_pending_orders(visual_state, candle)
         with self._lock, self._db:
             open_meta = [dict(row) for row in self._db.execute(
                 "SELECT * FROM pa_order_meta WHERE session_id=? AND status IN ('ORDER_PENDING','PARTIALLY_FILLED','ENTERED')",
                 (current["id"],))]
-            for meta in open_meta:
-                cfg = json.loads(meta["config_json"])
-                zone = next((row for row in visual_state.get("zones", []) if row["id"] == meta["zone_id"]), None)
-                is_long = meta["direction"] == "bullish"
-                entry_touched = candle.high >= cfg["entry"] if is_long else candle.low <= cfg["entry"]
-                stop_breached = candle.low <= cfg["stop"] if is_long else candle.high >= cfg["stop"]
-                cancel_reason = None
-                if index > meta["valid_until_index"]:
-                    cancel_reason = "setup confirmation order expired"
-                elif zone is not None and not zone.get("active", True):
-                    cancel_reason = "structural zone invalidated before entry"
-                elif stop_breached and not entry_touched:
-                    cancel_reason = "protective premise breached before the entry order activated"
-                if meta["status"] in {"ORDER_PENDING", "PARTIALLY_FILLED"} and cancel_reason:
-                    try:
-                        self.broker.cancel(meta["order_id"])
-                    except (KeyError, ValueError):
-                        pass
-                    terminal = "EXPIRED" if "expired" in cancel_reason else "INVALIDATED" if "invalidated" in cancel_reason else "CANCELLED"
-                    self._db.execute("UPDATE pa_order_meta SET status=?,reason=?,updated_at=? WHERE order_id=?",
-                                     (terminal, cancel_reason, _iso(), meta["order_id"]))
-                    self._audit("paper_order_cancelled", object_id=meta["order_id"],
-                                payload={"bar_index": index, "reason": cancel_reason})
             protections = {}
             for meta in open_meta:
                 cfg = json.loads(meta["config_json"])
@@ -550,6 +662,7 @@ class PriceActionPaperAccount:
                     (created if placed["accepted"] else rejected).append(placed)
             self._snapshot_current(metrics=visual_state.get("metrics", {}))
         return {"broker": result, "created": created, "rejected": rejected,
+                "reconciliation": reconciliation,
                 "operating_mode": config.operating_mode, "feed_reliable": feed_reliable,
                 "real_execution_allowed": False}
 
@@ -611,8 +724,17 @@ def binance_visual_state(market: MarketDataService, symbol: str, timeframe: str,
     current = forming.close if forming else previous
     try:
         quote = market.public_usdm_quote(symbol)
-        connection_state = "CONNECTED"
-        entries_paused = False
+        bid, ask, mark = (float(quote[key]) for key in ("bid", "ask", "mark"))
+        provider_time = datetime.fromisoformat(str(quote["provider_time"]).replace("Z", "+00:00"))
+        quote_age = max(0.0, (now - provider_time).total_seconds())
+        reference = current or previous
+        deviation_bps = max(abs(bid - reference), abs(ask - reference),
+                            abs(mark - reference)) / reference * 10_000
+        reconciled = bid > 0 and bid <= ask and mark > 0 and quote_age <= 15 and deviation_bps <= 100
+        connection_state = "SYNCHRONIZED" if reconciled else "QUOTE_MISMATCH"
+        health_reason = ("REST candle, bid/ask and mark snapshot are reconciled and fresh" if reconciled
+                         else "REST quote is stale, invalid or inconsistent with the displayed candle")
+        entries_paused = not reconciled
     except Exception:
         # OHLC remains factual and usable for inspection, but the absence of
         # the independent quote/mark channel is made explicit and automated
@@ -620,6 +742,9 @@ def binance_visual_state(market: MarketDataService, symbol: str, timeframe: str,
         quote = {"bid": current, "ask": current, "mark": current,
                  "funding_rate": None, "last_funding_time": None, "next_funding_time": None}
         connection_state = "DELAYED"
+        health_reason = "independent REST bid/ask and mark snapshot is unavailable"
+        quote_age = None
+        deviation_bps = None
         entries_paused = True
     state["forming_candle"] = _candle(forming) if forming else None
     state["live_display"] = {
@@ -633,6 +758,13 @@ def binance_visual_state(market: MarketDataService, symbol: str, timeframe: str,
         "last_funding_time": quote.get("last_funding_time"),
         "next_funding_time": quote["next_funding_time"],
         "connection_state": connection_state,
+        "transport_state": "REST_POLL",
+        "health_reason": health_reason,
+        "reliable": not entries_paused,
+        "quote_source": "PUBLIC_REST_SNAPSHOT",
+        "quote_age_seconds": quote_age,
+        "mark_age_seconds": quote_age,
+        "candle_quote_deviation_bps": deviation_bps,
         "new_entries_paused": entries_paused,
         "refresh_interval_seconds": 3,
         "execution_uses_closed_bars_only": True,
@@ -714,6 +846,27 @@ class PriceActionLabRuntime:
             if started:
                 self.engine.ingest_closed_bars(self.stream.snapshot()["closed_bars"])
 
+    def _session_identity(self, expected_mode: str) -> tuple[dict, tuple[str, str]]:
+        session = self.account.session()
+        if not session:
+            raise RuntimeError("no active Price Action session")
+        if session.get("mode") != expected_mode:
+            raise ValueError(
+                f"active Price Action session mode is {session.get('mode')}; expected {expected_mode}"
+            )
+        return session, (normalize_symbol(session.get("symbol") or "BTCUSDT"),
+                         session.get("timeframe") or "5m")
+
+    def _assert_session_identity(self, symbol: str, timeframe: str, expected_mode: str) -> dict:
+        session, identity = self._session_identity(expected_mode)
+        requested = (normalize_symbol(symbol), timeframe)
+        if requested != identity:
+            raise ValueError(
+                f"requested {requested[0]} {requested[1]} does not match active Price Action "
+                f"session {identity[0]} {identity[1]}"
+            )
+        return session
+
     def _engine_config(self, symbol: str, timeframe: str) -> PriceActionConfig:
         session = self.account.session()
         raw = json.loads(session.get("strategy_config_json") or "{}")
@@ -737,7 +890,10 @@ class PriceActionLabRuntime:
             rules = self.market.usdm_contract_rules(self.identity[0])
             status = self.stream.status()
             session = self.account.session()
-            session_matches = (session.get("symbol"), session.get("timeframe")) == self.identity
+            session_matches = (
+                session.get("mode") == "LIVE_PAPER" and
+                (session.get("symbol"), session.get("timeframe")) == self.identity
+            )
             if session_matches:
                 self.account.synchronize_strategy(state, contract_rules=rules, candle=bar,
                                                   feed_reliable=bool(status["reliable"]))
@@ -760,7 +916,9 @@ class PriceActionLabRuntime:
                 self.account.record_external_event({"kind": "funding_or_mark_delayed", "error": str(exc),
                                                     "symbol": self.identity[0]})
 
-    def live_state(self, symbol: str, timeframe: str, *, visible: int = 500) -> dict:
+    def live_state(self, symbol: str, timeframe: str, *, visible: int = 500,
+                   request_id: str | None = None) -> dict:
+        session = self._assert_session_identity(symbol, timeframe, "LIVE_PAPER")
         self.ensure(symbol, timeframe)
         with self._lock:
             if self.engine is None:
@@ -768,9 +926,11 @@ class PriceActionLabRuntime:
             snapshot = self.stream.snapshot()
             state = self.engine.visual_state(candle_window=max(50, min(visible, 1500)))
         quote, connection = snapshot["quote"], snapshot["connection"]
+        quote_source = "PUBLIC_WEBSOCKET"
         if quote.get("bid") is None or quote.get("mark") is None:
             try:
                 quote = {**quote, **self.market.public_usdm_quote(symbol)}
+                quote_source = "PUBLIC_REST_FALLBACK_UNRECONCILED"
             except Exception:
                 pass
         forming = snapshot["forming"]
@@ -784,16 +944,38 @@ class PriceActionLabRuntime:
             "mark": quote.get("mark"), "funding_rate": quote.get("funding_rate"),
             "next_funding_time": quote.get("next_funding_time"),
             "connection_state": connection["state"],
+            "transport_state": connection["transport_state"],
+            "health_reason": connection["health_reason"],
+            "reliable": connection["reliable"],
+            "quote_source": quote_source,
             "last_update": connection["last_update"],
+            "last_candle_update": connection["last_candle_update"],
+            "last_quote_update": connection["last_quote_update"],
+            "last_mark_update": connection["last_mark_update"],
+            "last_closed_update": connection["last_closed_update"],
+            "candle_age_seconds": connection["candle_age_seconds"],
+            "quote_age_seconds": connection["quote_age_seconds"],
+            "mark_age_seconds": connection["mark_age_seconds"],
+            "closed_candle_age_seconds": connection["closed_candle_age_seconds"],
+            "candle_quote_deviation_bps": connection["candle_quote_deviation_bps"],
             "new_entries_paused": connection["new_entries_paused"],
             "execution_uses_closed_bars_only": True,
         }
+        state["data_identity"] = {
+            "request_id": request_id, "session_id": session["id"],
+            "mode": session["mode"], "symbol": normalize_symbol(symbol),
+            "timeframe": timeframe,
+        }
+        state["metrics_scope"].update({
+            "session_id": session["id"], "mode": "LIVE_PUBLIC_MARKET_OBSERVATION",
+        })
         state["connection"] = connection
         state["data_provenance"] = {
             "mode": "LIVE_BINANCE_WEBSOCKET_WITH_REST_RECOVERY",
             "market_data_mode": "LIVE", "market_data_source": "Binance USDⓈ-M public streams",
             "exchange": "Binance USDⓈ-M Futures", "symbol": normalize_symbol(symbol),
             "timeframe": timeframe, "closed_candles_used": len(self.engine.bars),
+            "session_id": session["id"], "request_id": request_id,
             "forming_candle_excluded": forming is not None,
             "connection_state": connection["state"],
             "new_entries_paused": connection["new_entries_paused"],
@@ -803,13 +985,12 @@ class PriceActionLabRuntime:
 
     def replay_step(self, symbol: str, timeframe: str, cursor: int, *, limit: int = 3000) -> dict:
         symbol = normalize_symbol(symbol)
+        session = self._assert_session_identity(symbol, timeframe, "HISTORICAL")
         rows = self.market.bars(symbol, timeframe, limit=max(100, min(limit, 10_000)))
         if not rows:
             raise RuntimeError("verified cached history is required for replay")
         reveal = max(1, min(int(cursor), len(rows)))
-        session = self.account.session()
-        owns_replay = (session.get("mode") == "HISTORICAL" and
-                       (session.get("symbol"), session.get("timeframe")) == (symbol, timeframe))
+        owns_replay = True
         prior_cursor = int(session.get("replay_cursor") or 0) if owns_replay else reveal
         advances_session = owns_replay and reveal >= prior_cursor
         engine = NativePriceActionEngine(self._engine_config(symbol, timeframe) if owns_replay else
@@ -829,14 +1010,33 @@ class PriceActionLabRuntime:
         state["replay"] = {"cursor": reveal, "total": len(rows), "future_candles_visible": False,
                            "has_next": reveal < len(rows), "session_execution_advanced": advances_session,
                            "rewind_is_view_only": bool(owns_replay and reveal < prior_cursor)}
+        state["data_identity"] = {
+            "request_id": None, "session_id": session["id"], "mode": session["mode"],
+            "symbol": symbol, "timeframe": timeframe,
+        }
+        state["metrics_scope"].update({
+            "session_id": session["id"], "mode": "HISTORICAL_REPLAY",
+        })
         state["data_provenance"] = {
             "mode": "HISTORICAL_REPLAY", "market_data_mode": "REPLAY",
             "market_data_source": "verified Binance USDⓈ-M Futures cache",
             "exchange": "Binance USDⓈ-M Futures", "symbol": symbol, "timeframe": timeframe,
+            "session_id": session["id"],
             "closed_candles_used": reveal, "future_candles_visible": False,
             "real_execution_allowed": False,
         }
         return state
+
+    def reconcile_paper_orders(self) -> dict:
+        session = self.account.session()
+        visual_state = None
+        candle = None
+        with self._lock:
+            if self.engine is not None and self.identity == (
+                    session.get("symbol"), session.get("timeframe")):
+                visual_state = self.engine.visual_state(candle_window=1500)
+                candle = self.engine.bars[-1] if self.engine.bars else None
+        return self.account.reconcile_pending_orders(visual_state, candle)
 
     def stop(self) -> None:
         self.stream.stop()

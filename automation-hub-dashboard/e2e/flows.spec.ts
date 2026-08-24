@@ -36,7 +36,7 @@ test("Price Action Visual Lab — public stream truth and protected paper modes"
   await expect(page.getByRole("heading", { name: "Price Action Visual Lab" })).toBeVisible();
   await expect(page.getByText("PAPER ONLY")).toBeVisible();
   await expect(page.getByText("REAL ORDERS DISABLED")).toBeVisible();
-  await expect(page.getByText(/Binance · CONNECTED/)).toBeVisible();
+  await expect(page.getByText(/Binance · SYNCHRONIZED/)).toBeVisible();
   await expect(page.getByText(/PAPER · NO LIVE EXECUTION PATH/)).toBeVisible();
 
   await page.getByLabel("Paper operating mode").selectOption("automatic");
@@ -50,6 +50,39 @@ test("Price Action Visual Lab — public stream truth and protected paper modes"
   await page.getByRole("button", { name: /connection/i }).click();
   await expect(page.getByText("CLOSED BARS ONLY")).toBeVisible();
   await expect(page.getByText("DISABLED", { exact: true })).toBeVisible();
+});
+
+test("Price Action Visual Lab — rapid market switches settle on one session identity", async ({ page }) => {
+  await mockApi(page);
+  await page.goto("/#/price-action-lab");
+  const symbol = page.getByLabel("Price Action session symbol");
+  await expect(symbol).toHaveValue("BTCUSDT");
+  await symbol.selectOption("ETHUSDT");
+  await expect(symbol).toHaveValue("ETHUSDT");
+  await expect(page.locator(".pa-chart-head")).toContainText("ETHUSDT · 5m");
+
+  await page.getByRole("button", { name: "15m", exact: true }).click();
+  await expect(page.locator(".pa-chart-head")).toContainText("ETHUSDT · 15m");
+  await expect(page.locator(".pa-stream-truth")).toContainText("SYNCHRONIZED");
+});
+
+test("Price Action Visual Lab — chart presets and setup focus remain audit-safe", async ({ page }, testInfo) => {
+  await mockApi(page);
+  await page.goto("/#/price-action-lab");
+  const preset = page.getByLabel("Chart layer preset");
+  await expect(preset).toHaveValue("clean");
+  await preset.selectOption("debug");
+  await expect(page.getByText(/All zones, setups, orders and trades remain/)).toBeVisible();
+  await page.getByRole("button", { name: "orders", exact: false }).click();
+  await expect(page.getByText("Pending paper audit")).toBeVisible();
+  await expect(page.getByText("Research-engine orders · not paper broker orders")).toBeVisible();
+  await page.getByRole("button", { name: "Reconcile strategy orders" }).click();
+  await expect(page.getByText("Pending paper orders are already reconciled")).toBeVisible();
+  await preset.selectOption("clean");
+  await page.locator(".pa-chart-shell").scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath("price-action-desktop.png"), fullPage: true });
+  await page.setViewportSize({ width: 768, height: 900 });
+  await page.screenshot({ path: testInfo.outputPath("price-action-responsive.png"), fullPage: true });
 });
 
 test("Settings > Save Settings shows a success toast", async ({ page }) => {

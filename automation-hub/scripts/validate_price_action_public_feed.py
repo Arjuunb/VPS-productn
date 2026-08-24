@@ -145,9 +145,18 @@ def main() -> int:
             "controlled_reconnect_performed": restarted,
         }
         connection_states = [row.get("state") for row in events if row.get("kind") == "connection"]
+        health_states = [row.get("state") for row in events if row.get("kind") == "market_data_health"]
         result["checks"]["rest_gap_reconciliation"] = gap_probe
         result["checks"]["websocket"]["reconnect_completed"] = (
             connection_states.count("CONNECTED") >= 2)
+        result["checks"]["websocket"]["synchronized_after_reconnect"] = (
+            health_states.count("SYNCHRONIZED") >= 2 and
+            final_status["state"] == "SYNCHRONIZED" and
+            final_status["transport_state"] == "CONNECTED" and
+            final_status["reliable"] is True and
+            all(final_status.get(field) is not None for field in (
+                "last_candle_update", "last_quote_update", "last_mark_update"))
+        )
         stale_now = ((runtime.stream.last_update or datetime.now(timezone.utc)) +
                      timedelta(seconds=runtime.stream.stale_after_seconds + 1))
         stale = runtime.stream.status(now=stale_now)
@@ -195,6 +204,7 @@ def main() -> int:
             result["checks"]["websocket"]["duplicate_completed_candles_in_snapshot"] == 0 and
             result["checks"]["websocket"]["completed_candle_advanced"] and
             result["checks"]["websocket"]["reconnect_completed"] and
+            result["checks"]["websocket"]["synchronized_after_reconnect"] and
             gap_probe["restored"] and gap_probe["reconciled"] >= 1 and
             result["checks"]["strategy_and_order_deduplication"]["duplicate_strategy_events"] == 0 and
             result["checks"]["strategy_and_order_deduplication"]["duplicate_zone_direction_orders"] == 0 and
