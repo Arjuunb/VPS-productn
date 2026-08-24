@@ -572,6 +572,9 @@ export async function mockApi(page: Page) {
       if (url.pathname.endsWith("/research/smc/live-chart")) {
         return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(SMC_CHART) });
       }
+      if (url.pathname.endsWith("/research/smc/chart")) {
+        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(SMC_CHART) });
+      }
       if (url.pathname.endsWith("/research/smc/paper")) {
         return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(SMC_PAPER) });
       }

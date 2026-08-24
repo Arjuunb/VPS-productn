@@ -22,3 +22,21 @@ for (const viewport of [
     expect(overflow).toBe(false);
   });
 }
+
+test("SMC Visual Lab and SMC Strategy Lab have separate sidebar routes and page identities", async ({ page }) => {
+  await mockApi(page);
+  await page.goto("/#/smc-visual-lab");
+
+  await expect(page).toHaveURL(/#\/smc-visual-lab$/);
+  await expect(page.getByRole("heading", { name: "Native SMC Visual Lab" })).toBeVisible();
+  await expect(page.getByText("SMC PAPER ACCOUNT", { exact: true })).toHaveCount(0);
+
+  await page.locator("aside.sidebar").getByRole("button", { name: "SMC Strategy Lab" }).click();
+  await expect(page).toHaveURL(/#\/smc-strategy-lab$/);
+  await expect(page.getByRole("heading", { name: "SMC Strategy Lab" })).toBeVisible();
+  await expect(page.getByText("SMC PAPER ACCOUNT", { exact: true })).toBeVisible();
+
+  await page.locator("aside.sidebar").getByRole("button", { name: "SMC Visual Lab" }).click();
+  await expect(page).toHaveURL(/#\/smc-visual-lab$/);
+  await expect(page.getByRole("heading", { name: "Native SMC Visual Lab" })).toBeVisible();
+});

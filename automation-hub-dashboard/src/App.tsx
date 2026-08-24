@@ -33,6 +33,7 @@ const JournalPage = lazy(() => import("./pages/JournalHub"));
 const RiskHealthPage = lazy(() => import("./pages/RiskHealthHub"));
 const ForwardValidationPage = lazy(() => import("./pages/ForwardValidation"));
 const NativeSMCVisualPage = lazy(() => import("./pages/NativeSMCVisual"));
+const SMCStrategyLabPage = lazy(() => import("./pages/SMCStrategyLab"));
 const PriceActionVisualPage = lazy(() => import("./pages/PriceActionVisual"));
 import { AppContext, parseHash, slug } from "./app-context";
 
@@ -127,7 +128,7 @@ export default function App() {
       case "Analytics": return <AnalyticsPage tab={route.tab} />;
       case "Strategy Proof": return <StrategyProofPage />;
       case "Forward Validation": return <ForwardValidationPage />;
-      case "SMC Strategy Lab":
+      case "SMC Strategy Lab": return <SMCStrategyLabPage />;
       case "SMC Visual Lab": return <NativeSMCVisualPage />;
       case "Price Action Lab": return <PriceActionVisualPage />;
       case "Strategy Studio": return <StrategyStudioPage tab={route.tab} />;

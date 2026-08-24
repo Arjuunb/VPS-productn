@@ -25,7 +25,7 @@ const NAV_LUCIDE: Record<string, LucideIcon> = {
   "Forward Validation": GitCompareArrows,
   "Strategy Proof": BadgeCheck,
   "Strategy Studio": Blocks,
-  "SMC Strategy Lab": CandlestickChart,
+  "SMC Strategy Lab": Brain,
   "SMC Visual Lab": CandlestickChart,
   "Price Action Lab": Activity,
   "Risk & Health": ShieldAlert,
