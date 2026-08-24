@@ -134,6 +134,7 @@ class PriceActionPaperAccount:
             self.broker.leverage = float(leverage)
             self._snapshot_current()
         self.journal = PriceActionJournalStore(self.path)
+        self.reconcile_pending_orders()
 
     def session(self) -> dict:
         with self._lock:
@@ -263,7 +264,14 @@ class PriceActionPaperAccount:
     def reconcile_pending_orders(self, visual_state: dict | None = None,
                                  candle: Bar | None = None,
                                  *, feed_reliable: bool = True) -> dict:
-        """Safely reconcile strategy metadata; manual paper orders are untouched."""
+        """Safely reconcile strategy metadata; manual paper orders are untouched.
+
+        A strategy-owned position may survive an application restart from an
+        older snapshot that predates durable stop/target attachment.  Missing
+        protection is restored only when exactly one filled order in the
+        current session proves ownership and its immutable configuration has
+        valid geometry for the restored position.
+        """
         before = self.audit_pending_orders()
         current = self.session()
         session_id = current.get("id", "")
@@ -338,6 +346,58 @@ class PriceActionPaperAccount:
                               "from": meta["status"], "to": terminal_status, "reason": reason}
                     actions.append(action)
                     self._audit("paper_order_reconciled", object_id=meta["order_id"], payload=action)
+            entered = [dict(row) for row in self._db.execute(
+                "SELECT * FROM pa_order_meta WHERE session_id=? AND status IN ('ENTERED','PARTIALLY_FILLED') ORDER BY created_at",
+                (session_id,))]
+            for position in self.broker.positions():
+                if position.get("stop_loss") is not None and position.get("take_profit") is not None:
+                    continue
+                owners: list[tuple[dict, dict]] = []
+                for meta in entered:
+                    try:
+                        order = self.broker.order(meta["order_id"])
+                    except KeyError:
+                        continue
+                    if order.get("status") in {"filled", "partially_filled"} and \
+                            order.get("symbol") == position.get("symbol"):
+                        owners.append((meta, order))
+                if len(owners) != 1:
+                    continue
+                meta, _order = owners[0]
+                cfg = json.loads(meta["config_json"])
+                try:
+                    stop, target = float(cfg["stop"]), float(cfg["target"])
+                    entry = float(position["entry_price"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                expected_side = "long" if meta["direction"] == "bullish" else "short"
+                valid_geometry = (
+                    stop < entry < target if expected_side == "long"
+                    else target < entry < stop
+                )
+                if position.get("side") != expected_side or not valid_geometry:
+                    continue
+                missing_stop = position.get("stop_loss") is None
+                missing_target = position.get("take_profit") is None
+                repaired = self.broker.set_protection(
+                    position["symbol"],
+                    stop_loss=stop if missing_stop else None,
+                    take_profit=target if missing_target else None,
+                )
+                action = {
+                    "order_id": meta["order_id"],
+                    "symbol": position["symbol"],
+                    "action": "restored_missing_strategy_protection",
+                    "stop_loss_restored": missing_stop,
+                    "take_profit_restored": missing_target,
+                    "stop_loss": repaired.get("stop_loss"),
+                    "take_profit": repaired.get("take_profit"),
+                    "source": "immutable_pa_order_configuration",
+                }
+                actions.append(action)
+                self._audit("paper_position_protection_repaired",
+                            strategy_id=meta["strategy_id"], object_id=meta["order_id"],
+                            payload=action)
             if actions:
                 self._snapshot_current()
         return {"before": before, "after": self.audit_pending_orders(), "actions": actions,

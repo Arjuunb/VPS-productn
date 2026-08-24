@@ -59,6 +59,40 @@ def test_automatic_paper_lifecycle_sizes_rounds_protects_and_stops_first(tmp_pat
     assert state["account"]["realized_pnl"] < 0
 
 
+def test_restart_repairs_missing_strategy_protection_without_touching_manual_positions(tmp_path):
+    path = tmp_path / "restart-protection.db"
+    account = PriceActionPaperAccount(path)
+    account.configure(execution_config=PaperExecutionConfig(
+        operating_mode="automatic", risk_pct=.5))
+    account.synchronize_strategy(visual(), contract_rules=RULES,
+                                 candle=bar(1), feed_reliable=True)
+    account.synchronize_strategy(visual(count=11), contract_rules=RULES,
+                                 candle=bar(2, 104, 106, 103, 105), feed_reliable=True)
+    protected = account.state()["positions"][0]
+    assert protected["stop_loss"] == 99.0
+    assert protected["take_profit"] == 120.0
+
+    # Simulate a legacy/restored row whose strategy protection was lost.
+    account.broker._c.execute(
+        "UPDATE v2_positions SET stop_loss=NULL,take_profit=NULL WHERE symbol='BTCUSDT'")
+    account.broker._c.commit()
+    reopened = PriceActionPaperAccount(path)
+    repaired = reopened.state()["positions"][0]
+    assert repaired["stop_loss"] == 99.0
+    assert repaired["take_profit"] == 120.0
+    assert any(row["kind"] == "paper_position_protection_repaired"
+               for row in reopened.state()["activity"])
+
+    manual_path = tmp_path / "manual-position.db"
+    manual = PriceActionPaperAccount(manual_path)
+    manual.broker.submit(symbol="BTCUSDT", side="buy", order_type="market", quantity=1)
+    manual.broker.process_candle("BTCUSDT", bar(1))
+    manual_reopened = PriceActionPaperAccount(manual_path)
+    manual_position = manual_reopened.state()["positions"][0]
+    assert manual_position["stop_loss"] is None
+    assert manual_position["take_profit"] is None
+
+
 def test_signals_manual_approval_duplicate_and_unreliable_feed_are_explicit(tmp_path):
     account = PriceActionPaperAccount(tmp_path / "modes.db")
     signal = account.synchronize_strategy(visual(), contract_rules=RULES,
