@@ -215,8 +215,17 @@ class SMCPaperAccount:
                 except KeyError:
                     continue
                 if order.get("symbol") == position.get("symbol") and order.get("status") in {"partially_filled", "filled"}:
-                    owners.append(meta)
-            config = json.loads(owners[0]["config_json"]) if len(owners) == 1 else {}
+                    owners.append((meta, order, json.loads(meta["config_json"] or "{}")))
+            planned_values = [value for _meta, _order, config in owners
+                              if (value := _configured_r(config, "target_2")) is not None]
+            broker_owners = [order for order in self.broker.orders()
+                             if order.get("symbol") == position.get("symbol")
+                             and not order.get("reduce_only")
+                             and order.get("status") in {"partially_filled", "filled"}
+                             and float(order.get("filled") or 0) > 0
+                             and order.get("protection_target_r") is not None]
+            if not planned_values:
+                planned_values = [float(order["protection_target_r"]) for order in broker_owners]
             stop, target, entry = position.get("stop_loss"), position.get("take_profit"), position.get("entry_price")
             effective_rr = None
             if stop is not None and target is not None and entry is not None and abs(float(entry) - float(stop)) > 0:
@@ -224,10 +233,12 @@ class SMCPaperAccount:
             rows.append({
                 "symbol": position["symbol"], "side": position["side"], "size": position["size"],
                 "entry_price": entry, "stop_loss": stop, "take_profit": target,
-                "planned_rr": _configured_r(config, "target_2"),
+                "planned_rr": min(planned_values) if planned_values else None,
                 "effective_rr": round(effective_rr, 6) if effective_rr is not None else None,
-                "protection_status": "PROTECTED" if stop is not None and target is not None else "UNPROTECTED",
-                "protection_order_id": owners[0]["order_id"] if len(owners) == 1 else None,
+                "protection_status": ("PROTECTED" if stop is not None and target is not None
+                                      else "LEGACY_UNPROTECTED_REQUIRES_CLOSE_OR_PROTECTION"),
+                "protection_order_id": (owners[-1][0]["order_id"] if owners
+                                        else broker_owners[-1]["id"] if broker_owners else None),
                 "peak_price": position.get("peak_price"), "opened_at": position.get("opened_at"),
                 "estimated_liquidation_price": position.get("estimated_liquidation_price"),
             })
@@ -442,8 +453,8 @@ class SMCPaperAccount:
         if target_1 is not None and target_2 is not None and (
                 (side == "buy" and target_2 <= target_1) or (side == "sell" and target_2 >= target_1)):
             raise ValueError("T2 must be farther than T1")
-        if ownership == "strategy" and (protective_stop is None or target_1 is None or target_2 is None):
-            raise ValueError("SMC strategy orders require a protective stop, target 1 and target 2")
+        if protective_stop is None or target_1 is None or target_2 is None:
+            raise ValueError("SMC paper entry orders require a protective stop, target 1 and target 2")
         risk_distance = abs(entry - float(protective_stop)) if protective_stop is not None else None
         target_1_r = (abs(float(target_1) - entry) / risk_distance
                       if target_1 is not None and risk_distance else None)
@@ -452,7 +463,11 @@ class SMCPaperAccount:
         order = self.broker.submit(symbol=symbol, side=side, order_type=order_type,
                                    quantity=quantity, limit_price=limit_price,
                                    stop_price=trigger_price if order_type in {"stop", "stop_limit"} else None,
-                                   reduce_only=False, market_open=True)
+                                   reduce_only=False, market_open=True,
+                                   protection_stop_loss=protective_stop,
+                                   protection_take_profit=target_2,
+                                   protection_target_r=target_2_r,
+                                   protection_tick_size=float(rules.get("tick_size") or 0) or None)
         now = _iso()
         config = {"reference_price": entry, "stop_loss": protective_stop,
                   "target_1": target_1, "target_2": target_2,
@@ -483,12 +498,22 @@ class SMCPaperAccount:
         return {"order": order, "real_execution_allowed": False}
 
     def reconcile_orders(self) -> dict:
-        """Reconcile statuses without deleting records or touching manual orders."""
+        """Reconcile statuses and fail closed around existing exposure.
+
+        Unfilled same-symbol entries, including manual entries, are cancelled
+        when a position already exists because the broker supports one
+        position per symbol and cannot preserve independent protection for a
+        second owner. Filled records and their audit history are retained.
+        """
         current = self.session()
         sid = current.get("id", "")
         broker_orders = {row["id"]: row for row in self.broker.orders()}
         actions = []
-        for meta in self._db.execute("SELECT * FROM smc_order_meta WHERE session_id=?", (sid,)).fetchall():
+        metadata = [dict(row) for row in self._db.execute(
+            "SELECT * FROM smc_order_meta WHERE session_id=?", (sid,)).fetchall()]
+        metadata_by_order = {row["order_id"]: row for row in metadata}
+        manual_orders_cancelled = 0
+        for meta in metadata:
             order = broker_orders.get(meta["order_id"])
             if not order:
                 actions.append({"order_id": meta["order_id"], "action": "flagged_missing",
@@ -503,28 +528,66 @@ class SMCPaperAccount:
                 actions.append({"order_id": meta["order_id"], "action": "status_reconciled",
                                 "from": meta["status"], "to": mapped, "ownership": meta["ownership"]})
         strategy_owners = [dict(row) for row in self._db.execute(
-            "SELECT * FROM smc_order_meta WHERE session_id=? AND ownership='strategy' AND status IN ('PARTIALLY_FILLED','ENTERED') ORDER BY created_at",
+            "SELECT * FROM smc_order_meta WHERE session_id=? AND ownership!='strategy_target_1' AND status IN ('PARTIALLY_FILLED','ENTERED') ORDER BY created_at",
             (sid,),
         )]
         for position in self.broker.positions():
+            for pending in self.broker.orders():
+                if pending.get("symbol") != position.get("symbol") or pending.get("reduce_only") or \
+                        pending.get("status") not in OPEN_STATUSES or float(pending.get("filled") or 0) > 0:
+                    continue
+                self.broker.cancel(pending["id"])
+                self._db.execute(
+                    "UPDATE smc_order_meta SET status='CANCELLED',reason=?,updated_at=? WHERE order_id=?",
+                    ("cancelled during legacy exposure reconciliation; same-symbol stacking is unsupported",
+                     _iso(), pending["id"]),
+                )
+                action = {"order_id": pending["id"], "action": "cancelled_pending_entry_during_position_repair",
+                          "symbol": position["symbol"]}
+                owner = metadata_by_order.get(pending["id"])
+                if owner is None or owner.get("ownership") == "manual":
+                    manual_orders_cancelled += 1
+                actions.append(action)
+                self._audit("paper_order_reconciled", object_id=pending["id"], payload=action)
             owners = []
             for meta in strategy_owners:
                 order = broker_orders.get(meta["order_id"])
                 if order and order.get("symbol") == position.get("symbol") and order.get("status") in {"partially_filled", "filled"}:
-                    owners.append(meta)
-            if len(owners) != 1:
+                    owners.append((meta, order, json.loads(meta.get("config_json") or "{}")))
+            if not owners:
                 continue
-            meta = owners[0]
-            config = json.loads(meta.get("config_json") or "{}")
             try:
+                candidates = []
+                for _meta, _order, config in owners:
+                    stop_value = float(config["stop_loss"])
+                    ratio_value = _configured_r(config, "target_2") or _configured_r(config, "target_1")
+                    if ratio_value is None or (position["side"] == "long" and stop_value >= position["entry_price"]) or \
+                            (position["side"] == "short" and stop_value <= position["entry_price"]):
+                        continue
+                    candidates.append((stop_value, float(ratio_value),
+                                       (config.get("rules") or {}).get("tick_size")))
+                if not candidates:
+                    continue
+                stop_value = (max(row[0] for row in candidates) if position["side"] == "long"
+                              else min(row[0] for row in candidates))
+                planned_rr = min(row[1] for row in candidates)
+                ticks = [float(row[2]) for row in candidates if row[2]]
                 stop, target = self.broker._resolved_protection(position, {
-                    "stop_loss": float(config["stop_loss"]),
-                    "take_profit": float(config.get("target_2") or config["target_1"]),
-                    "target_r": _configured_r(config, "target_2") or _configured_r(config, "target_1"),
-                    "tick_size": (config.get("rules") or {}).get("tick_size"),
+                    "stop_loss": stop_value, "take_profit": None,
+                    "target_r": planned_rr, "tick_size": max(ticks) if ticks else None,
                 })
             except (KeyError, TypeError, ValueError):
                 continue
+            for meta, _order, config in owners:
+                try:
+                    self.broker.set_order_protection(
+                        meta["order_id"], stop_loss=float(config["stop_loss"]),
+                        take_profit=float(config.get("target_2") or config["target_1"]),
+                        target_r=float(_configured_r(config, "target_2") or _configured_r(config, "target_1")),
+                        tick_size=(config.get("rules") or {}).get("tick_size"),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
             stop_changed = position.get("stop_loss") is None or abs(float(position["stop_loss"]) - float(stop)) > 1e-9
             target_changed = position.get("take_profit") is None or abs(float(position["take_profit"]) - float(target)) > 1e-9
             if not stop_changed and not target_changed:
@@ -534,17 +597,23 @@ class SMCPaperAccount:
                 take_profit=target if target_changed else None,
             )
             action = {
-                "order_id": meta["order_id"], "action": "restored_strategy_protection",
+                "order_id": owners[-1][0]["order_id"],
+                "owner_order_ids": [row[0]["order_id"] for row in owners],
+                "ownership_resolution": "single" if len(owners) == 1 else "legacy_aggregate_conservative",
+                "action": "restored_strategy_protection",
                 "stop_loss": repaired.get("stop_loss"), "take_profit": repaired.get("take_profit"),
-                "planned_rr": _configured_r(config, "target_2") or _configured_r(config, "target_1"),
+                "planned_rr": planned_rr,
                 "source": "immutable_smc_order_configuration_and_actual_fill",
             }
             actions.append(action)
-            self._audit("paper_position_protection_repaired", object_id=meta["order_id"], payload=action)
+            self._audit("paper_position_protection_repaired", object_id=owners[-1][0]["order_id"], payload=action)
         if actions:
-            self._audit("paper_orders_reconciled", payload={"actions": actions, "manual_orders_cancelled": 0})
+            self._audit("paper_orders_reconciled", payload={
+                "actions": actions, "manual_orders_cancelled": manual_orders_cancelled,
+            })
             self._snapshot()
-        return {"actions": actions, "manual_orders_cancelled": 0, "records_deleted": 0,
+        return {"actions": actions, "manual_orders_cancelled": manual_orders_cancelled,
+                "records_deleted": 0,
                 "real_execution_allowed": False}
 
     def process_candle(self, symbol: str, candle) -> dict:

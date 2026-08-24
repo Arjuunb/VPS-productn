@@ -88,6 +88,53 @@ def test_smc_restart_repairs_strategy_protection_and_blocks_stacking(tmp_path):
                               target_2=entry + 30, idempotency_key="blocked-stack")
 
 
+def test_smc_restart_consolidates_multiple_legacy_fills_conservatively(tmp_path):
+    path = tmp_path / "smc-legacy-aggregate.db"
+    account = SMCPaperAccount(path)
+    first = account.submit_order(
+        symbol="BTCUSDT", side="buy", order_type="market", rules=RULES,
+        reference_price=100, quantity=.1, stop_loss=90, target_1=110,
+        target_2=120, idempotency_key="legacy-first", ownership="strategy",
+    )
+    account.process_candle("BTCUSDT", Bar(
+        datetime(2026, 8, 24, 12, tzinfo=timezone.utc), 100, 101, 99, 100, 1_000))
+
+    second = account.broker.submit(
+        symbol="BTCUSDT", side="buy", order_type="market", quantity=.1)
+    account.broker.process_candle("BTCUSDT", Bar(
+        datetime(2026, 8, 24, 12, 5, tzinfo=timezone.utc), 102, 103, 101, 102, 1_000))
+    now = datetime.now(timezone.utc).isoformat()
+    second_config = {
+        "reference_price": 102, "stop_loss": 95, "target_1": 109,
+        "target_2": 116, "target_1_r": 1, "target_2_r": 2,
+        "rules": RULES,
+    }
+    account._db.execute(
+        "INSERT INTO smc_order_meta(order_id,session_id,ownership,idempotency_key,model_id,model_version,direction,entry,stop,target_1,target_2,status,reason,config_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (second["id"], account.session()["id"], "strategy", "legacy-second",
+         "SMC_M1_SWEEP_REVERSAL", "legacy", "bullish", 102, 95, 109, 116,
+         "ENTERED", "legacy filled owner", json.dumps(second_config, sort_keys=True), now, now),
+    )
+    pending = account.broker.submit(
+        symbol="BTCUSDT", side="buy", order_type="limit", quantity=.1, limit_price=90)
+    account.broker._c.execute(
+        "UPDATE v2_positions SET stop_loss=NULL,take_profit=NULL WHERE symbol='BTCUSDT'")
+    account.broker._c.commit()
+
+    reopened = SMCPaperAccount(path)
+    repaired = reopened.state()["positions"][0]
+    assert repaired["stop_loss"] == 95
+    assert repaired["take_profit"] is not None
+    assert repaired["planned_rr"] == 2
+    assert repaired["effective_rr"] >= 2
+    assert repaired["protection_status"] == "PROTECTED"
+    assert reopened.broker.order(pending["id"])["status"] == "cancelled"
+    repair = next(row for row in reopened.state()["activity"]
+                  if row["kind"] == "paper_position_protection_repaired")
+    assert repair["payload"]["ownership_resolution"] == "legacy_aggregate_conservative"
+    assert first["order"]["id"] in repair["payload"]["owner_order_ids"]
+
+
 def test_risk_sizing_and_session_identity_guards(tmp_path):
     account = SMCPaperAccount(tmp_path / "smc.db")
     placed = account.submit_order(

@@ -87,6 +87,13 @@ class PaperBrokerV2:
             ):
                 if name not in columns:
                     self._c.execute(f"ALTER TABLE v2_account ADD COLUMN {name} {ddl}")
+            order_columns = {row[1] for row in self._c.execute("PRAGMA table_info(v2_orders)")}
+            for name in (
+                "protection_stop_loss", "protection_take_profit",
+                "protection_target_r", "protection_tick_size",
+            ):
+                if name not in order_columns:
+                    self._c.execute(f"ALTER TABLE v2_orders ADD COLUMN {name} REAL")
             self._c.execute(
                 "UPDATE v2_account SET peak_equity=CASE WHEN peak_equity<=0 THEN balance ELSE peak_equity END WHERE id=1"
             )
@@ -194,7 +201,11 @@ class PaperBrokerV2:
     def submit(self, *, symbol: str, side: str, order_type: str, quantity: float,
                limit_price: Optional[float] = None, stop_price: Optional[float] = None,
                trailing_offset: Optional[float] = None, reduce_only: bool = False,
-               market_open: bool = True) -> dict:
+               market_open: bool = True,
+               protection_stop_loss: Optional[float] = None,
+               protection_take_profit: Optional[float] = None,
+               protection_target_r: Optional[float] = None,
+               protection_tick_size: Optional[float] = None) -> dict:
         symbol = (symbol or "").upper().replace("/", "")
         side, order_type = self._norm_side(side), (order_type or "").lower()
         if order_type not in ORDER_TYPES:
@@ -209,6 +220,10 @@ class PaperBrokerV2:
             raise ValueError("stop price must be positive")
         if order_type == "trailing_stop" and (trailing_offset is None or trailing_offset <= 0):
             raise ValueError("trailing offset must be positive")
+        if any(value is not None and value <= 0 for value in (
+                protection_stop_loss, protection_take_profit,
+                protection_target_r, protection_tick_size)):
+            raise ValueError("stored order protection values must be positive")
         with self._lock:
             pos = self._c.execute("SELECT * FROM v2_positions WHERE symbol=?", (symbol,)).fetchone()
             if reduce_only and (not pos or (pos["side"] == "long") == (side == "buy")):
@@ -222,9 +237,13 @@ class PaperBrokerV2:
                     if needed > self.account()["free_margin"]:
                         raise ValueError("insufficient free margin")
             oid, now = _id(), _now()
-            self._c.execute("INSERT INTO v2_orders VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                            (oid, symbol, side, order_type, float(quantity), float(quantity), 0.0, None,
-                             limit_price, stop_price, trailing_offset, int(reduce_only), "open", None, now, now, None))
+            self._c.execute(
+                "INSERT INTO v2_orders(id,symbol,side,type,quantity,remaining,filled,average_price,limit_price,stop_price,trailing_offset,reduce_only,status,reason,created_at,updated_at,triggered_at,protection_stop_loss,protection_take_profit,protection_target_r,protection_tick_size) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (oid, symbol, side, order_type, float(quantity), float(quantity), 0.0, None,
+                 limit_price, stop_price, trailing_offset, int(reduce_only), "open", None, now, now, None,
+                 protection_stop_loss, protection_take_profit,
+                 protection_target_r, protection_tick_size),
+            )
             self._c.commit()
         return self.order(oid)
 
@@ -243,6 +262,24 @@ class PaperBrokerV2:
             if row["status"] not in OPEN_STATUSES:
                 raise ValueError("only open orders can be cancelled")
             self._c.execute("UPDATE v2_orders SET status='cancelled',updated_at=? WHERE id=?", (_now(), order_id))
+            self._c.commit()
+        return self.order(order_id)
+
+    def set_order_protection(self, order_id: str, *, stop_loss: float,
+                             take_profit: float, target_r: float,
+                             tick_size: Optional[float] = None) -> dict:
+        if any(value is None or float(value) <= 0 for value in (stop_loss, take_profit, target_r)):
+            raise ValueError("order protection requires positive stop, target and R:R")
+        if tick_size is not None and float(tick_size) <= 0:
+            raise ValueError("protection tick size must be positive")
+        with self._lock:
+            if not self._c.execute("SELECT 1 FROM v2_orders WHERE id=?", (order_id,)).fetchone():
+                raise KeyError(order_id)
+            self._c.execute(
+                "UPDATE v2_orders SET protection_stop_loss=?,protection_take_profit=?,protection_target_r=?,protection_tick_size=?,updated_at=? WHERE id=?",
+                (float(stop_loss), float(take_profit), float(target_r),
+                 float(tick_size) if tick_size is not None else None, _now(), order_id),
+            )
             self._c.commit()
         return self.order(order_id)
 
@@ -299,6 +336,13 @@ class PaperBrokerV2:
                     continue
                 if price is not None:
                     protection = (protections or {}).get(order["id"])
+                    if not protection and order.get("protection_stop_loss") is not None:
+                        protection = {
+                            "stop_loss": order.get("protection_stop_loss"),
+                            "take_profit": order.get("protection_take_profit"),
+                            "target_r": order.get("protection_target_r"),
+                            "tick_size": order.get("protection_tick_size"),
+                        }
                     stop_loss = protection.get("stop_loss") if protection else None
                     simulated_fill = self._price(order["side"], price)
                     invalid_stop_geometry = stop_loss is not None and (
@@ -538,8 +582,13 @@ class PaperBrokerV2:
                 for row in snapshot["orders"]:
                     keys = ("id", "symbol", "side", "type", "quantity", "remaining", "filled",
                             "average_price", "limit_price", "stop_price", "trailing_offset", "reduce_only",
-                            "status", "reason", "created_at", "updated_at", "triggered_at")
-                    self._c.execute("INSERT INTO v2_orders VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", tuple(row.get(k) for k in keys))
+                            "status", "reason", "created_at", "updated_at", "triggered_at",
+                            "protection_stop_loss", "protection_take_profit",
+                            "protection_target_r", "protection_tick_size")
+                    self._c.execute(
+                        "INSERT INTO v2_orders(id,symbol,side,type,quantity,remaining,filled,average_price,limit_price,stop_price,trailing_offset,reduce_only,status,reason,created_at,updated_at,triggered_at,protection_stop_loss,protection_take_profit,protection_target_r,protection_tick_size) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        tuple(row.get(k) for k in keys),
+                    )
                 for row in snapshot["fills"]:
                     keys = ("id", "order_id", "symbol", "side", "quantity", "price", "fee", "realized_pnl", "timestamp")
                     self._c.execute("INSERT INTO v2_fills VALUES (?,?,?,?,?,?,?,?,?)", tuple(row.get(k) for k in keys))

@@ -300,6 +300,8 @@ class PaperOrderBody(BaseModel):
     stop_price: Optional[float] = None
     trailing_offset: Optional[float] = None
     reduce_only: bool = False
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
 
 
 def _multiple(value: float, step: float) -> bool:
@@ -323,11 +325,42 @@ def create_paper_order(body: PaperOrderBody, x_webhook_secret: Optional[str] = H
         reference = price or _wa.v2_market_data.public_usdm_quote(body.symbol)["mark"]
         if body.quantity * reference < rules["min_notional"]:
             raise ValueError(f"order notional must be at least {rules['min_notional']} USDT")
+        side = body.side.lower()
+        if side not in {"buy", "long", "sell", "short"}:
+            raise ValueError("side must be buy/long or sell/short")
+        is_long = side in {"buy", "long"}
+        if not body.reduce_only:
+            if body.stop_loss is None or body.take_profit is None:
+                raise ValueError("Price Action paper entries require both stop loss and take profit")
+            if not _multiple(body.stop_loss, rules["tick_size"]) or not _multiple(body.take_profit, rules["tick_size"]):
+                raise ValueError(f"protection prices must follow Binance tick size {rules['tick_size']}")
+            valid_geometry = (
+                body.stop_loss < reference < body.take_profit if is_long
+                else body.take_profit < reference < body.stop_loss
+            )
+            if not valid_geometry:
+                raise ValueError("stop loss and take profit must be on the correct sides of the entry")
+            open_entries = [row for row in _wa.price_action_paper.broker.orders()
+                            if row.get("status") in {"open", "partially_filled", "triggered"}
+                            and not row.get("reduce_only")]
+            open_position = any(row.get("symbol") == body.symbol.upper()
+                                for row in _wa.price_action_paper.broker.positions())
+            same_symbol_entry = any(row.get("symbol") == body.symbol.upper()
+                                    for row in open_entries)
+            if open_position or same_symbol_entry:
+                raise ValueError("another Price Action entry or protected position is already active")
+            target_r = abs(body.take_profit - reference) / abs(reference - body.stop_loss)
+        else:
+            target_r = None
         return _wa.price_action_paper.broker.submit(
             symbol=body.symbol, side=body.side, order_type=body.order_type,
             quantity=body.quantity, limit_price=body.limit_price,
             stop_price=body.stop_price, trailing_offset=body.trailing_offset,
             reduce_only=body.reduce_only, market_open=True,
+            protection_stop_loss=body.stop_loss,
+            protection_take_profit=body.take_profit,
+            protection_target_r=target_r,
+            protection_tick_size=rules["tick_size"] if not body.reduce_only else None,
         )
     except ValueError as exc:
         _bad(exc)
@@ -357,7 +390,7 @@ def cancel_paper_order(order_id: str, x_webhook_secret: Optional[str] = Header(d
 
 @router.post("/paper/orders/reconcile")
 def reconcile_paper_orders(x_webhook_secret: Optional[str] = Header(default=None)):
-    """Reconcile strategy-generated paper orders without touching manual orders."""
+    """Reconcile paper orders and prevent unprotected same-symbol stacking."""
     _wa._check_secret(x_webhook_secret)
     try:
         return _wa.price_action_runtime.reconcile_paper_orders()

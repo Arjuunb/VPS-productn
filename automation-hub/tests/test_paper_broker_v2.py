@@ -90,6 +90,25 @@ def test_entry_is_rejected_if_gap_or_slippage_crosses_protective_stop(tmp_path):
     assert "protective stop" in rejected["reason"]
 
 
+def test_order_level_protection_is_durable_and_needs_no_runtime_side_map(tmp_path):
+    path = tmp_path / "durable-protection.db"
+    broker = PaperBrokerV2(path, starting_balance=10_000, fee_rate=0,
+                           spread_bps=2, slippage_bps=3, participation_rate=1)
+    order = broker.submit(
+        symbol="BTCUSDT", side="buy", order_type="market", quantity=1,
+        protection_stop_loss=95, protection_take_profit=112.5,
+        protection_target_r=2.5, protection_tick_size=.1,
+    )
+    broker.process_candle("BTCUSDT", _bar(open_=100, high=101, low=99, close=100))
+    position = broker.positions()[0]
+    assert position["stop_loss"] == 95
+    assert position["take_profit"] > 112.5
+    restored = PaperBrokerV2(path, starting_balance=1)
+    persisted = restored.order(order["id"])
+    assert persisted["protection_stop_loss"] == 95
+    assert persisted["protection_target_r"] == 2.5
+
+
 def test_bad_candle_is_rejected(tmp_path):
     broker = _broker(tmp_path)
     broker.submit(symbol="BTCUSDT", side="buy", order_type="market", quantity=1)

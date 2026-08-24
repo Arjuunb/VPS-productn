@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 
 from bot.types import Bar
@@ -115,6 +116,47 @@ def test_price_action_blocks_same_symbol_stacking_that_would_overwrite_protectio
     assert result["created"] == []
     assert "stacking is blocked" in result["rejected"][0]["reason"]
     assert len(account.state()["positions"]) == 1
+
+
+def test_restart_consolidates_legacy_multiple_owners_and_cancels_pending_entries(tmp_path):
+    path = tmp_path / "legacy-aggregate.db"
+    account = PriceActionPaperAccount(path)
+    account.configure(execution_config=PaperExecutionConfig(
+        operating_mode="automatic", risk_pct=.5))
+    account.synchronize_strategy(visual(), contract_rules=RULES,
+                                 candle=bar(1), feed_reliable=True)
+    account.synchronize_strategy(visual(count=11), contract_rules=RULES,
+                                 candle=bar(2, 104, 106, 103, 105), feed_reliable=True)
+
+    second = account.broker.submit(symbol="BTCUSDT", side="buy", order_type="market", quantity=1)
+    account.broker.process_candle("BTCUSDT", bar(3, 105, 106, 104, 105))
+    config = dict(account.state()["order_metadata"][0]["config"])
+    config.update({"entry": 105, "stop": 98, "target": 122.5,
+                   "target_r": 2.5, "planned_rr": 2.5})
+    now = NOW.isoformat()
+    account._db.execute(
+        "INSERT INTO pa_order_meta VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (second["id"], account.session()["id"], "proposal-legacy-2", "setup-legacy-2",
+         "zone-legacy-2", "bullish", "PA1_SR_REJECTION", json.dumps(config, sort_keys=True),
+         "ENTERED", "legacy filled owner", now, now, 99),
+    )
+    pending = account.broker.submit(symbol="BTCUSDT", side="buy", order_type="limit",
+                                    quantity=.1, limit_price=90)
+    account.broker._c.execute(
+        "UPDATE v2_positions SET stop_loss=NULL,take_profit=NULL WHERE symbol='BTCUSDT'")
+    account.broker._c.commit()
+
+    reopened = PriceActionPaperAccount(path)
+    repaired = reopened.state()["positions"][0]
+    assert repaired["stop_loss"] == 99
+    assert repaired["take_profit"] is not None
+    assert repaired["planned_rr"] == 2.5
+    assert repaired["effective_rr"] >= 2.5
+    assert repaired["protection_status"] == "PROTECTED"
+    assert reopened.broker.order(pending["id"])["status"] == "cancelled"
+    repair = next(row for row in reopened.state()["activity"]
+                  if row["kind"] == "paper_position_protection_repaired")
+    assert repair["payload"]["ownership_resolution"] == "legacy_aggregate_conservative"
 
 
 def test_signals_manual_approval_duplicate_and_unreliable_feed_are_explicit(tmp_path):

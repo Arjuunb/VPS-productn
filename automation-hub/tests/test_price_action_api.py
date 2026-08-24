@@ -56,6 +56,40 @@ def test_strategy_order_reconciliation_is_protected_and_preserves_manual_orders(
     assert response.json() == {"actions": [], "records_deleted": 0, "manual_orders_changed": 0}
 
 
+def test_manual_price_action_entries_require_and_persist_protection(monkeypatch, tmp_path):
+    class Market:
+        @staticmethod
+        def usdm_contract_rules(_symbol):
+            return {"tick_size": .1, "quantity_step": .001, "min_quantity": .001,
+                    "max_quantity": 100, "min_notional": 5}
+
+        @staticmethod
+        def public_usdm_quote(_symbol):
+            return {"mark": 100}
+
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+    account = PriceActionPaperAccount(tmp_path / "pa-protected-order.db")
+    monkeypatch.setattr(webhook_api, "price_action_paper", account)
+    monkeypatch.setattr(webhook_api, "v2_market_data", Market())
+    headers = {"x-webhook-secret": webhook_api.settings.admin_key}
+    base = {"symbol": "BTCUSDT", "side": "buy", "type": "market", "quantity": .1}
+
+    rejected = client.post("/research/price-action/paper/orders", headers=headers, json=base)
+    assert rejected.status_code == 400
+    assert "require both stop loss and take profit" in rejected.json()["detail"]
+
+    accepted = client.post("/research/price-action/paper/orders", headers=headers, json={
+        **base, "stop_loss": 95, "take_profit": 110,
+    })
+    assert accepted.status_code == 200
+    order = accepted.json()
+    assert order["protection_stop_loss"] == 95
+    assert order["protection_take_profit"] == 110
+    assert order["protection_target_r"] == 2
+
+
 def test_session_api_configures_paper_modes_and_resumes_without_live_path(monkeypatch, tmp_path):
     app = FastAPI()
     app.include_router(router)
