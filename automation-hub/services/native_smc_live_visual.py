@@ -20,6 +20,12 @@ from services.native_smc import SMCConfig, SMCMarketStructureEngine
 
 
 LIVE_VENUES = {
+    "binance_usdm": {
+        "label": "Binance USDⓈ-M Futures",
+        "ccxt_id": "binanceusdm",
+        "market": lambda symbol: f"{symbol[:-4]}/USDT:USDT",
+        "options": {"defaultType": "future"},
+    },
     "mexc_perpetual": {
         "label": "MEXC perpetual",
         "ccxt_id": "mexc",
@@ -62,6 +68,69 @@ _LIVE_FEEDS_LOCK = RLock()
 _LIVE_REFRESH_SECONDS = 2.5
 
 
+def reconcile_market_state(state: dict, quote: dict | None, *, timeframe: str,
+                           now: datetime | None = None) -> dict:
+    """Attach a fail-closed Binance candle/quote/mark health decision.
+
+    OHLC polling is useful display evidence, but it is not sufficient execution
+    evidence.  A PAPER entry is eligible only when the independent public
+    bid/ask and mark snapshot is fresh and reconciles with the displayed price.
+    """
+    observed = now or datetime.now(timezone.utc)
+    live = state.setdefault("live_display", {})
+    reason = "independent Binance bid/ask and mark snapshot is unavailable"
+    health = "STALE_QUOTE"
+    quote_age = deviation_bps = None
+    reliable = False
+    try:
+        if not quote:
+            raise ValueError(reason)
+        bid, ask, mark = (float(quote[key]) for key in ("bid", "ask", "mark"))
+        provider_at = datetime.fromisoformat(str(quote["provider_time"]).replace("Z", "+00:00"))
+        quote_age = max(0.0, (observed - provider_at).total_seconds())
+        reference = float(live.get("last_price") or state["candles"][-1]["close"])
+        deviation_bps = max(abs(bid - reference), abs(ask - reference),
+                            abs(mark - reference)) / reference * 10_000
+        last_closed = datetime.fromisoformat(
+            str(state["data_provenance"]["last_closed_candle"]).replace("Z", "+00:00"))
+        closed_age = max(0.0, (observed - last_closed).total_seconds())
+        closed_limit = TF_SECONDS[timeframe] + 20
+        if bid <= 0 or ask < bid:
+            health, reason = "STALE_QUOTE", "public bid/ask snapshot is invalid"
+        elif mark <= 0:
+            health, reason = "STALE_MARK", "public mark-price snapshot is invalid"
+        elif quote_age > 15:
+            health, reason = "STALE_QUOTE", "public bid/ask and mark snapshot is stale"
+        elif closed_age > closed_limit:
+            health, reason = "STALE_CANDLES", "completed candle history is stale"
+        elif deviation_bps > 100:
+            health, reason = "QUOTE_MISMATCH", f"candle/quote deviation is {deviation_bps:.2f} bps"
+        else:
+            health = "SYNCHRONIZED"
+            reason = "candles, bid/ask and mark are reconciled and fresh"
+            reliable = True
+        live.update({"bid": bid, "ask": ask, "mark": mark,
+                     "funding_rate": quote.get("funding_rate"),
+                     "last_funding_time": quote.get("last_funding_time"),
+                     "next_funding_time": quote.get("next_funding_time")})
+    except (KeyError, TypeError, ValueError, IndexError) as exc:
+        if str(exc):
+            reason = str(exc)
+    live.update({
+        "connection_state": health, "transport_state": "PUBLIC_REST_POLL",
+        "health_reason": reason, "reliable": reliable,
+        "new_entries_paused": not reliable, "quote_age_seconds": quote_age,
+        "mark_age_seconds": quote_age, "candle_quote_deviation_bps": deviation_bps,
+        "quote_source": "BINANCE_USDM_PUBLIC_REST" if quote else "UNAVAILABLE",
+    })
+    state.setdefault("data_provenance", {}).update({
+        "connection_state": health, "new_entries_paused": not reliable,
+        "market_data_mode": "LIVE", "market_data_source": "Binance USDⓈ-M Futures public market data",
+        "exchange": "Binance USDⓈ-M Futures",
+    })
+    return state
+
+
 def _display_price(forming: Bar | None, closed: list[Bar]) -> float:
     """Return the one authoritative display price for this visual feed."""
     if forming is not None:
@@ -88,7 +157,7 @@ def _validate(symbol: str, timeframe: str, venue: str) -> tuple[str, str, str]:
     if timeframe not in {"1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"}:
         raise ValueError("timeframe must be one of 1m, 3m, 5m, 15m, 30m, 1h, 4h, 1d, or 1w")
     if venue not in LIVE_VENUES:
-        raise ValueError("venue must be one of mexc_perpetual or kraken_spot")
+        raise ValueError("venue must be one of binance_usdm, mexc_perpetual, or kraken_spot")
     return symbol, timeframe, venue
 
 
@@ -117,7 +186,7 @@ def fetch_venue_ohlcv(symbol: str, timeframe: str, venue: str, limit: int, *,
     return bars
 
 
-def live_visual_history(symbol: str = "BTCUSDT", timeframe: str = "5m", venue: str = "mexc_perpetual", *,
+def live_visual_history(symbol: str = "BTCUSDT", timeframe: str = "5m", venue: str = "binance_usdm", *,
                         before: datetime, limit: int = 400, now: datetime | None = None,
                         fetcher: Callable[..., list[Bar]] = fetch_venue_ohlcv) -> dict:
     """Return one genuine, closed-candle page before ``before`` for chart browsing.
@@ -238,9 +307,10 @@ def _refresh_feed(feed: _LiveVisualFeed, symbol: str, timeframe: str, venue: str
     feed.last_fetch_monotonic = monotonic()
 
 
-def live_visual_state(symbol: str = "BTCUSDT", timeframe: str = "5m", venue: str = "mexc_perpetual", *,
+def live_visual_state(symbol: str = "BTCUSDT", timeframe: str = "5m", venue: str = "binance_usdm", *,
                       limit: int = 800, visible: int = 240, now: datetime | None = None,
-                      fetcher: Callable[[str, str, str, int], list[Bar]] = fetch_venue_ohlcv) -> dict:
+                      fetcher: Callable[[str, str, str, int], list[Bar]] = fetch_venue_ohlcv,
+                      model_id: str = "SMC_M1_SWEEP_REVERSAL") -> dict:
     """Return a real-time display state while isolating native SMC to closed bars.
 
     Production calls share a small in-memory feed and poll it at most once per
@@ -269,7 +339,9 @@ def live_visual_state(symbol: str = "BTCUSDT", timeframe: str = "5m", venue: str
     # The ladder is a read-only projection of the same closed-bar native
     # engine. It cannot create a signal, alter a snapshot, or place an order.
     from services.smc_strategy_ladder import evaluate_ladder
+    from services.smc_strategy_v1 import evaluate as evaluate_source_strategy
     state["strategy_ladder"] = evaluate_ladder(feed.engine)
+    state["source_strategy"] = evaluate_source_strategy(feed.engine, model_id)
     forming = _candle_payload(feed.forming_candle)
     candle_closes_at = (
         (feed.forming_candle.timestamp + timedelta(seconds=TF_SECONDS[timeframe])).isoformat()

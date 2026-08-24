@@ -10,7 +10,7 @@ UTC = timezone.utc
 
 
 def _bars(symbol: str, timeframe: str, venue: str, limit: int):
-    assert (symbol, timeframe, venue) == ("BTCUSDT", "5m", "mexc_perpetual")
+    assert (symbol, timeframe, venue) == ("BTCUSDT", "5m", "binance_usdm")
     start = datetime(2025, 3, 1, tzinfo=UTC)
     return [Bar(start + timedelta(minutes=5 * i), 100 + i, 102 + i, 99 + i, 101 + i, 10 + i) for i in range(250)]
 
@@ -19,11 +19,13 @@ def test_live_visual_uses_only_closed_bars_and_never_enables_execution():
     now = datetime(2025, 3, 1, tzinfo=UTC) + timedelta(minutes=5 * 250)
     state = live_visual_state(now=now, fetcher=_bars)
     assert state["execution_allowed"] is False
+    assert state["source_strategy"]["paper_only"] is True
+    assert state["source_strategy"]["execution_allowed"] is False
     assert len(state["candles"]) == 240
     assert state["forming_candle"] is None
     assert state["live_display"]["execution_uses_closed_bars_only"] is True
     assert state["data_provenance"]["mode"] == "LIVE_EXCHANGE_DISPLAY_WITH_CLOSED_BAR_SMC"
-    assert state["data_provenance"]["venue"] == "MEXC perpetual"
+    assert state["data_provenance"]["venue"] == "Binance USDⓈ-M Futures"
     assert state["data_provenance"]["forming_candle_excluded"] is False
 
 

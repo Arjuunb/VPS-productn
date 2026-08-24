@@ -48,10 +48,10 @@ export async function apiDelete<T>(path: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-export async function apiPostJson<T>(path: string, body: unknown): Promise<T> {
+export async function apiPostJson<T>(path: string, body: unknown, extraHeaders: Record<string, string> = {}): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" }, credentials: "include",
+    headers: { "Content-Type": "application/json", ...extraHeaders }, credentials: "include",
     body: JSON.stringify(body),
   });
   if (!res.ok) throw await requestError(res, `POST ${path}`);

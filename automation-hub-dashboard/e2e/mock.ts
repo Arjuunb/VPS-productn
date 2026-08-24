@@ -100,6 +100,48 @@ const PA_PAPER = {
     manual_orders_are_never_auto_cancelled: true },
 };
 
+const SMC_SNAPSHOT = {
+  id: "smc-snapshot-1", candle_open: PA_CANDLES.at(-1)?.timestamp,
+  candle_close: PA_CANDLES.at(-1)?.timestamp, htf_bias: 1, htf_ema: 104,
+  swing_bias: 1, internal_bias: 1, session: "london",
+  dealing_range: { high: 110, low: 98, equilibrium: 104, area: "discount" },
+  price_action: { bullish_rejection: true, bearish_rejection: false, body: 1, upper_wick: .2, lower_wick: .8 },
+  active_setup_id: null, setup_phase: null, next_required_event: "Await liquidity sweep",
+  latest_sweep_id: null, event_ids: [], active_fvg_ids: [], active_ob_ids: [], proposal_ids: [],
+};
+const SMC_SOURCE = {
+  strategy_id: "SMC_SOURCE_V1", version: "SMC_SOURCE_V1.0.0-paper-draft",
+  state: "WATCHING", next_required_event: "Await liquidity sweep", selected_candidate_id: null,
+  paper_only: true, execution_allowed: false, native_object_ids: [], missing_conditions: ["liquidity_sweep"],
+  model: { id: "SMC_M1_SWEEP_REVERSAL", label: "M1 Sweep Reversal", status: "ACTIVE",
+    narrative: "Sweep reversal", ordered_rules: ["HTF bias", "location", "sweep"] },
+  ordered_condition_results: [], trade_plan: null,
+};
+const SMC_CHART = {
+  research_id: "SMC_NATIVE_V1_RESEARCH", execution_allowed: false, candles: PA_CANDLES,
+  pivots: [], events: [], fair_value_gaps: [], order_blocks: [], proposals: [], setups: [],
+  snapshot: SMC_SNAPSHOT, selected_snapshot: SMC_SNAPSHOT, snapshot_ledger: [SMC_SNAPSHOT],
+  forming_candle: { ...PA_CANDLES.at(-1), close: 109 }, source_strategy: SMC_SOURCE,
+  strategy_ladder: { candidates: [] },
+  live_display: { is_forming: true, observed_at: "2026-01-01T07:00:00Z", refresh_interval_seconds: 0,
+    candle_closes_at: "2026-01-01T07:05:00Z", last_price: 109, bid: 108.9, ask: 109.1, mark: 109,
+    connection_state: "SYNCHRONIZED", reliable: true, new_entries_paused: false,
+    health_reason: "candles, bid/ask and mark are reconciled and fresh", quote_age_seconds: .1,
+    candle_quote_deviation_bps: 2, execution_uses_closed_bars_only: true },
+  data_provenance: { venue: "Binance USDⓈ-M Futures", market: "BTC/USDT:USDT",
+    last_closed_candle: PA_CANDLES.at(-1)?.timestamp, observed_at: "2026-01-01T07:00:00Z",
+    closed_candles_loaded: 80, closed_candles_visible: 80, forming_candle_excluded: true,
+    execution_allowed: false },
+};
+const SMC_PAPER = {
+  paper_only: true, real_execution_allowed: false,
+  session: { id: "smc-session-1", mode: "LIVE_PAPER", symbol: "BTCUSDT", timeframe: "5m",
+    operating_mode: "signals_only", model_id: "SMC_M1_SWEEP_REVERSAL", risk_pct: .5 },
+  account: { balance: 10000, equity: 10000, available_margin: 10000, used_margin: 0,
+    open_risk: 0, unrealized_pnl: 0, leverage: 1 },
+  positions: [], orders: [], trades: [], candidates: [], activity: [], funding_events: [],
+};
+
 const JOURNAL_FULL = {
   trade_id: "t1234567abcdef", mode: "paper", symbol: "BTCUSDT", side: "long",
   strategy: "Decision Brain", timeframe: "4h", entry: 100, stop: 95, target: 115,
@@ -527,6 +569,30 @@ export async function mockApi(page: Page) {
           session_id: paPaper.session.id, mode: paPaper.session.mode ?? "LIVE_PAPER", symbol, timeframe };
         return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(chart) });
       }
+      if (url.pathname.endsWith("/research/smc/live-chart")) {
+        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(SMC_CHART) });
+      }
+      if (url.pathname.endsWith("/research/smc/paper")) {
+        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(SMC_PAPER) });
+      }
+      if (url.pathname.endsWith("/research/smc/strategy-models")) {
+        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+          strategy_id: "SMC_SOURCE_V1", strategy_version: SMC_SOURCE.version, paper_only: true,
+          real_execution_allowed: false, models: [SMC_SOURCE.model],
+        }) });
+      }
+      if (url.pathname.endsWith("/research/smc/strategy-v1/evaluate")) {
+        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(SMC_SOURCE) });
+      }
+      if (url.pathname.endsWith("/research/smc/sessions")) {
+        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ sessions: [SMC_PAPER.session], paper_only: true, real_execution_allowed: false }) });
+      }
+      if (url.pathname.endsWith("/research/smc/journal")) {
+        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ journal: [], paper_only: true, real_execution_allowed: false }) });
+      }
+      if (url.pathname.includes("/research/smc/review-sample")) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ sample: [] }) });
+      if (url.pathname.includes("/research/smc/reviews")) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ reviews: [] }) });
+      if (url.pathname.endsWith("/research/smc/pine-reference")) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ reference_id: "mock", status: "REFERENCE_ONLY", language: "pine", sha256: "0".repeat(64), execution_allowed: false, notice: "Reference only", content: "// mock" }) });
       if (url.pathname.endsWith("/research/price-action/paper") && route.request().method() === "GET") {
         return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(paPaper) });
       }

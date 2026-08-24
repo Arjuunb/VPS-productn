@@ -29,6 +29,8 @@ export interface NativeSMCChartState {
     price_direction?: "up" | "down" | "unchanged";
     bid?: number; ask?: number; mark?: number; funding_rate?: number | null;
     last_funding_time?: string | null; next_funding_time?: string | null; connection_state?: string; new_entries_paused?: boolean;
+    health_reason?: string; quote_age_seconds?: number | null; mark_age_seconds?: number | null;
+    candle_quote_deviation_bps?: number | null; reliable?: boolean; quote_source?: string;
     price_updated_at?: string; source_mode?: "exchange_ohlcv_live_poll";
     execution_uses_closed_bars_only: true;
   };
@@ -36,6 +38,13 @@ export interface NativeSMCChartState {
 export interface NativeSMCOverlayFilters {
   pivots: boolean; internal: boolean; swing: boolean; structure: boolean; liquidity: boolean;
   fvg: boolean; orderBlocks: boolean; mitigated: boolean; labels: boolean;
+}
+
+export interface SMCTradePlanOverlay {
+  entry: number; stop: number; target_1: number; target_2: number;
+}
+export interface SMCFillOverlay {
+  timestamp: string; price: number; side: string; realized_pnl?: number;
 }
 
 export interface ChartPriceViewport {
@@ -85,6 +94,9 @@ interface Props {
   liveDataStale?: boolean;
   /** Neutral wording for consumers that reuse the closed-candle chart shell. */
   modelLabel?: string;
+  /** Source-strategy plan projected verbatim; it never changes native state. */
+  tradePlan?: SMCTradePlanOverlay | null;
+  fillMarkers?: SMCFillOverlay[];
   height?: number | string;
 }
 
@@ -214,7 +226,7 @@ function futureChartSlots(lastTimestamp: string | undefined, timeframe: string, 
   return Array.from({ length: count }, (_, index) => new Date(start + step * (index + 1)).toISOString());
 }
 
-function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetBars: number, initialVisibleBars: number, filters: NativeSMCOverlayFilters, selectedObjectId?: string, highlightedObjectIds: string[] = [], lightMode = false, priceViewport?: ChartPriceViewport, viewport?: ChartTimeViewport | null, liveDataStale = false, modelLabel = "native SMC"): ChartPresentation {
+function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetBars: number, initialVisibleBars: number, filters: NativeSMCOverlayFilters, selectedObjectId?: string, highlightedObjectIds: string[] = [], lightMode = false, priceViewport?: ChartPriceViewport, viewport?: ChartTimeViewport | null, liveDataStale = false, modelLabel = "native SMC", tradePlan?: SMCTradePlanOverlay | null, fillMarkers: SMCFillOverlay[] = []): ChartPresentation {
   const closedCandles = state.candles;
   // The display candle intentionally remains outside the native model's
   // snapshots. It makes the chart feel live without turning an unclosed bar
@@ -291,6 +303,12 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
     itemStyle: { color: colorFor(row.direction), borderColor: isHighlighted(row.id) ? "#ffffff" : undefined, borderWidth: isHighlighted(row.id) ? 2 : 0 },
     metadata: `${row.id}\n${row.event_type ? `${row.scope} ${row.event_type}` : "Liquidity sweep"}\nLevel: ${row.level}\nConfirmed: ${timestamp(eventAt(row)!)}`,
   }));
+  const fillData = fillMarkers.filter((row) => labelSet.has(row.timestamp)).map((row) => ({
+    name: row.realized_pnl ? "EXIT" : "FILL", value: [row.timestamp, row.price],
+    symbol: row.realized_pnl ? "diamond" : "triangle",
+    itemStyle: { color: row.realized_pnl && row.realized_pnl < 0 ? "#ef5b5b" : "#21c77a" },
+    metadata: `${row.realized_pnl ? "Paper exit" : "Paper fill"}\n${row.side} · ${row.price}\n${timestamp(row.timestamp)}`,
+  }));
   const rangeAreas = range ? [
     [{ name: `DISCOUNT · ${range.bars} bars`, xAxis: range.start, yAxis: range.low, itemStyle: { color: "rgba(34,197,94,.06)" } }, { xAxis: rangeEnd, yAxis: range.equilibrium }],
     [{ name: `PREMIUM · ${range.bars} bars`, xAxis: range.start, yAxis: range.equilibrium, itemStyle: { color: "rgba(239,91,91,.06)" } }, { xAxis: rangeEnd, yAxis: range.high }],
@@ -311,15 +329,22 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
     ...orderBlocks.flatMap((row) => [row.low, row.high]),
     ...(range ? [range.low, range.high] : []),
     ...nearbyProposals.flatMap((row) => [row.entry, row.stop, row.target]),
+    ...(tradePlan ? [tradePlan.entry, tradePlan.stop, tradePlan.target_1, tradePlan.target_2] : []),
   ].filter((value): value is number => typeof value === "number" && Number.isFinite(value));
   const rawLow = Math.min(candleLow, ...overlayLevels);
   const rawHigh = Math.max(candleHigh, ...overlayLevels);
   const rawSpan = Math.max(rawHigh - rawLow, Math.abs(rawHigh) * 0.002, 1);
-  const proposalLines = nearbyProposals.flatMap((row) => [
+  const proposalLines: any[] = nearbyProposals.flatMap((row) => [
     { yAxis: row.entry, name: "ENTRY", lineStyle: { color: "#65b7ff", width: 1.5 } },
     { yAxis: row.stop, name: "STOP LOSS", lineStyle: { color: "#ef5b5b", type: "dashed" } },
     { yAxis: row.target, name: "TAKE PROFIT", lineStyle: { color: "#21c77a", type: "dashed" } },
   ]);
+  if (tradePlan) proposalLines.push(
+    { yAxis: tradePlan.entry, name: "M1 ENTRY", lineStyle: { color: "#65b7ff", width: 2 } },
+    { yAxis: tradePlan.stop, name: "M1 STOP", lineStyle: { color: "#ef5b5b", width: 2, type: "dashed" } },
+    { yAxis: tradePlan.target_1, name: "M1 T1 · 50%", lineStyle: { color: "#21c77a", width: 1.5, type: "dashed" } },
+    { yAxis: tradePlan.target_2, name: "M1 T2", lineStyle: { color: "#9be7c1", width: 2, type: "dashed" } },
+  );
   const manualScale = Math.min(4, Math.max(0.18, priceViewport?.scale ?? 1));
   const manualCenter = (rawHigh + rawLow) / 2 + rawSpan * (priceViewport?.offset ?? 0);
   const pricePadding = rawSpan * 0.1;
@@ -414,12 +439,13 @@ function chartOption(state: NativeSMCChartState, timeframe: string, rightOffsetB
       { id: "smc-volume", type: "bar", name: "Volume", xAxisIndex: 1, yAxisIndex: 1, data: [...candles.map((row, index) => ({ value: row.volume, itemStyle: { color: row.close >= row.open ? "rgba(8,153,129,.70)" : "rgba(242,54,69,.70)", opacity: hasFormingCandle && index === candles.length - 1 ? 0.72 : 1 } })), ...futureSlots.map(() => "-")], barMaxWidth: 18 },
       { id: "smc-pivots", type: "scatter", name: "Native pivots", xAxisIndex: 0, yAxisIndex: 0, data: pivotData as any[], symbolSize: 8, label: { show: filters.labels, formatter: (row: any) => row.data.name, color: "#d7deea", fontSize: 9, position: "top" }, labelLayout: { hideOverlap: true }, z: 8 },
       { id: "smc-structure", type: "scatter", name: "Native structure", xAxisIndex: 0, yAxisIndex: 0, data: structureData as any[], symbol: "diamond", symbolSize: 11, label: { show: filters.labels, formatter: (row: any) => row.data.name, color: "#d7deea", fontSize: 9, position: "bottom" }, labelLayout: { hideOverlap: true }, z: 9 },
+      { id: "smc-paper-fills", type: "scatter", name: "SMC paper fills", xAxisIndex: 0, yAxisIndex: 0, data: fillData as any[], symbolSize: 13, label: { show: true, formatter: (row: any) => row.data.name, color: "#f8fafc", fontSize: 9, position: "top" }, labelLayout: { hideOverlap: true }, z: 12 },
     ],
   } as EChartsOption, priceAxisRange, livePrice, liveDirection };
 }
 
-export default function NativeSMCChartOverlay({ state, timeframe = "5m", rightOffsetBars = 12, initialVisibleBars = 120, filters, selectedObjectId, highlightedObjectIds, onCandleSelect, fitContentSignal, latestSignal, centerTimestamp, priceViewport, viewport, onViewportChange, onHistoryNearStart, historyLoading = false, hasMoreHistory = true, historicalMode = false, onGoLive, prependedHistory, onPriceAxisDrag, onResetPriceScale, onChartPointerDown, lightMode = false, liveDataStale = false, modelLabel = "native SMC", height = 700 }: Props) {
-  const presentation = useMemo(() => chartOption(state, timeframe, rightOffsetBars, initialVisibleBars, filters, selectedObjectId, highlightedObjectIds, lightMode, priceViewport, viewport, liveDataStale, modelLabel), [state, timeframe, rightOffsetBars, initialVisibleBars, filters, selectedObjectId, highlightedObjectIds, lightMode, priceViewport, viewport, liveDataStale, modelLabel]);
+export default function NativeSMCChartOverlay({ state, timeframe = "5m", rightOffsetBars = 12, initialVisibleBars = 120, filters, selectedObjectId, highlightedObjectIds, onCandleSelect, fitContentSignal, latestSignal, centerTimestamp, priceViewport, viewport, onViewportChange, onHistoryNearStart, historyLoading = false, hasMoreHistory = true, historicalMode = false, onGoLive, prependedHistory, onPriceAxisDrag, onResetPriceScale, onChartPointerDown, lightMode = false, liveDataStale = false, modelLabel = "native SMC", tradePlan, fillMarkers = [], height = 700 }: Props) {
+  const presentation = useMemo(() => chartOption(state, timeframe, rightOffsetBars, initialVisibleBars, filters, selectedObjectId, highlightedObjectIds, lightMode, priceViewport, viewport, liveDataStale, modelLabel, tradePlan, fillMarkers), [state, timeframe, rightOffsetBars, initialVisibleBars, filters, selectedObjectId, highlightedObjectIds, lightMode, priceViewport, viewport, liveDataStale, modelLabel, tradePlan, fillMarkers]);
   const labels = state.candles.length + (state.forming_candle ? 1 : 0) + Math.max(0, rightOffsetBars);
   const localWindowBars = Math.min(labels, Math.max(24, initialVisibleBars + rightOffsetBars));
   const currentSpanBars = viewport ? Math.max(24, Math.round(((viewport.end - viewport.start) / 100) * labels)) : localWindowBars;

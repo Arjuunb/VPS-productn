@@ -131,7 +131,13 @@ def state_machine_hash() -> str:
                 child for child in node.body
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name in _STATE_METHODS
             )
-    return hashlib.sha256("\n".join(ast.dump(node, include_attributes=False) for node in selected).encode()).hexdigest()
+    # Python 3.12 added empty ``type_params`` fields to ClassDef/FunctionDef
+    # AST dumps. They are interpreter metadata, not SMC state-machine logic.
+    # Remove only that empty field so the frozen Python 3.11 fingerprint is
+    # stable when verification runs under the supported 3.12 developer VM.
+    canonical = "\n".join(ast.dump(node, include_attributes=False) for node in selected)
+    canonical = canonical.replace(", type_params=[]", "")
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def dataset_provenance_hash() -> str:

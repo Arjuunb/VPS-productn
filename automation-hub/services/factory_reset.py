@@ -213,6 +213,10 @@ class FactoryResetService:
         if hasattr(r, "price_action_runtime"):
             r.price_action_runtime.stop()
         r.price_action_paper.factory_reset()
+        if hasattr(r, "smc_runtime"):
+            r.smc_runtime.stop()
+        if hasattr(r, "smc_paper"):
+            r.smc_paper.factory_reset()
         if hasattr(r, "price_action_experiments"):
             r.price_action_experiments.clear()
         r.account_store.set_initial_capital(r.settings.starting_cash, reset_account=True)

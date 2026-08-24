@@ -136,6 +136,10 @@ class Settings:
     # positions, orders, or balance with the general paper account.
     price_action_paper_db: str = field(default_factory=lambda: os.environ.get(
         "HUB_PRICE_ACTION_PAPER_DB", str(DATA_DIR / "price_action_paper.db")))
+    # SMC Strategy Lab is deliberately isolated from Price Action and every
+    # other paper account, including at the database-file boundary.
+    smc_paper_db: str = field(default_factory=lambda: os.environ.get(
+        "HUB_SMC_PAPER_DB", str(DATA_DIR / "smc_strategy_paper.db")))
     price_action_research_db: str = field(default_factory=lambda: os.environ.get(
         "HUB_PRICE_ACTION_RESEARCH_DB", str(DATA_DIR / "price_action_research.db")))
     # Decision-journal database (full explainable record of every trade)

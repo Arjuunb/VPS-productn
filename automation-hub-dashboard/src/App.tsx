@@ -127,6 +127,7 @@ export default function App() {
       case "Analytics": return <AnalyticsPage tab={route.tab} />;
       case "Strategy Proof": return <StrategyProofPage />;
       case "Forward Validation": return <ForwardValidationPage />;
+      case "SMC Strategy Lab":
       case "SMC Visual Lab": return <NativeSMCVisualPage />;
       case "Price Action Lab": return <PriceActionVisualPage />;
       case "Strategy Studio": return <StrategyStudioPage tab={route.tab} />;

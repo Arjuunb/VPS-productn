@@ -512,6 +512,7 @@ def _start_auto_engine() -> None:
 def _stop_price_action_stream() -> None:
     """Close the public Price Action WebSocket and its worker thread cleanly."""
     webhook_api.price_action_runtime.stop()
+    webhook_api.smc_runtime.stop()
 
 # Phase 8: process-wide event hub for the live (SSE) dashboard.
 from dashboard.stream import HubEventHub, sse_format  # noqa: E402
