@@ -127,6 +127,38 @@ export interface LiveState<T> {
   refetch: () => Promise<boolean>;
 }
 
+export interface LabBotStatus {
+  lab: "PRICE_ACTION" | "SMC";
+  account_scope: string;
+  scope_label: string;
+  paper_only: true;
+  real_execution_allowed: false;
+  strategy: { id?: string | null; model_id?: string | null; version?: string | null };
+  symbol?: string | null;
+  timeframe?: string | null;
+  mode?: string | null;
+  saved_configuration: Record<string, unknown>;
+  feed: Record<string, any>;
+  decision_state: string;
+  execution_state: string;
+  blockers: string[];
+  account?: Record<string, any> | null;
+  open_positions: number;
+  pending_orders: number;
+  positions: Array<Record<string, any>>;
+  latest_closed_candle_decision?: Record<string, any> | null;
+  latest_signal?: Record<string, any> | null;
+  latest_order?: Record<string, any> | null;
+  latest_fill?: Record<string, any> | null;
+  latest_activity?: Record<string, any> | null;
+  last_heartbeat?: string | null;
+  performance: {
+    backtest: Record<string, any>;
+    forward_validation: Record<string, any>;
+    live_paper: Record<string, any>;
+  };
+}
+
 // ---- shared polling layer ----
 // Every useLive(path) for the same path shares ONE poller: it dedupes identical
 // endpoints (many panels polling /paper/account no longer fan out into N requests),

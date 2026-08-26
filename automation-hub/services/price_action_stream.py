@@ -48,6 +48,7 @@ class PriceActionPublicStream:
         self.last_quote_update: datetime | None = None
         self.last_mark_update: datetime | None = None
         self.last_closed_update: datetime | None = None
+        self.started_at: datetime | None = None
         self.reconnect_attempt = 0
         self.duplicate_events = 0
         self.missing_candles = 0
@@ -175,6 +176,7 @@ class PriceActionPublicStream:
             self._reconnect_attempts = {"market": 0, "public": 0}
             self.reconnect_attempt = 0
         self._set_state("CONNECTING")
+        self.started_at = self.clock()
         try:
             self.bootstrap(symbol, timeframe)
         except Exception as exc:
@@ -422,6 +424,7 @@ class PriceActionPublicStream:
             timeframe_seconds = TF_MS.get(self.timeframe, 60_000) / 1000
             completed_candle_threshold = timeframe_seconds + max(
                 self.stale_after_seconds, min(timeframe_seconds * .25, 300.0))
+            connecting_age = age_for(self.started_at)
             unresolved = self._unresolved_gaps()
             bid, ask, mark, last = (self._quote.get(key) for key in ("bid", "ask", "mark", "last"))
             bid_ask_valid = all(isinstance(value, (int, float)) and value > 0 for value in (bid, ask)) and bid <= ask
@@ -436,6 +439,9 @@ class PriceActionPublicStream:
             if self.state in {"DISCONNECTED", "ERROR", "RECONNECTING", "CONNECTING"}:
                 health = self.state
                 reason = self.last_error or f"transport is {self.state.lower()}"
+                if self.state == "CONNECTING" and connecting_age is not None and connecting_age > 20:
+                    health = "ERROR"
+                    reason = "required Binance websocket channel did not connect within 20 seconds"
             elif not self.history_loaded:
                 health, reason = "LOADING_HISTORY", "completed-candle history has not loaded"
             elif not self.reconciliation_complete or unresolved:
@@ -451,6 +457,32 @@ class PriceActionPublicStream:
             else:
                 health, reason = "SYNCHRONIZED", "candles, bid/ask and mark are reconciled and fresh"
             reliable = health == "SYNCHRONIZED"
+            if not self.history_loaded:
+                failing_dependency = "BINANCE_USDM_REST_HISTORY"
+            elif self._channel_states.get("market") != "CONNECTED":
+                failing_dependency = "BINANCE_USDM_MARKET_WEBSOCKET"
+            elif self._channel_states.get("public") != "CONNECTED":
+                failing_dependency = "BINANCE_USDM_BOOK_TICKER_WEBSOCKET"
+            elif not self.reconciliation_complete or unresolved:
+                failing_dependency = "COMPLETED_CANDLE_RECONCILIATION"
+            elif health == "STALE_CANDLES":
+                failing_dependency = "BINANCE_USDM_KLINE_STREAM"
+            elif health == "STALE_QUOTE":
+                failing_dependency = "BINANCE_USDM_BOOK_TICKER_STREAM"
+            elif health == "STALE_MARK":
+                failing_dependency = "BINANCE_USDM_MARK_PRICE_STREAM"
+            elif health == "QUOTE_MISMATCH":
+                failing_dependency = "CANDLE_QUOTE_MARK_RECONCILIATION"
+            else:
+                failing_dependency = None
+            successful = [
+                ("closed_candle", self.last_closed_update),
+                ("kline", self.last_candle_update),
+                ("bid_ask", self.last_quote_update),
+                ("mark_price", self.last_mark_update),
+            ]
+            successful = [(name, stamp) for name, stamp in successful if stamp is not None]
+            latest_success = max(successful, key=lambda row: row[1]) if successful else None
             payload = {"state": health, "transport_state": self.state,
                     "health_reason": reason, "reliable": reliable, "new_entries_paused": not reliable,
                     "symbol": self.symbol, "timeframe": self.timeframe,
@@ -471,6 +503,17 @@ class PriceActionPublicStream:
                     "unresolved_missing_candles": unresolved,
                     "candle_quote_deviation_bps": mismatch_bps,
                     "reconnect_attempt": self.reconnect_attempt,
+                    "retry_state": {
+                        "attempt": self.reconnect_attempt,
+                        "channel_attempts": dict(self._reconnect_attempts),
+                        "maximum_backoff_seconds": 30,
+                        "automatic_retry": not self._stop.is_set(),
+                    },
+                    "connecting_age_seconds": connecting_age,
+                    "failing_dependency": failing_dependency,
+                    "last_successful_event": ({
+                        "kind": latest_success[0], "at": latest_success[1].isoformat(),
+                    } if latest_success else None),
                     "transport_channels": dict(self._channel_states),
                     "transport_errors": dict(self._channel_errors),
                     "duplicate_events": self.duplicate_events, "missing_candles": self.missing_candles,

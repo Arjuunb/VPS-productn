@@ -23,6 +23,15 @@ from services.native_price_action import (
 )
 from services.price_action_governance import PriceActionJournalStore
 from services.price_action_stream import PriceActionPublicStream
+from services.lab_lifecycle import (
+    blockers as lifecycle_blockers,
+    correlation_id as make_correlation_id,
+    decision_idempotency_key,
+    journal_performance,
+    json_text,
+    lifecycle_state,
+    paper_performance,
+)
 
 
 def _iso() -> str:
@@ -107,6 +116,16 @@ class PriceActionPaperAccount:
                 source_proposal_id TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL, payload TEXT NOT NULL,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+              CREATE TABLE IF NOT EXISTS pa_evaluations(
+                correlation_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL, candle_time TEXT NOT NULL,
+                symbol TEXT NOT NULL, timeframe TEXT NOT NULL,
+                strategy_id TEXT NOT NULL, strategy_version TEXT NOT NULL,
+                state TEXT NOT NULL, reason TEXT NOT NULL,
+                missing_conditions_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                UNIQUE(session_id,idempotency_key));
             """)
             session_columns = {row[1] for row in self._db.execute("PRAGMA table_info(pa_sessions)")}
             for name, ddl in (
@@ -493,6 +512,12 @@ class PriceActionPaperAccount:
             funding = [dict(row) for row in self._db.execute(
                 "SELECT * FROM pa_funding_events WHERE session_id=? ORDER BY funding_time DESC",
                 (current.get("id", ""),))]
+            evaluations = [{**dict(row),
+                            "missing_conditions": json.loads(row["missing_conditions_json"]),
+                            "payload": json.loads(row["payload_json"])}
+                           for row in self._db.execute(
+                "SELECT * FROM pa_evaluations WHERE session_id=? ORDER BY candle_time DESC LIMIT 500",
+                (current.get("id", ""),))]
         return {
             "account_scope": "PRICE_ACTION_VISUAL_LAB_ONLY",
             "currency": "USDT",
@@ -508,8 +533,79 @@ class PriceActionPaperAccount:
             "order_metadata": [{**row, "config": json.loads(row["config_json"])} for row in metadata],
             "activity": [{**row, "payload": json.loads(row["payload"])} for row in activity],
             "funding_events": funding,
+            "evaluations": evaluations,
             "order_audit": self.audit_pending_orders(),
         }
+
+    def record_evaluation(self, visual_state: dict, candle: Bar,
+                          feed_status: dict) -> dict:
+        """Persist exactly one saved-strategy decision for a confirmed candle."""
+        current = self.session()
+        config = self._execution_config()
+        candle_time = candle.timestamp.isoformat()
+        corr = make_correlation_id(
+            lab="PA", session_id=current["id"], strategy_id=config.strategy_id,
+            symbol=current["symbol"], timeframe=current["timeframe"],
+            candle_time=candle_time,
+        )
+        idempotency = decision_idempotency_key(
+            strategy_id=config.strategy_id, symbol=current["symbol"],
+            timeframe=current["timeframe"], candle_time=candle_time,
+        )
+        existing = self._db.execute(
+            "SELECT * FROM pa_evaluations WHERE session_id=? AND idempotency_key=?",
+            (current["id"], idempotency),
+        ).fetchone()
+        if existing:
+            return dict(existing)
+        snapshot = visual_state.get("snapshot") or {}
+        traces = [row for row in snapshot.get("strategy_traces", [])
+                  if row.get("strategy_id") == config.strategy_id]
+        proposals = [row for row in visual_state.get("proposals", [])
+                     if row.get("strategy_id") == config.strategy_id and
+                     (not row.get("signal_at") or str(row.get("signal_at")) == candle_time)]
+        selected = min(traces, key=lambda row: len(row.get("missing_conditions", []))) if traces else {}
+        missing = list(selected.get("missing_conditions") or [])
+        state = "SIGNAL_FOUND" if proposals else "WATCHING"
+        reason = ("native closed-candle proposal found" if proposals else
+                  selected.get("next_required_event") or "no eligible setup on this closed candle")
+        payload = {
+            "closed_candle": _candle(candle), "trace": selected,
+            "proposal_ids": [row.get("id") for row in proposals],
+            "feed_state": feed_status.get("state"),
+            "feed_reason": feed_status.get("health_reason"),
+            "saved_execution_config": asdict(config),
+        }
+        now = _iso()
+        self._db.execute(
+            "INSERT INTO pa_evaluations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (corr, current["id"], idempotency, candle_time, current["symbol"],
+             current["timeframe"], config.strategy_id, PRICE_ACTION_STRATEGY_VERSION,
+             state, str(reason), json_text(missing), json_text(payload), now, now),
+        )
+        self._audit("closed_candle_decision", symbol=current["symbol"],
+                    strategy_id=config.strategy_id, object_id=corr,
+                    payload={"correlation_id": corr, "idempotency_key": idempotency,
+                             "state": state, "reason": reason,
+                             "missing_conditions": missing, "candle_time": candle_time})
+        return dict(self._db.execute(
+            "SELECT * FROM pa_evaluations WHERE correlation_id=?", (corr,)).fetchone())
+
+    def _advance_evaluation(self, correlation_id: str | None, state: str,
+                            reason: str, **evidence) -> None:
+        if not correlation_id:
+            return
+        row = self._db.execute(
+            "SELECT payload_json FROM pa_evaluations WHERE correlation_id=?", (correlation_id,)).fetchone()
+        if not row:
+            return
+        payload = json.loads(row["payload_json"] or "{}")
+        payload.setdefault("lifecycle", []).append({"state": state, "reason": reason,
+                                                     "at": _iso(), **evidence})
+        self._db.execute(
+            "UPDATE pa_evaluations SET state=?,reason=?,payload_json=?,updated_at=? WHERE correlation_id=?",
+            (state, reason, json_text(payload), _iso(), correlation_id),
+        )
 
     def _positions_with_protection(self) -> list[dict]:
         current = self.session()
@@ -585,7 +681,7 @@ class PriceActionPaperAccount:
             self.broker.factory_reset(self.starting_balance)
             self.journal.factory_reset()
             now, new_id = _iso(), uuid.uuid4().hex
-            for table in ("pa_order_meta", "pa_candidates", "pa_funding_events", "pa_activity", "pa_sessions"):
+            for table in ("pa_evaluations", "pa_order_meta", "pa_candidates", "pa_funding_events", "pa_activity", "pa_sessions"):
                 self._db.execute(f"DELETE FROM {table}")
             self._db.execute(
                 "INSERT INTO pa_sessions(id,started_at,starting_balance,status,updated_at) VALUES (?,?,?,?,?)",
@@ -756,10 +852,13 @@ class PriceActionPaperAccount:
         return None
 
     def _candidate(self, proposal: dict, setup: dict, rules: dict, status: str,
-                   reason: str, config: PaperExecutionConfig) -> dict:
+                   reason: str, config: PaperExecutionConfig, *,
+                   correlation_id: str | None = None,
+                   idempotency_key: str | None = None) -> dict:
         current, now = self.session(), _iso()
         payload = {"proposal": proposal, "setup": setup, "rules": rules,
-                   "execution_config": asdict(config), "reason": reason}
+                   "execution_config": asdict(config), "reason": reason,
+                   "correlation_id": correlation_id, "idempotency_key": idempotency_key}
         candidate_id = f"{current['id']}:{proposal['id']}"
         self._db.execute(
             "INSERT OR IGNORE INTO pa_candidates(proposal_id,session_id,source_proposal_id,status,payload,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
@@ -772,7 +871,9 @@ class PriceActionPaperAccount:
         return payload
 
     def _place_proposal(self, proposal: dict, setup: dict, rules: dict,
-                        config: PaperExecutionConfig, *, source: str) -> dict:
+                        config: PaperExecutionConfig, *, source: str,
+                        correlation_id: str | None = None,
+                        idempotency_key: str | None = None) -> dict:
         current = self.session()
         zone_id = str(setup.get("zone_id") or "NO_ZONE")
         duplicate = self._db.execute(
@@ -781,14 +882,18 @@ class PriceActionPaperAccount:
         ).fetchone()
         if duplicate:
             reason = "duplicate trade blocked for the same session, zone and direction"
-            self._candidate(proposal, setup, rules, "REJECTED", reason, config)
+            self._candidate(proposal, setup, rules, "REJECTED", reason, config,
+                            correlation_id=correlation_id, idempotency_key=idempotency_key)
+            self._advance_evaluation(correlation_id, "RISK_REJECTED", reason)
             return {"accepted": False, "reason": reason, "duplicate_order_id": duplicate["order_id"]}
         open_entries = [row for row in self.broker.orders()
                         if row.get("status") in OPEN_BROKER_ORDER_STATUSES and not row.get("reduce_only")]
         if self.broker.positions() or open_entries:
             reason = ("another Price Action entry or protected position is already active; "
                       "same-symbol stacking is blocked so stop, target and R:R ownership cannot be overwritten")
-            self._candidate(proposal, setup, rules, "REJECTED", reason, config)
+            self._candidate(proposal, setup, rules, "REJECTED", reason, config,
+                            correlation_id=correlation_id, idempotency_key=idempotency_key)
+            self._advance_evaluation(correlation_id, "RISK_REJECTED", reason)
             return {"accepted": False, "reason": reason}
         account = self.broker.account()
         risk_pct = min(config.risk_pct, config.max_risk_pct)
@@ -800,12 +905,16 @@ class PriceActionPaperAccount:
             open_risk += float(json.loads(row["config_json"]).get("risk_amount") or 0)
         if open_risk + risk_amount > account["equity"] * config.max_concurrent_risk_pct / 100 + 1e-9:
             reason = "maximum concurrent paper risk would be exceeded"
-            self._candidate(proposal, setup, rules, "REJECTED", reason, config)
+            self._candidate(proposal, setup, rules, "REJECTED", reason, config,
+                            correlation_id=correlation_id, idempotency_key=idempotency_key)
+            self._advance_evaluation(correlation_id, "RISK_REJECTED", reason)
             return {"accepted": False, "reason": reason}
         risk_distance = abs(float(proposal["entry"]) - float(proposal["stop"]))
         if risk_distance <= 0:
             reason = "entry-to-stop distance is not positive"
-            self._candidate(proposal, setup, rules, "REJECTED", reason, config)
+            self._candidate(proposal, setup, rules, "REJECTED", reason, config,
+                            correlation_id=correlation_id, idempotency_key=idempotency_key)
+            self._advance_evaluation(correlation_id, "RISK_REJECTED", reason)
             return {"accepted": False, "reason": reason}
         tick, step = float(rules.get("tick_size") or 0), float(rules.get("quantity_step") or 0)
         is_long = proposal["direction"] == "bullish"
@@ -814,7 +923,9 @@ class PriceActionPaperAccount:
         actual_risk = abs(entry - stop)
         if actual_risk <= 0 or (is_long and stop >= entry) or (not is_long and stop <= entry):
             reason = "rounded entry and protective stop do not form valid directional risk"
-            self._candidate(proposal, setup, rules, "REJECTED", reason, config)
+            self._candidate(proposal, setup, rules, "REJECTED", reason, config,
+                            correlation_id=correlation_id, idempotency_key=idempotency_key)
+            self._advance_evaluation(correlation_id, "RISK_REJECTED", reason)
             return {"accepted": False, "reason": reason}
         target = self._round_step(entry + actual_risk * config.target_r * (1 if is_long else -1), tick,
                                   upward=is_long)
@@ -831,7 +942,9 @@ class PriceActionPaperAccount:
         elif notional < float(rules.get("min_notional") or 0):
             rejection = f"risk-sized notional {notional:.8f} is below contract minimum"
         if rejection:
-            self._candidate(proposal, setup, rules, "REJECTED", rejection, config)
+            self._candidate(proposal, setup, rules, "REJECTED", rejection, config,
+                            correlation_id=correlation_id, idempotency_key=idempotency_key)
+            self._advance_evaluation(correlation_id, "RISK_REJECTED", rejection)
             return {"accepted": False, "reason": rejection}
         order_config = {
             "research_id": "PRICE_ACTION_NATIVE_V1_RESEARCH", "source": source,
@@ -842,6 +955,7 @@ class PriceActionPaperAccount:
             "entry": entry, "stop": stop, "target": target,
             "target_r": config.target_r, "planned_rr": config.target_r,
             "leverage": self.broker.leverage, "execution_mode": "PAPER",
+            "correlation_id": correlation_id, "idempotency_key": idempotency_key,
             "live_execution_allowed": False,
         }
         order = self.broker.submit(symbol=current.get("symbol") or proposal.get("symbol") or "BTCUSDT",
@@ -852,7 +966,7 @@ class PriceActionPaperAccount:
                                    protection_tick_size=tick or None)
         now = _iso()
         self._db.execute(
-            "INSERT INTO pa_order_meta VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO pa_order_meta(order_id,session_id,proposal_id,setup_id,zone_id,direction,strategy_id,config_json,status,reason,created_at,updated_at,valid_until_index) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (order["id"], current["id"], proposal["id"], proposal["setup_id"], zone_id,
              proposal["direction"], proposal["strategy_id"], json.dumps(order_config, sort_keys=True, default=str),
              "ORDER_PENDING", "eligible setup accepted for paper execution", now, now,
@@ -862,6 +976,8 @@ class PriceActionPaperAccount:
                          (now, current["id"], proposal["id"]))
         self._audit("paper_order_accepted", symbol=current.get("symbol", ""),
                     strategy_id=proposal["strategy_id"], object_id=order["id"], payload=order_config)
+        self._advance_evaluation(correlation_id, "ORDER_SUBMITTED",
+                                 "protected paper order submitted", order_id=order["id"])
         self._snapshot_current()
         return {"accepted": True, "order": order, "configuration": order_config}
 
@@ -875,6 +991,14 @@ class PriceActionPaperAccount:
         if not current:
             raise ValueError("no active Price Action session")
         self._assert_native_state_identity(visual_state, current)
+        observed_health = feed_status or {
+            "state": "SYNCHRONIZED" if feed_reliable else "DATA_PAUSED",
+            "health_reason": "caller supplied only the reliability boundary",
+            "reliable": feed_reliable,
+        }
+        evaluation = self.record_evaluation(visual_state, candle, observed_health)
+        correlation = evaluation["correlation_id"]
+        idempotency = evaluation["idempotency_key"]
         proposals = {row["id"]: row for row in visual_state.get("proposals", [])}
         setups = {row["id"]: row for row in visual_state.get("setups", [])}
         reconciliation = self.reconcile_pending_orders(
@@ -916,21 +1040,36 @@ class PriceActionPaperAccount:
             for event in result["events"]:
                 meta = self._db.execute("SELECT * FROM pa_order_meta WHERE order_id=?", (event.get("order_id"),)).fetchone()
                 if meta:
+                    meta_config = json.loads(meta["config_json"] or "{}")
+                    meta_correlation = meta_config.get("correlation_id")
                     order = self.broker.order(meta["order_id"])
                     status = "ENTERED" if order["status"] == "filled" else "PARTIALLY_FILLED"
                     self._db.execute("UPDATE pa_order_meta SET status=?,reason=?,updated_at=? WHERE order_id=?",
                                      (status, "paper fill simulated from verified market data", _iso(), meta["order_id"]))
                     self._audit("paper_order_filled", strategy_id=meta["strategy_id"], object_id=meta["order_id"],
-                                payload={**event, "execution_quote": quote_evidence})
+                                payload={**event, "execution_quote": quote_evidence,
+                                         "correlation_id": meta_correlation})
+                    self._advance_evaluation(meta_correlation, "FILLED",
+                                             "paper order filled from a verified closed candle",
+                                             order_id=meta["order_id"], fill=event)
+                    if status == "ENTERED":
+                        self._advance_evaluation(meta_correlation, "POSITION_OPEN",
+                                                 "protected Price Action paper position opened",
+                                                 order_id=meta["order_id"])
                 elif str(event.get("order_id", "")).startswith("protective-"):
                     owning = self._db.execute(
-                        "SELECT order_id,strategy_id FROM pa_order_meta WHERE session_id=? AND status='ENTERED' ORDER BY created_at DESC LIMIT 1",
+                        "SELECT order_id,strategy_id,config_json FROM pa_order_meta WHERE session_id=? AND status='ENTERED' ORDER BY created_at DESC LIMIT 1",
                         (current["id"],)).fetchone()
                     self._audit("paper_position_completed",
                                 strategy_id=owning["strategy_id"] if owning else "",
                                 object_id=owning["order_id"] if owning else event["order_id"],
                                 payload={**event, "execution_quote": quote_evidence,
                                          "broker_event_order_id": event["order_id"]})
+                    owning_config = json.loads(owning["config_json"] or "{}") if owning else {}
+                    self._advance_evaluation(
+                        owning_config.get("correlation_id"),
+                        "EXITED", "protective paper exit completed",
+                        broker_event_order_id=event["order_id"], fill=event)
                     self._db.execute(
                         "UPDATE pa_order_meta SET status='COMPLETED',reason=?,updated_at=? WHERE session_id=? AND status='ENTERED'",
                         ("protective stop or fixed 2.5R target completed the paper position",
@@ -949,36 +1088,44 @@ class PriceActionPaperAccount:
                 attestation_error = self._proposal_attestation_error(proposal, setup, config)
                 if attestation_error:
                     self._candidate(proposal, setup, contract_rules, "REJECTED",
-                                    attestation_error, config)
+                                    attestation_error, config, correlation_id=correlation,
+                                    idempotency_key=idempotency)
+                    self._advance_evaluation(correlation, "RISK_REJECTED", attestation_error)
                     rejected.append({"proposal_id": proposal["id"],
                                      "reason": attestation_error})
                 elif not feed_reliable:
                     self._candidate(proposal, setup, contract_rules, "DATA_PAUSED",
-                                    "new entry paused because market feed is unreliable", config)
+                                    "new entry paused because market feed is unreliable", config,
+                                    correlation_id=correlation, idempotency_key=idempotency)
+                    self._advance_evaluation(correlation, "RISK_REJECTED",
+                                             "new entry paused because market feed is unreliable")
                     rejected.append({"proposal_id": proposal["id"], "reason": "feed unreliable"})
                 elif config.operating_mode == "signals_only":
-                    self._candidate(proposal, setup, contract_rules, "SIGNAL_ONLY", "signals-only mode does not create an order", config)
+                    self._candidate(proposal, setup, contract_rules, "SIGNAL_ONLY", "signals-only mode does not create an order", config,
+                                    correlation_id=correlation, idempotency_key=idempotency)
                 elif config.operating_mode == "manual_approval":
-                    self._candidate(proposal, setup, contract_rules, "PENDING_APPROVAL", "waiting for explicit paper-order approval", config)
+                    self._candidate(proposal, setup, contract_rules, "PENDING_APPROVAL", "waiting for explicit paper-order approval", config,
+                                    correlation_id=correlation, idempotency_key=idempotency)
                 elif config.operating_mode == "automatic":
                     try:
                         placed = self._place_proposal(
-                            proposal, setup, contract_rules, config, source="automatic")
+                            proposal, setup, contract_rules, config, source="automatic",
+                            correlation_id=correlation, idempotency_key=idempotency)
                     except (ValueError, RuntimeError) as exc:
                         reason = f"automatic paper placement rejected: {exc}"
-                        self._candidate(proposal, setup, contract_rules, "REJECTED", reason, config)
+                        self._candidate(proposal, setup, contract_rules, "REJECTED", reason, config,
+                                        correlation_id=correlation, idempotency_key=idempotency)
+                        self._advance_evaluation(correlation, "RISK_REJECTED", reason)
                         placed = {"accepted": False, "proposal_id": proposal["id"],
                                   "reason": reason}
                     (created if placed["accepted"] else rejected).append(placed)
                 else:
                     reason = "saved Price Action operating mode is invalid; execution failed closed"
-                    self._candidate(proposal, setup, contract_rules, "DATA_PAUSED", reason, config)
+                    self._candidate(proposal, setup, contract_rules, "DATA_PAUSED", reason, config,
+                                    correlation_id=correlation, idempotency_key=idempotency)
+                    self._advance_evaluation(correlation, "RISK_REJECTED", reason)
                     rejected.append({"proposal_id": proposal["id"], "reason": reason})
             self._snapshot_current(metrics=visual_state.get("metrics", {}))
-        observed_health = feed_status or {
-            "state": "SYNCHRONIZED" if feed_reliable else "DATA_PAUSED",
-            "health_reason": "caller supplied only the reliability boundary",
-        }
         captured = self.journal.capture(
             visual_state=visual_state, session=self._decode_session(dict(current)),
             paper_state=self.state(), feed_status=observed_health,
@@ -1002,7 +1149,9 @@ class PriceActionPaperAccount:
             payload = json.loads(row["payload"])
             config = PaperExecutionConfig(**payload["execution_config"]).validated()
             return self._place_proposal(payload["proposal"], payload["setup"], payload["rules"], config,
-                                        source="manual_approval")
+                                        source="manual_approval",
+                                        correlation_id=payload.get("correlation_id"),
+                                        idempotency_key=payload.get("idempotency_key"))
 
     def apply_funding_once(self, *, symbol: str, funding_time: str,
                            rate: float, mark_price: float) -> dict:
@@ -1388,6 +1537,10 @@ class PriceActionLabRuntime:
             "mark_age_seconds": connection["mark_age_seconds"],
             "closed_candle_age_seconds": connection["closed_candle_age_seconds"],
             "candle_quote_deviation_bps": connection["candle_quote_deviation_bps"],
+            "failing_dependency": connection.get("failing_dependency"),
+            "last_successful_event": connection.get("last_successful_event"),
+            "retry_state": connection.get("retry_state"),
+            "connecting_age_seconds": connection.get("connecting_age_seconds"),
             "new_entries_paused": connection["new_entries_paused"],
             "execution_uses_closed_bars_only": True,
         }
@@ -1412,6 +1565,66 @@ class PriceActionLabRuntime:
             "real_execution_allowed": False,
         }
         return state
+
+    def bot_status(self) -> dict:
+        """One factual, scope-labelled control-plane view for the dashboard."""
+        paper = self.account.state()
+        session = paper.get("session") or {}
+        connection = self.stream.status()
+        evaluations = paper.get("evaluations") or []
+        latest = evaluations[0] if evaluations else None
+        pending = [row for row in paper.get("orders", [])
+                   if row.get("status") in OPEN_BROKER_ORDER_STATUSES]
+        config = session.get("execution_config") or {}
+        blockers = lifecycle_blockers(
+            connection=connection, operating_mode=session.get("operating_mode", "signals_only"),
+            account=paper.get("account") or {}, strategy_valid=bool(config.get("strategy_id")),
+            positions=paper.get("positions") or [], risk_pct=config.get("risk_pct"),
+            max_risk_pct=float(config.get("max_risk_pct") or 1.0))
+        paper_rows = self.account.journal.list(
+            session_id=session.get("id"), partition="paper_forward").get("entries", [])
+        development = self.account.journal.list(partition="development").get("entries", [])
+        validation = self.account.journal.list(partition="validation").get("entries", [])
+        live_performance = paper_performance(
+            fills=paper.get("trades") or [], account=paper.get("account") or {},
+            orders=paper.get("orders") or [],
+            realized_r_values=[row["outcome"].get("net_r") for row in paper_rows
+                               if row.get("outcome", {}).get("net_r") is not None])
+        activity = paper.get("activity") or []
+        return {
+            "lab": "PRICE_ACTION", "account_scope": paper["account_scope"],
+            "scope_label": "Price Action session · isolated paper ledger",
+            "paper_only": True, "real_execution_allowed": False,
+            "strategy": {"id": config.get("strategy_id"),
+                         "version": PRICE_ACTION_STRATEGY_VERSION},
+            "symbol": session.get("symbol"), "timeframe": session.get("timeframe"),
+            "mode": session.get("operating_mode"), "saved_configuration": config,
+            "feed": connection,
+            "decision_state": lifecycle_state(
+                connection_state=connection.get("state", "DISCONNECTED"),
+                reliable=bool(connection.get("reliable")),
+                has_position=bool(paper.get("positions")), has_order=bool(pending),
+                last_decision_state=(latest or {}).get("state")),
+            "execution_state": "ELIGIBLE_ON_CONFIRMED_CLOSED_CANDLE" if not blockers else "BLOCKED",
+            "blockers": blockers,
+            "account": paper.get("account"), "open_positions": len(paper.get("positions") or []),
+            "pending_orders": len(pending), "positions": paper.get("positions") or [],
+            "latest_closed_candle_decision": latest,
+            # A signal remains evidence after its lifecycle advances to an
+            # order, position or exit.  Do not make it disappear merely
+            # because the canonical state is no longer SIGNAL_FOUND.
+            "latest_signal": next((row for row in evaluations
+                                   if (row.get("payload") or {}).get("proposal_ids")), None),
+            "latest_order": (paper.get("order_metadata") or [None])[0],
+            "latest_fill": (paper.get("trades") or [None])[0],
+            "last_heartbeat": connection.get("last_update") or session.get("updated_at"),
+            "latest_activity": activity[0] if activity else None,
+            "performance": {
+                "backtest": journal_performance("BACKTEST", development),
+                "forward_validation": journal_performance("FORWARD_VALIDATION", validation),
+                "live_paper": live_performance,
+            },
+        }
 
     def replay_step(self, symbol: str, timeframe: str, cursor: int, *, limit: int = 3000) -> dict:
         symbol = normalize_symbol(symbol)

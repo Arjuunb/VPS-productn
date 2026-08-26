@@ -284,6 +284,8 @@ class PriceActionJournalStore:
         record = {
             "identity": {
                 "journal_entry_id": _fingerprint([session.get("id"), setup_id], "pa-journal"),
+                "correlation_id": (paper_candidate or {}).get("correlation_id") or
+                    ((paper_candidate or {}).get("payload") or {}).get("correlation_id"),
                 "session_id": session.get("id"), "experiment_id": visual_state.get("metrics_scope", {}).get("experiment_id"),
                 "strategy_family": STRATEGY_FAMILY, "strategy_id": setup.get("strategy_id"),
                 "strategy_name": str(setup.get("strategy_id") or "").replace("_", " "),

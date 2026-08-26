@@ -209,6 +209,12 @@ def smc_paper_account():
     return _smc_paper_state()
 
 
+@router.get("/bot-status")
+def smc_bot_status():
+    """Dashboard-safe status for the isolated SMC paper system."""
+    return _smc_runtime().smc_runtime.bot_status()
+
+
 @router.get("/paper/export")
 def smc_paper_export():
     return _smc_runtime().smc_paper.export_session()

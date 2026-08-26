@@ -18,6 +18,15 @@ from typing import Literal
 
 from data.market_data_v2 import TF_MS, normalize_symbol
 from execution.paper_broker_v2 import OPEN_STATUSES, PaperBrokerV2
+from services.lab_lifecycle import (
+    blockers as lifecycle_blockers,
+    correlation_id as make_correlation_id,
+    decision_idempotency_key,
+    json_text,
+    lifecycle_state,
+    paper_performance,
+    unavailable_performance,
+)
 from services.smc_strategy_v1 import ENTRY_MODELS, STRATEGY_ID, STRATEGY_VERSION
 
 
@@ -109,6 +118,16 @@ class SMCPaperAccount:
               CREATE TABLE IF NOT EXISTS smc_processed_candles(
                 session_id TEXT NOT NULL, symbol TEXT NOT NULL, candle_time TEXT NOT NULL,
                 PRIMARY KEY(session_id,symbol,candle_time));
+              CREATE TABLE IF NOT EXISTS smc_evaluations(
+                correlation_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL, candle_time TEXT NOT NULL,
+                symbol TEXT NOT NULL, timeframe TEXT NOT NULL,
+                strategy_id TEXT NOT NULL, strategy_version TEXT NOT NULL,
+                model_id TEXT NOT NULL, state TEXT NOT NULL, reason TEXT NOT NULL,
+                missing_conditions_json TEXT NOT NULL DEFAULT '[]',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                UNIQUE(session_id,idempotency_key));
               CREATE TABLE IF NOT EXISTS smc_journal_revisions(
                 id TEXT PRIMARY KEY, journal_id TEXT NOT NULL, session_id TEXT NOT NULL,
                 note TEXT NOT NULL, created_at TEXT NOT NULL);
@@ -189,6 +208,11 @@ class SMCPaperAccount:
             "SELECT * FROM smc_candidates WHERE session_id=? ORDER BY created_at DESC", (sid,))]
         funding = [dict(row) for row in self._db.execute(
             "SELECT * FROM smc_funding_events WHERE session_id=? ORDER BY funding_time DESC", (sid,))]
+        evaluations = [{**dict(row),
+                        "missing_conditions": json.loads(row["missing_conditions_json"]),
+                        "payload": json.loads(row["payload_json"])}
+                       for row in self._db.execute(
+            "SELECT * FROM smc_evaluations WHERE session_id=? ORDER BY candle_time DESC LIMIT 500", (sid,))]
         return {
             "research_id": STRATEGY_ID, "strategy_version": STRATEGY_VERSION,
             "account_scope": "SMC_STRATEGY_LAB_ONLY", "currency": "USDT",
@@ -197,8 +221,72 @@ class SMCPaperAccount:
             "account": {**account, "available_margin": account["free_margin"], "open_risk": round(open_risk, 8)},
             "positions": positions, "orders": self.broker.orders(), "trades": self.broker.fills(limit=1000),
             "candidates": candidates, "order_metadata": metadata, "activity": activity,
-            "funding_events": funding,
+            "funding_events": funding, "evaluations": evaluations,
         }
+
+    def record_evaluation(self, evaluation: dict, *, candle_time: str,
+                          feed_status: dict | None = None) -> dict:
+        """Persist one source-strategy decision for one confirmed closed candle."""
+        current = self.session()
+        if not current:
+            raise ValueError("no active SMC paper session")
+        if not candle_time:
+            raise ValueError("SMC evaluation requires a confirmed closed-candle timestamp")
+        corr = make_correlation_id(
+            lab="SMC", session_id=current["id"], strategy_id=current["model_id"],
+            symbol=current["symbol"], timeframe=current["timeframe"], candle_time=candle_time)
+        idempotency = decision_idempotency_key(
+            strategy_id=current["model_id"], symbol=current["symbol"],
+            timeframe=current["timeframe"], candle_time=candle_time)
+        existing = self._db.execute(
+            "SELECT * FROM smc_evaluations WHERE session_id=? AND idempotency_key=?",
+            (current["id"], idempotency)).fetchone()
+        if existing:
+            return dict(existing)
+        signal_found = bool(evaluation.get("state") == "ENTRY_READY" and
+                            evaluation.get("proposal") and evaluation.get("trade_plan"))
+        state = "SIGNAL_FOUND" if signal_found else "WATCHING"
+        reason = ("native closed-candle proposal found" if signal_found else
+                  evaluation.get("next_required_event") or "no eligible setup on this closed candle")
+        missing = list(evaluation.get("missing_conditions") or [])
+        payload = {
+            "source_evaluation": evaluation,
+            "feed_state": (feed_status or {}).get("state"),
+            "feed_reason": (feed_status or {}).get("health_reason"),
+            "saved_configuration": {
+                "operating_mode": current["operating_mode"], "model_id": current["model_id"],
+                "risk_pct": current["risk_pct"], "symbol": current["symbol"],
+                "timeframe": current["timeframe"],
+            },
+        }
+        now = _iso()
+        self._db.execute(
+            "INSERT INTO smc_evaluations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (corr, current["id"], idempotency, candle_time, current["symbol"],
+             current["timeframe"], STRATEGY_ID, STRATEGY_VERSION, current["model_id"],
+             state, str(reason), json_text(missing), json_text(payload), now, now))
+        self._audit("closed_candle_decision", object_id=corr, payload={
+            "correlation_id": corr, "idempotency_key": idempotency,
+            "state": state, "reason": reason, "missing_conditions": missing,
+            "candle_time": candle_time,
+        })
+        return dict(self._db.execute(
+            "SELECT * FROM smc_evaluations WHERE correlation_id=?", (corr,)).fetchone())
+
+    def _advance_evaluation(self, correlation_id: str | None, state: str,
+                            reason: str, **evidence) -> None:
+        if not correlation_id:
+            return
+        row = self._db.execute(
+            "SELECT payload_json FROM smc_evaluations WHERE correlation_id=?", (correlation_id,)).fetchone()
+        if not row:
+            return
+        payload = json.loads(row["payload_json"] or "{}")
+        payload.setdefault("lifecycle", []).append({"state": state, "reason": reason,
+                                                     "at": _iso(), **evidence})
+        self._db.execute(
+            "UPDATE smc_evaluations SET state=?,reason=?,payload_json=?,updated_at=? WHERE correlation_id=?",
+            (state, reason, json_text(payload), _iso(), correlation_id))
 
     def _positions_with_protection(self) -> list[dict]:
         current = self.session()
@@ -353,7 +441,7 @@ class SMCPaperAccount:
         """Clear all SMC operational data for the global protected reset."""
         with self._lock, self._db:
             self.broker.factory_reset(self.starting_balance)
-            for table in ("smc_journal_revisions", "smc_processed_candles", "smc_funding_events", "smc_order_meta",
+            for table in ("smc_journal_revisions", "smc_evaluations", "smc_processed_candles", "smc_funding_events", "smc_order_meta",
                           "smc_candidates", "smc_activity", "smc_sessions"):
                 self._db.execute(f"DELETE FROM {table}")
             self._db.execute("UPDATE smc_settings SET leverage=1 WHERE id=1")
@@ -391,7 +479,8 @@ class SMCPaperAccount:
                      ownership: str = "manual", proposal_id: str | None = None,
                      setup_id: str | None = None, poi_id: str | None = None,
                      model_id: str | None = None, creation_candle: str | None = None,
-                     expiry_candle: str | None = None) -> dict:
+                     expiry_candle: str | None = None,
+                     correlation_id: str | None = None) -> dict:
         current = self.session()
         if not current:
             raise ValueError("no active SMC paper session")
@@ -471,7 +560,9 @@ class SMCPaperAccount:
         now = _iso()
         config = {"reference_price": entry, "stop_loss": protective_stop,
                   "target_1": target_1, "target_2": target_2,
-                  "target_1_r": target_1_r, "target_2_r": target_2_r, "rules": rules}
+                  "target_1_r": target_1_r, "target_2_r": target_2_r, "rules": rules,
+                  "correlation_id": correlation_id, "idempotency_key": idempotency_key,
+                  "execution_mode": "PAPER", "live_execution_allowed": False}
         self._db.execute(
             "INSERT INTO smc_order_meta(order_id,session_id,ownership,idempotency_key,proposal_id,setup_id,poi_id,model_id,model_version,direction,entry,stop,target_1,target_2,risk_pct,creation_candle,expiry_candle,status,reason,config_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (order["id"], current["id"], ownership, idempotency_key, proposal_id, setup_id, poi_id,
@@ -481,7 +572,8 @@ class SMCPaperAccount:
         )
         self._audit("paper_order_created", object_id=order["id"], payload={"ownership": ownership,
                     "quantity": quantity, "entry": entry, "stop": protective_stop,
-                    "target_1": target_1, "target_2": target_2})
+                    "target_1": target_1, "target_2": target_2,
+                    "correlation_id": correlation_id, "idempotency_key": idempotency_key})
         self._snapshot()
         return {"accepted": True, "duplicate": False, "order": order, "paper_only": True,
                 "real_execution_allowed": False}
@@ -522,6 +614,10 @@ class SMCPaperAccount:
             mapped = {"open": "ORDER_PENDING", "triggered": "ORDER_PENDING",
                       "partially_filled": "PARTIALLY_FILLED", "filled": "ENTERED",
                       "cancelled": "CANCELLED", "rejected": "REJECTED"}.get(order["status"], order["status"].upper())
+            # A completed strategy owner remains terminal even though its
+            # original entry order is (correctly) still filled in the broker.
+            if meta["status"] == "COMPLETED" and order["status"] == "filled":
+                mapped = "COMPLETED"
             if mapped != meta["status"]:
                 self._db.execute("UPDATE smc_order_meta SET status=?,reason=?,updated_at=? WHERE order_id=?",
                                  (mapped, f"reconciled from broker status {order['status']}", _iso(), meta["order_id"]))
@@ -673,6 +769,12 @@ class SMCPaperAccount:
             if not parent or parent["ownership"] != "strategy":
                 continue
             config = json.loads(parent["config_json"] or "{}")
+            self._advance_evaluation(
+                config.get("correlation_id"), "FILLED",
+                "SMC paper entry fill recorded", order_id=parent["order_id"], fill=event)
+            self._advance_evaluation(
+                config.get("correlation_id"), "POSITION_OPEN",
+                "protected SMC paper entry filled", order_id=parent["order_id"], fill=event)
             target_1 = config.get("target_1")
             if target_1 is None or self._db.execute(
                     "SELECT 1 FROM smc_order_meta WHERE session_id=? AND idempotency_key=?",
@@ -716,13 +818,46 @@ class SMCPaperAccount:
                                  "target_1": target_1})
         self.reconcile_orders()
         for event in result["events"]:
+            event_parent = self._db.execute(
+                "SELECT config_json FROM smc_order_meta WHERE order_id=?", (event.get("order_id"),)).fetchone()
+            event_config = json.loads(event_parent["config_json"] or "{}") if event_parent else {}
+            if not event_parent and str(event.get("order_id") or "").startswith("protective-"):
+                owner = self._db.execute(
+                    "SELECT order_id,proposal_id,config_json FROM smc_order_meta "
+                    "WHERE session_id=? AND ownership='strategy' "
+                    "AND status='ENTERED' ORDER BY created_at DESC LIMIT 1",
+                    (current["id"],)).fetchone()
+                event_config = json.loads(owner["config_json"] or "{}") if owner else {}
+                self._advance_evaluation(
+                    event_config.get("correlation_id"), "EXITED",
+                    "protective SMC paper exit completed", fill=event)
+                if owner:
+                    exit_ids = list(event_config.get("protective_exit_order_ids") or [])
+                    if event["order_id"] not in exit_ids:
+                        exit_ids.append(event["order_id"])
+                    event_config["protective_exit_order_ids"] = exit_ids
+                    self._db.execute(
+                        "UPDATE smc_order_meta SET status='COMPLETED',reason=?,config_json=?,updated_at=? "
+                        "WHERE order_id=?",
+                        ("protective stop or deterministic target completed the SMC paper position",
+                         json.dumps(event_config, sort_keys=True), _iso(), owner["order_id"]),
+                    )
+                    self._db.execute(
+                        "UPDATE smc_candidates SET status='COMPLETED',reason=?,updated_at=? "
+                        "WHERE session_id=? AND proposal_id=?",
+                        ("protected SMC paper position exited", _iso(), current["id"],
+                         owner["proposal_id"]),
+                    )
             self._audit("paper_fill", object_id=event.get("order_id", ""),
-                        payload={**event, "candle_time": candle_time})
+                        payload={**event, "candle_time": candle_time,
+                                 "correlation_id": event_config.get("correlation_id")})
         self._snapshot()
         return {**result, "duplicate": False, "paper_only": True, "real_execution_allowed": False}
 
     def synchronize_candidate(self, evaluation: dict, *, rules: dict,
-                              reference_price: float, feed_reliable: bool) -> dict:
+                              reference_price: float, feed_reliable: bool,
+                              closed_candle_time: str | None = None,
+                              feed_status: dict | None = None) -> dict:
         """Journal one deterministic M1 decision and enforce the saved mode."""
         current = self.session()
         if not current:
@@ -739,8 +874,21 @@ class SMCPaperAccount:
             raise ValueError("SMC decision identity does not match the active paper session")
         proposal = evaluation.get("proposal")
         plan = evaluation.get("trade_plan")
+        candle_time = str(
+            closed_candle_time or identity.get("selected_candle") or
+            (proposal or {}).get("signal_timestamp") or "")
+        decision = self.record_evaluation(
+            evaluation, candle_time=candle_time,
+            feed_status=feed_status or {
+                "state": "SYNCHRONIZED" if feed_reliable else "DATA_PAUSED",
+                "health_reason": "caller supplied only the reliability boundary",
+                "reliable": feed_reliable,
+            })
+        correlation = decision["correlation_id"]
+        decision_key = decision["idempotency_key"]
         if evaluation.get("state") != "ENTRY_READY" or not proposal or not plan:
             return {"created": False, "reason": evaluation.get("next_required_event", "not ready"),
+                    "correlation_id": correlation, "decision_recorded": True,
                     "real_execution_allowed": False}
         if (normalize_symbol(proposal.get("symbol") or ""), proposal.get("timeframe")) != (
                 normalize_symbol(current.get("symbol") or ""), current.get("timeframe")):
@@ -767,7 +915,8 @@ class SMCPaperAccount:
             status, reason = "APPROVED_AUTOMATIC", "automatic paper mode passed the candidate boundary"
         else:
             status, reason = "DATA_PAUSED", "saved SMC operating mode is invalid; execution failed closed"
-        payload = {"evaluation": evaluation, "rules": rules, "reference_price": reference_price}
+        payload = {"evaluation": evaluation, "rules": rules, "reference_price": reference_price,
+                   "correlation_id": correlation, "idempotency_key": decision_key}
         now = _iso()
         self._db.execute(
             "INSERT INTO smc_candidates VALUES (?,?,?,?,?,?,?,?,?)",
@@ -776,7 +925,10 @@ class SMCPaperAccount:
         )
         self._audit("strategy_candidate_created", object_id=proposal_id,
                     payload={"status": status, "reason": reason,
-                             "native_object_ids": evaluation.get("native_object_ids", [])})
+                             "native_object_ids": evaluation.get("native_object_ids", []),
+                             "correlation_id": correlation, "idempotency_key": decision_key})
+        if status == "DATA_PAUSED":
+            self._advance_evaluation(correlation, "RISK_REJECTED", reason)
         placed = None
         if status == "APPROVED_AUTOMATIC":
             try:
@@ -789,9 +941,11 @@ class SMCPaperAccount:
                     (status, reason, _iso(), proposal_id),
                 )
                 self._audit("paper_order_rejected", object_id=proposal_id,
-                            payload={"reason": reason, "source": "automatic"})
+                            payload={"reason": reason, "source": "automatic",
+                                     "correlation_id": correlation})
+                self._advance_evaluation(correlation, "RISK_REJECTED", reason)
         return {"created": True, "candidate_status": status, "order": placed,
-                "reason": reason,
+                "reason": reason, "correlation_id": correlation,
                 "real_execution_allowed": False}
 
     def _place_candidate(self, payload: dict, proposal_id: str, *, source: str) -> dict:
@@ -807,15 +961,19 @@ class SMCPaperAccount:
             rules=payload["rules"], reference_price=float(payload["reference_price"]),
             risk_pct=float(current["risk_pct"]), stop_loss=normalized(plan["stop"]),
             target_1=normalized(plan["target_1"]), target_2=normalized(plan["target_2"]),
-            idempotency_key=f"strategy:{proposal_id}", ownership="strategy",
+            idempotency_key=payload.get("idempotency_key") or f"strategy:{proposal_id}", ownership="strategy",
             proposal_id=proposal_id, setup_id=proposal.get("setup_id"),
             poi_id=next((object_id for object_id in evaluation.get("native_object_ids", [])
                          if object_id.startswith(("ob-", "fvg-"))), None),
             model_id=evaluation["model"]["id"],
             creation_candle=str(proposal.get("signal_timestamp") or ""),
+            correlation_id=payload.get("correlation_id"),
         )
         self._db.execute("UPDATE smc_candidates SET status='ORDER_CREATED',reason=?,updated_at=? WHERE proposal_id=?",
                          (f"{source} paper order created", _iso(), proposal_id))
+        self._advance_evaluation(payload.get("correlation_id"), "ORDER_SUBMITTED",
+                                 "protected SMC paper order submitted",
+                                 order_id=result["order"]["id"])
         return result
 
     def approve_candidate(self, proposal_id: str) -> dict:
@@ -904,7 +1062,10 @@ class SMCPaperAccount:
                               if row.get("proposal_id") == candidate["proposal_id"]]
             meta = next((row for row in candidate_meta if row.get("ownership") == "strategy"),
                         candidate_meta[0] if candidate_meta else None)
-            fills = [fill for row in candidate_meta for fill in fills_by_order.get(row["order_id"], [])]
+            owned_order_ids = {row["order_id"] for row in candidate_meta}
+            for row in candidate_meta:
+                owned_order_ids.update(row.get("config", {}).get("protective_exit_order_ids") or [])
+            fills = [fill for order_id in owned_order_ids for fill in fills_by_order.get(order_id, [])]
             rows.append({
                 "journal_id": f"smc-journal-{candidate['proposal_id']}",
                 "session_id": candidate["session_id"], "symbol": proposal.get("symbol", state["session"].get("symbol")),
@@ -937,7 +1098,9 @@ class SMCPaperAccount:
     def metrics(self) -> dict:
         current_id = self.session().get("id")
         journal = self.journal(current_id)["journal"] if current_id else []
-        completed = [row for row in journal if row["fills"]]
+        completed = [row for row in journal if row["status"] == "COMPLETED" and
+                     any(abs(float(fill.get("realized_pnl") or 0)) > 1e-12
+                         for fill in row["fills"])]
         wins = [row for row in completed if row["net_pnl"] > 0]
         losses = [row for row in completed if row["net_pnl"] < 0]
         gross_profit = sum(row["net_pnl"] for row in wins)
@@ -973,6 +1136,13 @@ class SMCStrategyLabRuntime:
         self._tick_lock = threading.Lock()
         self._thread = None
         self._stream_identity: tuple[str, str] | None = None
+        self.last_market_health: dict = {
+            "state": "DISCONNECTED", "transport_state": "DISCONNECTED",
+            "health_reason": "SMC market-data runtime has not synchronized",
+            "reliable": False, "new_entries_paused": True,
+            "failing_dependency": "BINANCE_USDM_PUBLIC_STREAMS",
+            "last_successful_event": None,
+        }
         self.stream = None
         if callable(getattr(market, "public_usdm_window", None)):
             from services.price_action_stream import PriceActionPublicStream
@@ -994,7 +1164,9 @@ class SMCStrategyLabRuntime:
         except Exception:
             pass
         if self.stream is None:
-            return reconcile_market_state(visual, rest_quote, timeframe=timeframe), rest_quote
+            reconciled = reconcile_market_state(visual, rest_quote, timeframe=timeframe)
+            self.last_market_health = dict(reconciled.get("live_display") or self.last_market_health)
+            return reconciled, rest_quote
         identity = (normalize_symbol(symbol), timeframe)
         if self._stream_identity != identity:
             self.stream.start(*identity)
@@ -1020,6 +1192,10 @@ class SMCStrategyLabRuntime:
             "health_reason": (status["health_reason"] if histories_match else
                               "websocket and chart completed-candle histories are not reconciled"),
         })
+        if not histories_match:
+            live["state"] = live["connection_state"] = "SYNCING"
+            live["failing_dependency"] = "COMPLETED_CANDLE_RECONCILIATION"
+        self.last_market_health = dict(live)
         visual.setdefault("data_provenance", {}).update({
             "connection_state": live["connection_state"],
             "new_entries_paused": not reliable, "market_data_mode": "LIVE",
@@ -1035,6 +1211,13 @@ class SMCStrategyLabRuntime:
                 if current and current.get("mode") == "LIVE_PAPER":
                     self.tick()
             except Exception as exc:
+                self.last_market_health = {
+                    **self.last_market_health, "state": "ERROR", "transport_state": "ERROR",
+                    "health_reason": f"SMC runtime tick failed: {type(exc).__name__}: {exc}",
+                    "reliable": False, "new_entries_paused": True,
+                    "failing_dependency": "SMC_CLOSED_CANDLE_RUNTIME",
+                    "retry_state": {"automatic_retry": True, "retry_after_seconds": self.poll_seconds},
+                }
                 self.account._audit("paper_runtime_paused", payload={"error": f"{type(exc).__name__}: {exc}",
                                                                       "new_orders_created": 0})
 
@@ -1052,13 +1235,19 @@ class SMCStrategyLabRuntime:
             visual, quote = self.reconcile_visual(
                 visual, symbol=current["symbol"], timeframe=current["timeframe"])
             reliable = bool(visual["live_display"].get("reliable"))
-            processed = (self.account.process_candle(current["symbol"], visual["candles"][-1])
+            closed_candle = visual["candles"][-1]
+            closed_time = getattr(closed_candle, "timestamp", None)
+            if closed_time is None and isinstance(closed_candle, dict):
+                closed_time = closed_candle.get("timestamp")
+            closed_time = closed_time.isoformat() if hasattr(closed_time, "isoformat") else str(closed_time or "")
+            processed = (self.account.process_candle(current["symbol"], closed_candle)
                          if reliable else {"duplicate": False, "events": [], "paused": True,
                                            "reason": visual["live_display"].get("health_reason")})
             candidate = self.account.synchronize_candidate(
                 visual["source_strategy"], rules=rules,
                 reference_price=float((quote or {}).get("mark") or visual["live_display"]["last_price"]),
-                feed_reliable=reliable)
+                feed_reliable=reliable, closed_candle_time=closed_time,
+                feed_status=visual["live_display"])
             funding = self.account.apply_funding_once(
                 symbol=current["symbol"], funding_time=(quote or {}).get("last_funding_time"),
                 rate=float((quote or {}).get("funding_rate") or 0),
@@ -1069,6 +1258,74 @@ class SMCStrategyLabRuntime:
                     "paper_only": True, "real_execution_allowed": False}
         finally:
             self._tick_lock.release()
+
+    def bot_status(self) -> dict:
+        """One factual, scope-labelled control-plane view for the dashboard."""
+        paper = self.account.state()
+        session = paper.get("session") or {}
+        connection = dict(self.last_market_health)
+        if self.stream is not None:
+            raw = self.stream.status()
+            # Keep the reconciler's authoritative state/reason while taking
+            # current transport heartbeat and retry evidence from the stream.
+            connection = {
+                **raw, **connection,
+                "last_successful_event": raw.get("last_successful_event")
+                    or connection.get("last_successful_event"),
+                "retry_state": raw.get("retry_state") or connection.get("retry_state"),
+                "connecting_age_seconds": raw.get("connecting_age_seconds"),
+                "last_update": raw.get("last_update") or connection.get("last_update"),
+            }
+        evaluations = paper.get("evaluations") or []
+        latest = evaluations[0] if evaluations else None
+        pending = [row for row in paper.get("orders", []) if row.get("status") in OPEN_STATUSES]
+        blockers = lifecycle_blockers(
+            connection=connection, operating_mode=session.get("operating_mode", "signals_only"),
+            account=paper.get("account") or {},
+            strategy_valid=(session.get("model_id") in ACTIVE_MODEL_IDS),
+            positions=paper.get("positions") or [], risk_pct=session.get("risk_pct"),
+            max_risk_pct=1.0)
+        fills = paper.get("trades") or []
+        live_performance = paper_performance(
+            fills=fills, account=paper.get("account") or {}, realized_r_values=[],
+            orders=paper.get("orders") or [])
+        activity = paper.get("activity") or []
+        return {
+            "lab": "SMC", "account_scope": paper["account_scope"],
+            "scope_label": "SMC Strategy Lab session · isolated paper ledger",
+            "paper_only": True, "real_execution_allowed": False,
+            "strategy": {"id": STRATEGY_ID, "model_id": session.get("model_id"),
+                         "version": STRATEGY_VERSION},
+            "symbol": session.get("symbol"), "timeframe": session.get("timeframe"),
+            "mode": session.get("operating_mode"),
+            "saved_configuration": {
+                "operating_mode": session.get("operating_mode"),
+                "model_id": session.get("model_id"), "risk_pct": session.get("risk_pct")},
+            "feed": connection,
+            "decision_state": lifecycle_state(
+                connection_state=connection.get("state", "DISCONNECTED"),
+                reliable=bool(connection.get("reliable")),
+                has_position=bool(paper.get("positions")), has_order=bool(pending),
+                last_decision_state=(latest or {}).get("state")),
+            "execution_state": "ELIGIBLE_ON_CONFIRMED_CLOSED_CANDLE" if not blockers else "BLOCKED",
+            "blockers": blockers,
+            "account": paper.get("account"), "open_positions": len(paper.get("positions") or []),
+            "pending_orders": len(pending), "positions": paper.get("positions") or [],
+            "latest_closed_candle_decision": latest,
+            "latest_signal": next((row for row in evaluations
+                                   if (row.get("payload") or {}).get("source_evaluation", {}).get("state") == "ENTRY_READY"), None),
+            "latest_order": (paper.get("order_metadata") or [None])[0],
+            "latest_fill": (fills or [None])[0],
+            "last_heartbeat": connection.get("last_update") or session.get("updated_at"),
+            "latest_activity": activity[0] if activity else None,
+            "performance": {
+                "backtest": unavailable_performance(
+                    "BACKTEST", "No normalized SMC backtest ledger is attached to this live-paper session"),
+                "forward_validation": unavailable_performance(
+                    "FORWARD_VALIDATION", "No normalized SMC forward-validation ledger is attached to this live-paper session"),
+                "live_paper": live_performance,
+            },
+        }
 
     def stop(self) -> None:
         self._stop.set()
@@ -1100,7 +1357,10 @@ class SMCStrategyLabRuntime:
             processed = self.account.process_candle(current["symbol"], bar)
             decision = evaluate(engine, current["model_id"], candle_at=bar.timestamp)
             candidate = self.account.synchronize_candidate(
-                decision, rules=rules, reference_price=float(bar.close), feed_reliable=True)
+                decision, rules=rules, reference_price=float(bar.close), feed_reliable=True,
+                closed_candle_time=bar.timestamp.isoformat(),
+                feed_status={"state": "SYNCHRONIZED", "reliable": True,
+                             "health_reason": "deterministic historical replay"})
             results.append({"candle": bar.timestamp.isoformat(), "processed": processed,
                             "candidate": candidate, "decision_state": decision["state"]})
         self.account.advance_replay_cursor(current["id"], end)

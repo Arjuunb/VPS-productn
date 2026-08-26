@@ -569,6 +569,46 @@ export async function mockApi(page: Page) {
           session_id: paPaper.session.id, mode: paPaper.session.mode ?? "LIVE_PAPER", symbol, timeframe };
         return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(chart) });
       }
+      if (url.pathname.endsWith("/research/price-action/bot-status")) {
+        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+          lab: "PRICE_ACTION", account_scope: "PRICE_ACTION_VISUAL_LAB_ONLY",
+          scope_label: "Price Action session · isolated paper ledger", paper_only: true,
+          real_execution_allowed: false, strategy: { id: "PA1_SR_REJECTION", version: "1.1.0" },
+          symbol: "BTCUSDT", timeframe: "5m", mode: "automatic", saved_configuration: {},
+          feed: { state: "SYNCHRONIZED", reliable: true, health_reason: "reconciled",
+            last_successful_event: { kind: "mark_price", at: "2026-08-24T21:30:00Z" }, retry_state: { attempt: 0 } },
+          decision_state: "POSITION_OPEN", execution_state: "ELIGIBLE_ON_CONFIRMED_CLOSED_CANDLE",
+          blockers: [], account: { balance: 9932.58, equity: 9935.17, realized_pnl: -67.42, unrealized_pnl: 2.59 },
+          open_positions: 1, pending_orders: 0, positions: [],
+          latest_closed_candle_decision: { correlation_id: "pa-corr", state: "POSITION_OPEN",
+            candle_time: "2026-08-24T21:30:00Z", reason: "protected paper entry filled", missing_conditions: [] },
+          latest_signal: { correlation_id: "pa-corr" }, latest_order: { order_id: "pa-order", status: "ENTERED" },
+          latest_fill: { order_id: "pa-order", created_at: "2026-08-24T21:30:01Z" },
+          last_heartbeat: "2026-08-24T21:30:02Z", performance: {
+            backtest: { scope: "BACKTEST", closed_trades: 10, win_rate: .5, profit_factor: 1.1, average_realized_rr: .2 },
+            forward_validation: { scope: "FORWARD_VALIDATION", closed_trades: 2, win_rate: .5, profit_factor: 1, average_realized_rr: 0 },
+            live_paper: { scope: "LIVE_PAPER", closed_trades: 19, win_rate: .42, profit_factor: .8, average_realized_rr: -.2, maximum_drawdown: 75 },
+          },
+        }) });
+      }
+      if (url.pathname.endsWith("/research/smc/bot-status")) {
+        return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+          lab: "SMC", account_scope: "SMC_STRATEGY_LAB_ONLY",
+          scope_label: "SMC Strategy Lab session · isolated paper ledger", paper_only: true,
+          real_execution_allowed: false, strategy: { id: "SMC_SOURCE_V1", model_id: "SMC_M1_SWEEP_REVERSAL", version: "1.0.0" },
+          symbol: "BTCUSDT", timeframe: "5m", mode: "signals_only", saved_configuration: {},
+          feed: { state: "SYNCING", reliable: false, health_reason: "candle histories differ",
+            failing_dependency: "COMPLETED_CANDLE_RECONCILIATION", retry_state: { attempt: 2 } },
+          decision_state: "SYNCING", execution_state: "BLOCKED",
+          blockers: ["market data is not synchronized", "saved operating mode is not Automatic paper"],
+          account: { balance: 10000, equity: 10000, realized_pnl: 0, unrealized_pnl: 0 },
+          open_positions: 0, pending_orders: 0, positions: [], latest_closed_candle_decision: null,
+          latest_signal: null, latest_order: null, latest_fill: null, last_heartbeat: null,
+          performance: { backtest: { available: false, reason: "not attached" },
+            forward_validation: { available: false, reason: "not attached" },
+            live_paper: { closed_trades: 0, win_rate: null, profit_factor: null, average_realized_rr: null, maximum_drawdown: 0 } },
+        }) });
+      }
       if (url.pathname.endsWith("/research/smc/live-chart")) {
         return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(SMC_CHART) });
       }

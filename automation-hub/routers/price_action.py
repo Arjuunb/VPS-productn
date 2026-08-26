@@ -151,6 +151,12 @@ def paper_account():
     return _paper_state()
 
 
+@router.get("/bot-status")
+def bot_status():
+    """Dashboard-safe status for the isolated Price Action paper system."""
+    return _wa.price_action_runtime.bot_status()
+
+
 @router.get("/paper/export")
 def export_paper_account():
     return {"exported_at": datetime.now(timezone.utc).isoformat(),

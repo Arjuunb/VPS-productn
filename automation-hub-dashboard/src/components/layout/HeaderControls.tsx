@@ -137,6 +137,7 @@ export default function HeaderControls() {
   const engineState = !selected ? "stopped" : riskBlocked ? "risk blocked" : dataDegraded && selected.state === "running" ? "degraded" : selected.state;
   const stateDot = engineState === "running" || engineState === "ready" ? "online" : ["paused", "starting", "bootstrapping", "warming", "syncing", "recovering", "data_stale"].includes(engineState) ? "warn" : "offline";
   const modeLabel = selected?.mode === "research" ? "RESEARCH" : "PAPER";
+  const independentLabPage = /#\/(price-action-lab|smc-strategy-lab)(?:\?|$)/.test(window.location.hash);
   const strategyVersion = selected ? `${selected.strategy_label} ${selected.strategy_version}` : "Strategy";
   const maxQuickRisk = (options.data?.execution_defaults?.max_quick_risk_pct ?? 0.01) * 100;
 
@@ -164,7 +165,9 @@ export default function HeaderControls() {
   const runCommand = async (command: Command) => { setPalette(false); setQuery(""); await command.run(); };
 
   return <>
-    <div className="hdr-controls" ref={root} aria-label="Quick trading controls" aria-busy={busy}>
+    <div className="hdr-controls" ref={root}
+      aria-label={independentLabPage ? "Global Trading Instance controls; independent lab status is shown in the page" : "Quick trading controls"}
+      aria-busy={busy}>
       <div className="hdr-seg">
         <Chip menu="mode" open={open} setOpen={setOpen}><span className="dot online" /><b>{modeLabel}</b></Chip>
         {open === "mode" && <Popover label="Trading mode">
@@ -238,7 +241,7 @@ export default function HeaderControls() {
       </div>
 
       <div className="hdr-seg quick-engine">
-        <Chip menu="engine" open={open} setOpen={setOpen}><span className={`dot ${stateDot}`} /><b className="state-label">{engineState}</b></Chip>
+        <Chip menu="engine" open={open} setOpen={setOpen}><span className={`dot ${stateDot}`} /><b className="state-label">{independentLabPage ? `Global ${engineState}` : engineState}</b></Chip>
         {open === "engine" && <Popover label="Engine lifecycle">
           <p className="hdr-pop-title">Actual worker lifecycle</p>
           <button className="hdr-item" disabled={busy || !selected || !["stopped", "error", "created"].includes(selected.state)} onClick={() => void lifecycle("start")}><b>Start</b></button>

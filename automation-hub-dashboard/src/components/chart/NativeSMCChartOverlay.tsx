@@ -31,6 +31,9 @@ export interface NativeSMCChartState {
     last_funding_time?: string | null; next_funding_time?: string | null; connection_state?: string; new_entries_paused?: boolean;
     health_reason?: string; quote_age_seconds?: number | null; mark_age_seconds?: number | null;
     candle_quote_deviation_bps?: number | null; reliable?: boolean; quote_source?: string;
+    failing_dependency?: string | null;
+    last_successful_event?: { kind: string; at: string } | null;
+    retry_state?: { attempt?: number; automatic_retry?: boolean };
     price_updated_at?: string; source_mode?: "exchange_ohlcv_live_poll";
     execution_uses_closed_bars_only: true;
   };
