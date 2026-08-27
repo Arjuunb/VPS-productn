@@ -11,6 +11,11 @@ services:
       HUB_ENV: production
       HUB_DATA_DIR: /var/lib/tradexa
       PORT: "8000"
+      # Runtime metadata is explicit as well as baked into the image. This
+      # prevents an empty value from env_file from masking the deployed build.
+      GIT_COMMIT: ${GIT_COMMIT:-unknown}
+      GIT_BRANCH: ${GIT_BRANCH:-unknown}
+      DEPLOYED_AT: ${DEPLOYED_AT:-unknown}
     volumes:
       - tradexa-data:/var/lib/tradexa
     restart: unless-stopped

@@ -168,3 +168,21 @@ def test_conftest_extends_sys_path_and_that_is_why_this_file_exists():
     conftest = ROOT / "automation-hub" / "conftest.py"
     assert conftest.is_file(), "the backend conftest moved — re-check this trap"
     assert "sys.path" in conftest.read_text()
+
+
+def test_vps_deploy_exports_runtime_revision_metadata():
+    """The public health response must identify the checkout actually shipped.
+
+    ``env_file`` values override image ``ENV`` values, including with an empty
+    string.  Guard both halves of the fix: the deploy path derives authoritative
+    values, and Compose passes them explicitly after loading ``.env``.
+    """
+    deploy = (ROOT / "scripts" / "deploy.sh").read_text()
+    compose = (ROOT / "compose.yaml").read_text()
+
+    assert "git rev-parse HEAD" in deploy
+    assert "git branch --show-current" in deploy
+    assert "date -u +%Y-%m-%dT%H:%M:%SZ" in deploy
+    assert "export GIT_COMMIT GIT_BRANCH DEPLOYED_AT" in deploy
+    for name in ("GIT_COMMIT", "GIT_BRANCH", "DEPLOYED_AT"):
+        assert f"{name}: ${{{name}:-unknown}}" in compose
