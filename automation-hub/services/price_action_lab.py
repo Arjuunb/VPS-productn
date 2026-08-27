@@ -126,6 +126,18 @@ class PriceActionPaperAccount:
                 payload_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                 UNIQUE(session_id,idempotency_key));
+              CREATE TABLE IF NOT EXISTS pa_position_remediations(
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, symbol TEXT NOT NULL,
+                reason_code TEXT NOT NULL, initiated_by TEXT NOT NULL,
+                original_position_json TEXT NOT NULL,
+                market_evidence_json TEXT NOT NULL,
+                close_result_json TEXT NOT NULL,
+                journal_id TEXT NOT NULL, created_at TEXT NOT NULL);
+              CREATE TABLE IF NOT EXISTS pa_runtime_controls(
+                session_id TEXT PRIMARY KEY,
+                readiness_recheck_required INTEGER NOT NULL DEFAULT 0,
+                entry_pause_reason TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL);
             """)
             session_columns = {row[1] for row in self._db.execute("PRAGMA table_info(pa_sessions)")}
             for name, ddl in (
@@ -154,6 +166,14 @@ class PriceActionPaperAccount:
                 self._db.execute(
                     "INSERT INTO pa_sessions(id,started_at,ended_at,starting_balance,status,end_reason,updated_at) VALUES (?,?,?,?,?,?,?)",
                     (uuid.uuid4().hex, _iso(), None, self.starting_balance, "active", None, _iso()),
+                )
+            active_session = self._db.execute(
+                "SELECT id FROM pa_sessions WHERE status='active' ORDER BY started_at DESC LIMIT 1"
+            ).fetchone()
+            if active_session:
+                self._db.execute(
+                    "INSERT OR IGNORE INTO pa_runtime_controls VALUES (?,?,?,?)",
+                    (active_session["id"], 0, "", _iso()),
                 )
             leverage = self._db.execute("SELECT leverage FROM pa_settings WHERE id=1").fetchone()[0]
             self.broker.leverage = float(leverage)
@@ -189,6 +209,156 @@ class PriceActionPaperAccount:
             (uuid.uuid4().hex, sid, kind, symbol, strategy_id, object_id, _iso(),
              json.dumps(payload or {}, sort_keys=True, default=str)),
         )
+
+    def _runtime_control(self) -> dict:
+        session_id = self.session().get("id")
+        if not session_id:
+            return {"readiness_recheck_required": True,
+                    "entry_pause_reason": "no active Price Action session"}
+        self._db.execute(
+            "INSERT OR IGNORE INTO pa_runtime_controls VALUES (?,?,?,?)",
+            (session_id, 0, "", _iso()),
+        )
+        return dict(self._db.execute(
+            "SELECT * FROM pa_runtime_controls WHERE session_id=?", (session_id,)
+        ).fetchone())
+
+    def _set_readiness_recheck(self, required: bool, reason: str) -> dict:
+        session_id = self.session().get("id")
+        if not session_id:
+            raise ValueError("no active Price Action session")
+        self._db.execute(
+            "INSERT INTO pa_runtime_controls(session_id,readiness_recheck_required,entry_pause_reason,updated_at) "
+            "VALUES (?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET "
+            "readiness_recheck_required=excluded.readiness_recheck_required,"
+            "entry_pause_reason=excluded.entry_pause_reason,updated_at=excluded.updated_at",
+            (session_id, int(required), reason, _iso()),
+        )
+        return self._runtime_control()
+
+    def recheck_readiness(self, connection: dict) -> dict:
+        """Re-run every execution gate after destructive PAPER cleanup."""
+        session = self.session()
+        reasons: list[str] = []
+        if connection.get("state") != "SYNCHRONIZED" or not connection.get("reliable"):
+            reasons.append("candles, bid/ask and mark are not synchronized")
+        if session.get("operating_mode") != "automatic":
+            reasons.append("saved Price Action mode is not Automatic Paper")
+        account = self.broker.account()
+        if float(account.get("balance") or 0) <= 0 or float(account.get("equity") or 0) <= 0:
+            reasons.append("paper balance and equity must be positive")
+        positions = self._positions_with_protection()
+        if positions:
+            reasons.append("an unresolved Price Action paper position remains open")
+        pending = [row for row in self.broker.orders()
+                   if row.get("status") in OPEN_BROKER_ORDER_STATUSES]
+        if pending:
+            reasons.append("pending Price Action paper orders must be reconciled")
+        try:
+            execution = self._execution_config()
+            if not 0 < execution.risk_pct <= execution.max_risk_pct:
+                reasons.append("saved Price Action risk configuration is invalid")
+            strategy = json.loads(session.get("strategy_config_json") or "{}")
+            if strategy.get("stop_model", "rejection_extreme") not in {
+                    "rejection_extreme", "pattern", "structural_zone"}:
+                reasons.append("saved Price Action stop-loss model is invalid")
+            if execution.target_r <= 0:
+                reasons.append("saved Price Action exit/target configuration is invalid")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            reasons.append(f"saved strategy or risk configuration is invalid: {exc}")
+        ready = not reasons
+        reason = ("all Price Action readiness gates passed after legacy remediation"
+                  if ready else "; ".join(reasons))
+        control = self._set_readiness_recheck(not ready, reason)
+        self._audit(
+            "legacy_remediation_readiness_recheck",
+            symbol=session.get("symbol", ""),
+            strategy_id=(json.loads(session.get("execution_config_json") or "{}")
+                         .get("strategy_id", "")),
+            payload={"ready": ready, "blockers": reasons,
+                     "connection_state": connection.get("state"),
+                     "operating_mode": session.get("operating_mode"),
+                     "balance": account.get("balance"),
+                     "positions": len(positions), "pending_orders": len(pending),
+                     "execution_resumed_automatically": False,
+                     "real_execution_allowed": False},
+        )
+        return {"ready": ready, "state": "READY" if ready else "BLOCKED",
+                "blockers": reasons, "control": control,
+                "real_execution_allowed": False}
+
+    def remediate_legacy_position(
+            self, symbol: str, *, mark_price: float, market_evidence: dict,
+            initiated_by: str) -> dict:
+        """Archive and close one explicitly confirmed legacy PAPER position."""
+        symbol = normalize_symbol(symbol)
+        session = self.session()
+        if not session or normalize_symbol(session.get("symbol") or "") != symbol:
+            raise ValueError("position symbol does not match the active Price Action session")
+        position = next((row for row in self._positions_with_protection()
+                         if row["symbol"] == symbol), None)
+        if not position:
+            raise ValueError("no open Price Action paper position")
+        if position.get("protection_status") != "LEGACY_UNPROTECTED_REQUIRES_CLOSE_OR_PROTECTION":
+            raise ValueError("only a LEGACY / UNPROTECTED position can use remediation close")
+        if market_evidence.get("state") != "SYNCHRONIZED" or not market_evidence.get("reliable"):
+            raise ValueError("legacy remediation requires synchronized candles, bid/ask and mark")
+        remediation_id = f"pa-remediation-{uuid.uuid4().hex}"
+        self._set_readiness_recheck(
+            True, "legacy remediation completed; readiness gates must be re-run"
+        )
+        self._audit(
+            "legacy_position_remediation_requested", symbol=symbol,
+            object_id=remediation_id,
+            payload={"reason": "LEGACY_POSITION_REMEDIATION",
+                     "original_position": position,
+                     "initiated_by": initiated_by,
+                     "confirmation_required": True,
+                     "execution_paused": True,
+                     "real_execution_allowed": False},
+        )
+        close_result = self.broker.close_position_at_mark(
+            symbol, mark_price, reason="LEGACY_POSITION_REMEDIATION"
+        )
+        journal_id = self.journal.record_legacy_remediation(
+            session=self._decode_session(dict(session)),
+            original_position=position, close_result=close_result,
+            market_evidence=market_evidence,
+            remediation_id=remediation_id, initiated_by=initiated_by,
+        )
+        now = _iso()
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO pa_position_remediations VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (remediation_id, session["id"], symbol,
+                 "LEGACY_POSITION_REMEDIATION", initiated_by,
+                 json_text(position), json_text(market_evidence),
+                 json_text(close_result), journal_id, now),
+            )
+            self._db.execute(
+                "UPDATE pa_order_meta SET status='COMPLETED',reason=?,updated_at=? "
+                "WHERE session_id=? AND status='ENTERED'",
+                ("closed by LEGACY_POSITION_REMEDIATION; historical protection was not inferred",
+                 now, session["id"]),
+            )
+            self._audit(
+                "legacy_position_remediated", symbol=symbol,
+                object_id=remediation_id,
+                payload={"reason": "LEGACY_POSITION_REMEDIATION",
+                         "reference_mark_price": mark_price,
+                         "fill": close_result.get("fill"),
+                         "original_position": position,
+                         "journal_id": journal_id,
+                         "readiness_recheck_required": True,
+                         "execution_resumed_automatically": False,
+                         "real_execution_allowed": False},
+            )
+            self._snapshot_current()
+        return {"remediation_id": remediation_id, "journal_id": journal_id,
+                "close": close_result, "original_position_preserved": True,
+                "readiness_recheck_required": True,
+                "execution_resumed_automatically": False,
+                "real_execution_allowed": False}
 
     def _snapshot_current(self, *, metrics: dict | None = None) -> None:
         current = self.session()
@@ -518,6 +688,13 @@ class PriceActionPaperAccount:
                            for row in self._db.execute(
                 "SELECT * FROM pa_evaluations WHERE session_id=? ORDER BY candle_time DESC LIMIT 500",
                 (current.get("id", ""),))]
+            remediations = [{**dict(row),
+                             "original_position": json.loads(row["original_position_json"]),
+                             "market_evidence": json.loads(row["market_evidence_json"]),
+                             "close_result": json.loads(row["close_result_json"])}
+                            for row in self._db.execute(
+                "SELECT * FROM pa_position_remediations WHERE session_id=? ORDER BY created_at DESC",
+                (current.get("id", ""),))]
         return {
             "account_scope": "PRICE_ACTION_VISUAL_LAB_ONLY",
             "currency": "USDT",
@@ -534,6 +711,8 @@ class PriceActionPaperAccount:
             "activity": [{**row, "payload": json.loads(row["payload"])} for row in activity],
             "funding_events": funding,
             "evaluations": evaluations,
+            "position_remediations": remediations,
+            "entry_control": self._runtime_control(),
             "order_audit": self.audit_pending_orders(),
         }
 
@@ -875,6 +1054,16 @@ class PriceActionPaperAccount:
                         correlation_id: str | None = None,
                         idempotency_key: str | None = None) -> dict:
         current = self.session()
+        control = self._runtime_control()
+        if control.get("readiness_recheck_required"):
+            reason = control.get("entry_pause_reason") or (
+                "Price Action readiness recheck is required before a new paper entry"
+            )
+            self._candidate(proposal, setup, rules, "REJECTED", reason, config,
+                            correlation_id=correlation_id,
+                            idempotency_key=idempotency_key)
+            self._advance_evaluation(correlation_id, "RISK_REJECTED", reason)
+            return {"accepted": False, "reason": reason}
         zone_id = str(setup.get("zone_id") or "NO_ZONE")
         duplicate = self._db.execute(
             "SELECT order_id,status FROM pa_order_meta WHERE session_id=? AND zone_id=? AND direction=?",
@@ -1581,6 +1770,11 @@ class PriceActionLabRuntime:
             account=paper.get("account") or {}, strategy_valid=bool(config.get("strategy_id")),
             positions=paper.get("positions") or [], risk_pct=config.get("risk_pct"),
             max_risk_pct=float(config.get("max_risk_pct") or 1.0))
+        control = paper.get("entry_control") or {}
+        if control.get("readiness_recheck_required"):
+            blockers.append(control.get("entry_pause_reason") or
+                            "Price Action readiness recheck is required")
+        blockers = list(dict.fromkeys(blockers))
         paper_rows = self.account.journal.list(
             session_id=session.get("id"), partition="paper_forward").get("entries", [])
         development = self.account.journal.list(partition="development").get("entries", [])
@@ -1619,12 +1813,54 @@ class PriceActionLabRuntime:
             "latest_fill": (paper.get("trades") or [None])[0],
             "last_heartbeat": connection.get("last_update") or session.get("updated_at"),
             "latest_activity": activity[0] if activity else None,
+            "entry_control": control,
             "performance": {
                 "backtest": journal_performance("BACKTEST", development),
                 "forward_validation": journal_performance("FORWARD_VALIDATION", validation),
                 "live_paper": live_performance,
             },
         }
+
+    def remediate_legacy_position(self, symbol: str, *, initiated_by: str) -> dict:
+        """Close a confirmed legacy PAPER position using only reconciled data."""
+        session = self._assert_session_identity(
+            symbol, self.account.session().get("timeframe") or "5m", "LIVE_PAPER"
+        )
+        self.ensure(session["symbol"], session["timeframe"])
+        connection = self.stream.status()
+        snapshot = self.stream.snapshot()
+        quote = snapshot.get("quote") or {}
+        if connection.get("state") != "SYNCHRONIZED" or not connection.get("reliable"):
+            raise RuntimeError(
+                connection.get("health_reason") or
+                "Price Action market data is not synchronized"
+            )
+        try:
+            bid, ask, mark = (float(quote[key]) for key in ("bid", "ask", "mark"))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("reconciled bid, ask and mark are required") from exc
+        if bid <= 0 or ask < bid or mark <= 0:
+            raise RuntimeError("reconciled bid, ask or mark is invalid")
+        market_evidence = {
+            "state": connection["state"], "reliable": True,
+            "health_reason": connection.get("health_reason"),
+            "bid": bid, "ask": ask, "mark": mark,
+            "last_closed_update": connection.get("last_closed_update"),
+            "last_quote_update": connection.get("last_quote_update"),
+            "last_mark_update": connection.get("last_mark_update"),
+            "source": "Binance USDⓈ-M reconciled public streams",
+            "symbol": session["symbol"], "timeframe": session["timeframe"],
+        }
+        remediation = self.account.remediate_legacy_position(
+            session["symbol"], mark_price=mark,
+            market_evidence=market_evidence, initiated_by=initiated_by,
+        )
+        # Closing exposure never grants execution authority by itself.  This
+        # explicit second pass recalculates the complete readiness boundary.
+        readiness = self.account.recheck_readiness(self.stream.status())
+        return {**remediation, "readiness": readiness,
+                "paper": self.account.state({session["symbol"]: mark}),
+                "real_execution_allowed": False}
 
     def replay_step(self, symbol: str, timeframe: str, cursor: int, *, limit: int = 3000) -> dict:
         symbol = normalize_symbol(symbol)

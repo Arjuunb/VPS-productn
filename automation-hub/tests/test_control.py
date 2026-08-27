@@ -1,6 +1,7 @@
 """Top control bar: preset resolution, real simulation, warning, compare,
 versioning, and the real-data-required guard."""
 import os
+from collections import Counter
 
 import pytest
 
@@ -54,13 +55,28 @@ def test_risk_manager_limits_apply_to_builtin_and_custom():
         assert base["available"] and base["results"]["total_trades"] > 5
         capped = run_simulation(strat, "BTCUSDT", "15m", tuning={"min_score": 0,
                                 "max_trades_per_day": 1}, bars=4000)
-        # a 1-trade/day cap genuinely reduces the count on an intraday timeframe —
-        # proving the limit is enforced (it was previously ignored for built-ins)
-        assert capped["results"]["total_trades"] < base["results"]["total_trades"]
-        # cooldown after a loss also reduces trade count
+        # A daily limit is a per-UTC-day invariant. It may legitimately defer a
+        # setup into a later day, so comparing only the aggregate trade count is
+        # not a correct assertion of the policy.
+        per_day = Counter(
+            trade["entry_time"][:10] for trade in capped["results"]["trades"]
+        )
+        assert per_day and max(per_day.values()) <= 1
+        assert capped["results"]["blocked_count"] > 0
+        assert any(
+            row.get("reason") == "max trades/day reached"
+            for row in capped["results"]["blocked"]
+        )
+        # Cooldown enforcement is proven by a recorded rejected setup. The same
+        # strategy may still take an equal number of later, eligible setups, so
+        # aggregate count alone is not the cooldown invariant either.
         cooled = run_simulation(strat, "BTCUSDT", "15m", tuning={"min_score": 0,
                                 "cooldown_after_loss": 600}, bars=4000)
-        assert cooled["results"]["total_trades"] < base["results"]["total_trades"]
+        assert cooled["results"]["blocked_count"] > 0
+        assert any(
+            row.get("reason") == "cooldown after loss"
+            for row in cooled["results"]["blocked"]
+        )
 
 
 def test_macro_confirmation_drive_the_mtf_gate():
@@ -111,6 +127,17 @@ def client(tmp_path):
     webhook_api.version_store = StrategyVersionStore(str(tmp_path / "v.json"))
     app = FastAPI(); app.include_router(webhook_api.router)
     return TestClient(app)
+
+
+def test_webhook_api_proxy_mutations_delegate_without_shadowing(monkeypatch):
+    """Router test overrides must not persist as proxy-owned global state."""
+    import webhook_api
+    from routers.instances import _wa
+
+    sentinel = object()
+    monkeypatch.setattr(_wa, "instance_manager", sentinel)
+    assert webhook_api.instance_manager is sentinel
+    assert "instance_manager" not in vars(_wa)
 
 
 SECRET = "dev-webhook-secret"

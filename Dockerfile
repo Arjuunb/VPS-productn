@@ -26,6 +26,12 @@ RUN npm run build          # -> /landing/dist
 
 # --- Stage 3: Python backend (serves both builds) ---
 FROM python:3.11-slim
+ARG GIT_COMMIT=""
+ARG GIT_BRANCH=""
+ARG DEPLOYED_AT=""
+ENV GIT_COMMIT=${GIT_COMMIT}
+ENV GIT_BRANCH=${GIT_BRANCH}
+ENV DEPLOYED_AT=${DEPLOYED_AT}
 WORKDIR /app
 RUN addgroup --system tradexa && adduser --system --ingroup tradexa --home /nonexistent tradexa
 COPY --chown=tradexa:tradexa . .

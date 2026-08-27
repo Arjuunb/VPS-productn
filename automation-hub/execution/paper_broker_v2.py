@@ -503,6 +503,70 @@ class PaperBrokerV2:
             self._c.commit()
         return next(p for p in self.positions() if p["symbol"] == symbol.upper())
 
+    def close_position_at_mark(self, symbol: str, mark_price: float, *,
+                               reason: str) -> dict:
+        """Close one PAPER position using a reconciled provider mark as reference.
+
+        The caller owns market-data reconciliation.  The broker still applies
+        its configured paper spread/slippage, so the returned fill price may be
+        slightly worse than the reference mark.  No order is sent to an
+        exchange and the original position must be archived by the caller.
+        """
+        symbol, mark = symbol.upper(), float(mark_price)
+        if mark <= 0:
+            raise ValueError("a positive reconciled paper mark price is required")
+        if reason != "LEGACY_POSITION_REMEDIATION":
+            raise ValueError("unsupported paper position close reason")
+        with self._lock:
+            position = self._c.execute(
+                "SELECT * FROM v2_positions WHERE symbol=?", (symbol,)
+            ).fetchone()
+            if not position:
+                raise ValueError("no open paper position")
+            original = dict(position)
+            side = "sell" if original["side"] == "long" else "buy"
+            event_order_id = "remediation-" + _id()
+            events: list[dict] = []
+            # Supply exactly enough synthetic candle volume to close the known
+            # paper quantity.  Price discovery still comes exclusively from
+            # the reconciled mark supplied by the runtime.
+            volume = max(
+                float(original["size"]) / max(self.participation_rate, 1e-9),
+                float(original["size"]),
+            )
+            order = {
+                "id": event_order_id, "symbol": symbol, "side": side,
+                "remaining": original["size"], "filled": 0.0,
+                "quantity": original["size"], "reduce_only": 1,
+                "type": "market",
+            }
+            try:
+                self._c.execute("BEGIN IMMEDIATE")
+                self._fill(
+                    order, side, mark,
+                    {"open": mark, "high": mark, "low": mark,
+                     "close": mark, "volume": volume},
+                    events, True, persisted=False,
+                )
+                if self._c.execute(
+                        "SELECT 1 FROM v2_positions WHERE symbol=?", (symbol,)
+                ).fetchone():
+                    raise RuntimeError("paper remediation did not fully close the position")
+                self._c.commit()
+            except Exception:
+                self._c.rollback()
+                raise
+        if not events:
+            raise RuntimeError("paper remediation produced no fill")
+        fill = next((row for row in self.fills(limit=20)
+                     if row["order_id"] == event_order_id), None)
+        return {
+            "closed": True, "execution_mode": "PAPER",
+            "real_execution_allowed": False, "reason": reason,
+            "reference_mark_price": mark, "original_position": original,
+            "event": events[-1], "fill": fill,
+        }
+
     def apply_funding(self, symbol: str, rate: float, mark_price: float) -> dict:
         """Book a known provider funding rate; callers must supply the real rate."""
         with self._lock:

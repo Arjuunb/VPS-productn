@@ -20,6 +20,18 @@ class _WebhookAPIProxy:
     def __getattr__(self, name):
         return getattr(importlib.import_module("webhook_api"), name)
 
+    def __setattr__(self, name, value):
+        """Keep test/runtime overrides on the authoritative module.
+
+        Without this delegate, ``monkeypatch.setattr(_wa, ...)`` created state on
+        the proxy itself.  That shadow survived module reuse and leaked one
+        test's TradingInstanceManager into later tests.
+        """
+        setattr(importlib.import_module("webhook_api"), name, value)
+
+    def __delattr__(self, name):
+        delattr(importlib.import_module("webhook_api"), name)
+
 
 _wa = _WebhookAPIProxy()
 

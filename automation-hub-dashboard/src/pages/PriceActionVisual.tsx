@@ -4,6 +4,7 @@ import NativeSMCChartOverlay, {
 } from "../components/chart/NativeSMCChartOverlay";
 import { apiDownload, apiGet, apiPostJson } from "../lib/api";
 import { useApp } from "../app-context";
+import Modal from "../components/common/Modal";
 
 type Mode = "live" | "replay";
 type BottomTab = "positions" | "orders" | "trades" | "setups" | "rejected" | "journal" | "learning" | "session" | "connection";
@@ -38,6 +39,8 @@ interface PaperState {
   candidates: { proposal_id: string; source_proposal_id: string; status: string; payload: Record<string, any> }[];
   order_metadata: { order_id: string; status: string; config: { proposal: Proposal; entry: number; stop: number; target: number } }[];
   activity: Record<string, any>[];
+  position_remediations?: Record<string, any>[];
+  entry_control?: { readiness_recheck_required?: boolean; entry_pause_reason?: string };
   order_audit?: { session_id: string; pending_paper_orders: number; pending_strategy_orders: number; pending_manual_orders: number; duplicate_strategy_orders: Record<string, any>[]; discrepancies: Record<string, any>[]; manual_orders_are_never_auto_cancelled: boolean };
 }
 interface PAJournalEntry {
@@ -285,6 +288,10 @@ export default function PriceActionVisual() {
   const [journalFilters, setJournalFilters] = useState<JournalFilters>({ strategy_id: "", direction: "", result: "", trigger_type: "", zone_type: "", touch_count: "", regime: "", rule_compliance: "", data_quality: "", entry_model: "", partition: "", strategy_version: "", date_from: "", date_to: "" });
   const [learning, setLearning] = useState<PALearningAnalysis | null>(null);
   const [learningCandidates, setLearningCandidates] = useState<PALearningCandidate[]>([]);
+  const [remediationSymbol, setRemediationSymbol] = useState("");
+  const [remediationPhrase, setRemediationPhrase] = useState("");
+  const [remediationAcknowledged, setRemediationAcknowledged] = useState(false);
+  const [remediating, setRemediating] = useState(false);
   const [controlsOpen, setControlsOpen] = useState(() => typeof window === "undefined" || window.innerWidth > 820);
   const identityInitialized = useRef(false);
   const chartRequestSequence = useRef(0);
@@ -405,6 +412,8 @@ export default function PriceActionVisual() {
   const marketSelection = pendingMarket ?? { symbol, timeframe, mode };
   const focusedObjectIds = focusedSetup ? [focusedSetup.id, focusedSetup.zone_id, focusedSetup.trigger_event_id].filter((row): row is string => Boolean(row)) : [];
   const selectedJournal = journal?.entries.find((row) => row.identity.journal_entry_id === selectedJournalId) ?? null;
+  const legacyPosition = paper?.positions.find((row) =>
+    row.protection_status === "LEGACY_UNPROTECTED_REQUIRES_CLOSE_OR_PROTECTION") ?? null;
 
   const submitOrder = async () => {
     try {
@@ -524,6 +533,32 @@ export default function PriceActionVisual() {
     } catch (reason) { toast(reason instanceof Error ? reason.message : "Order reconciliation failed", "error"); }
   };
 
+  const closeLegacyPosition = async () => {
+    if (!remediationSymbol || remediationPhrase !== "CLOSE LEGACY PAPER POSITION" ||
+        !remediationAcknowledged) return;
+    setRemediating(true);
+    try {
+      const result = await apiPostJson<{
+        paper: PaperState;
+        readiness: { ready: boolean; blockers: string[] };
+        remediation_id: string;
+        journal_id: string;
+      }>(`/research/price-action/paper/positions/${remediationSymbol}/legacy-remediation-close`, {
+        confirmation: remediationPhrase,
+        acknowledge_missing_historical_protection: remediationAcknowledged,
+      });
+      setPaper(result.paper);
+      setRemediationSymbol(""); setRemediationPhrase(""); setRemediationAcknowledged(false);
+      await Promise.all([loadPaper(), loadGovernance(), loadChart()]);
+      toast(result.readiness.ready
+        ? "Legacy PAPER position closed; all readiness gates passed"
+        : `Legacy PAPER position closed; execution remains blocked: ${result.readiness.blockers.join(" · ")}`,
+      result.readiness.ready ? "success" : "error");
+    } catch (reason) {
+      toast(reason instanceof Error ? reason.message : "Legacy position remediation failed", "error");
+    } finally { setRemediating(false); }
+  };
+
   return <div className="pa-lab">
     <header className="pa-titlebar">
       <div><span className="pa-kicker">NATIVE RESEARCH TERMINAL</span><h1>Price Action Visual Lab</h1><p>One closed-candle engine · historical replay + live paper observation</p></div>
@@ -562,7 +597,16 @@ export default function PriceActionVisual() {
         <div className="pa-bottom">
           <nav>{TABS.map((row) => <button key={row} className={tab === row ? "active" : ""} onClick={() => setTab(row)}>{row}<em>{row === "positions" ? paper?.positions.length ?? 0 : row === "orders" ? pendingPaperOrders.length : row === "trades" ? tradeRows.length : row === "setups" ? state?.setups.length ?? 0 : row === "rejected" ? rejected.length : row === "journal" ? journal?.statistics.setups ?? 0 : row === "learning" ? learningCandidates.length : ""}</em></button>)}</nav>
           <div className={`pa-bottom-body ${tab === "journal" || tab === "learning" ? "is-governance" : ""}`}>
-            {tab === "positions" ? <DataTable rows={paper?.positions ?? []} empty="No open Price Action paper positions." /> : null}
+            {tab === "positions" ? <>
+              {legacyPosition ? <div className="pa-order-audit">
+                <b>LEGACY / UNPROTECTED PAPER POSITION</b>
+                <span>{String(legacyPosition.symbol)} · {String(legacyPosition.side)} · {String(legacyPosition.size)}</span>
+                <span>Stop loss, take profit, risk and R:R are unverified and will not be invented.</span>
+                <small>This cleanup closes only the isolated paper position at the current reconciled mark reference. The original position and remediation evidence remain in the immutable journal.</small>
+                <button type="button" className="btn-danger" onClick={() => setRemediationSymbol(String(legacyPosition.symbol))}>Close legacy paper position</button>
+              </div> : null}
+              <DataTable rows={paper?.positions ?? []} empty="No open Price Action paper positions." />
+            </> : null}
             {tab === "orders" ? <><div className="pa-order-ticket"><select aria-label="Paper order side" value={order.side} onChange={(e) => setOrder({ ...order, side: e.target.value })}><option value="buy">Buy / Long</option><option value="sell">Sell / Short</option></select><select aria-label="Paper order type" value={order.type} onChange={(e) => setOrder({ ...order, type: e.target.value })}><option value="market">Market</option><option value="limit">Limit</option><option value="stop">Stop</option></select><input aria-label="Paper order quantity" value={order.quantity} onChange={(e) => setOrder({ ...order, quantity: e.target.value })} inputMode="decimal" placeholder="Quantity" />{order.type !== "market" ? <input aria-label="Paper order trigger or limit price" value={order.limit_price} onChange={(e) => setOrder({ ...order, limit_price: e.target.value })} inputMode="decimal" placeholder="Trigger / limit price" /> : null}<input aria-label="Paper order stop loss" value={order.stop_loss} onChange={(e) => setOrder({ ...order, stop_loss: e.target.value })} inputMode="decimal" placeholder="Stop loss · required" /><input aria-label="Paper order take profit" value={order.take_profit} onChange={(e) => setOrder({ ...order, take_profit: e.target.value })} inputMode="decimal" placeholder="Take profit · required" /><button onClick={() => void submitOrder()}>Place protected paper order</button><button className="pa-reconcile" onClick={() => void reconcileOrders()}>Reconcile strategy orders</button><span>PAPER · {pendingPaperOrders.length} pending</span></div><div className="pa-order-audit"><b>Pending paper audit</b><span>Total {paper?.order_audit?.pending_paper_orders ?? pendingPaperOrders.length}</span><span>Strategy {paper?.order_audit?.pending_strategy_orders ?? 0}</span><span>Manual {paper?.order_audit?.pending_manual_orders ?? 0}</span><span>Duplicates {paper?.order_audit?.duplicate_strategy_orders.length ?? 0}</span><span>Discrepancies {paper?.order_audit?.discrepancies.length ?? 0}</span><small>Every new paper entry requires durable stop-loss and take-profit protection.</small></div>{(paper?.candidates ?? []).filter((row) => row.status === "PENDING_APPROVAL").map((row) => <div className="pa-order-ticket" key={row.proposal_id}><b>{String(row.payload.proposal?.strategy_id ?? "Strategy")} · {String(row.payload.proposal?.direction ?? "—")}</b><span>{String(row.payload.reason ?? "Awaiting approval")}</span><button onClick={() => void approve(row.source_proposal_id)}>Approve paper order</button></div>)}<h3 className="pa-table-heading">Pending paper broker orders</h3><DataTable rows={pendingPaperOrders} empty="No pending paper broker orders." /><h3 className="pa-table-heading">Research-engine orders · not paper broker orders</h3><DataTable rows={researchOrderRows} empty="No normalized research-engine orders in this candle window." /></> : null}
             {tab === "trades" ? <DataTable rows={tradeRows} empty="No completed paper fills or normalized research outcomes." /> : null}
             {tab === "setups" ? <DataTable rows={(state?.setups ?? []) as unknown as Record<string, any>[]} empty="No confirmed setups in the visible engine state." /> : null}
@@ -575,5 +619,19 @@ export default function PriceActionVisual() {
         </div>
       </main>
     </div>
+    <Modal open={Boolean(remediationSymbol)} title="Close legacy PAPER position?" onClose={() => {
+      if (remediating) return;
+      setRemediationSymbol(""); setRemediationPhrase(""); setRemediationAcknowledged(false);
+    }}>
+      <p>This is a <b>paper-account cleanup</b>. It will close the unprotected {remediationSymbol} paper position using the current reconciled Binance mark as the reference. The paper broker’s configured spread, slippage and fee model still applies.</p>
+      <p>No historical stop loss, take profit, risk amount or R:R will be reconstructed. The original position snapshot and the completed remediation will be preserved in the audit and immutable journal.</p>
+      <label className="pa-check"><input type="checkbox" checked={remediationAcknowledged} onChange={(event) => setRemediationAcknowledged(event.target.checked)} /><span>I understand the historical protection is unavailable and this action is PAPER only.</span></label>
+      <label>Type <b>CLOSE LEGACY PAPER POSITION</b><input aria-label="Legacy remediation confirmation" value={remediationPhrase} onChange={(event) => setRemediationPhrase(event.target.value)} autoComplete="off" /></label>
+      <p className="dim">Closing the position does not bypass readiness. Market data, saved Automatic Paper mode, balance, risk, stop and exit gates will be recalculated before any future entry is eligible.</p>
+      <div className="modal-actions">
+        <button type="button" className="btn btn-soft" disabled={remediating} onClick={() => { setRemediationSymbol(""); setRemediationPhrase(""); setRemediationAcknowledged(false); }}>Cancel</button>
+        <button type="button" className="btn btn-danger" disabled={remediating || !remediationAcknowledged || remediationPhrase !== "CLOSE LEGACY PAPER POSITION"} onClick={() => void closeLegacyPosition()}>{remediating ? "Closing paper position…" : "Close PAPER position"}</button>
+      </div>
+    </Modal>
   </div>;
 }

@@ -2253,7 +2253,7 @@ def _deploy_info() -> dict:
         "commit_short": commit[:7],
         "branch": os.environ.get("RENDER_GIT_BRANCH") or os.environ.get("GIT_BRANCH", ""),
         "service": os.environ.get("RENDER_SERVICE_NAME", ""),
-        "deployed_at": os.environ.get("RENDER_DEPLOY_ID", ""),
+        "deployed_at": os.environ.get("RENDER_DEPLOY_ID") or os.environ.get("DEPLOYED_AT", ""),
     }
 
 

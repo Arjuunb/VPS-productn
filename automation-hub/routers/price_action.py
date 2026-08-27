@@ -431,6 +431,11 @@ class ProtectionBody(BaseModel):
     trailing_offset: Optional[float] = None
 
 
+class LegacyRemediationBody(BaseModel):
+    confirmation: str
+    acknowledge_missing_historical_protection: bool = False
+
+
 @router.post("/paper/positions/{symbol}/protection")
 def protect_paper_position(symbol: str, body: ProtectionBody,
                            x_webhook_secret: Optional[str] = Header(default=None)):
@@ -442,6 +447,28 @@ def protect_paper_position(symbol: str, body: ProtectionBody,
         )
     except ValueError as exc:
         _bad(exc)
+
+
+@router.post("/paper/positions/{symbol}/legacy-remediation-close")
+def remediate_legacy_paper_position(
+        symbol: str, body: LegacyRemediationBody,
+        x_webhook_secret: Optional[str] = Header(default=None)):
+    """User-confirmed PAPER cleanup; never reconstructs historical protection."""
+    _wa._check_secret(x_webhook_secret)
+    if body.confirmation != "CLOSE LEGACY PAPER POSITION":
+        raise HTTPException(
+            422, "confirmation must exactly match CLOSE LEGACY PAPER POSITION"
+        )
+    if not body.acknowledge_missing_historical_protection:
+        raise HTTPException(
+            422, "acknowledge that historical SL, TP, risk and R:R are unavailable"
+        )
+    try:
+        return _wa.price_action_runtime.remediate_legacy_position(
+            symbol, initiated_by="authenticated_control_operator"
+        )
+    except (KeyError, ValueError, RuntimeError) as exc:
+        _bad(exc, 409)
 
 
 class ResetBody(BaseModel):

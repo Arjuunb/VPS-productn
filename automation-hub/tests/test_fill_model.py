@@ -98,11 +98,23 @@ def test_paper_engine_rejection():
 
 # ───────────────────────── endpoint ─────────────────────────
 @pytest.fixture()
-def client():
+def client(tmp_path, monkeypatch):
     pytest.importorskip("fastapi")
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
+    from config import settings
+    from services.trading_instances import TradingInstanceManager
     import webhook_api
+
+    def factory(_key, _symbol):
+        return object()
+
+    manager = TradingInstanceManager(
+        SqliteLedger(str(tmp_path / "instances.db")),
+        strategy_factory=factory, live=False, live_poll_s=60,
+    )
+    monkeypatch.setattr(webhook_api, "instance_manager", manager)
+    monkeypatch.setattr(settings, "settings_path", str(tmp_path / "runtime.json"))
     app = FastAPI(); app.include_router(webhook_api.router)
     return TestClient(app)
 

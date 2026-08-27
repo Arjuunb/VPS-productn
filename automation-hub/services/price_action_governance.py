@@ -460,6 +460,168 @@ class PriceActionJournalStore:
                 captured.append(journal_id)
         return captured
 
+    def record_legacy_remediation(
+            self, *, session: dict, original_position: dict,
+            close_result: dict, market_evidence: dict,
+            remediation_id: str, initiated_by: str) -> str:
+        """Append immutable evidence for a user-confirmed legacy PAPER close.
+
+        Unknown historical protection and risk fields remain explicitly null.
+        The remediation is operational cleanup, not a reconstructed strategy
+        trade and is excluded from research/performance statistics.
+        """
+        symbol = str(original_position["symbol"]).upper()
+        direction = str(original_position["side"])
+        fill = close_result.get("fill") or close_result.get("event") or {}
+        closed_at = str(fill.get("timestamp") or _now())
+        journal_id = _fingerprint(
+            [session.get("id"), remediation_id, symbol], "pa-journal-remediation"
+        )
+        setup_id = f"LEGACY_REMEDIATION:{remediation_id}"
+        record = _canonical({
+            "identity": {
+                "journal_entry_id": journal_id,
+                "correlation_id": remediation_id,
+                "session_id": session.get("id"), "experiment_id": None,
+                "strategy_family": STRATEGY_FAMILY,
+                "strategy_id": "LEGACY_UNVERIFIED",
+                "strategy_name": "Legacy / Unverified",
+                "strategy_version": "LEGACY / UNVERIFIED",
+                "configuration_fingerprint": "LEGACY_UNVERIFIED",
+                "engine_fingerprint": "LEGACY_UNVERIFIED",
+                "dataset_fingerprint": "LEGACY_UNVERIFIED",
+                "symbol": symbol, "timeframe": session.get("timeframe") or "UNKNOWN",
+                "direction": direction, "origin": "legacy_position_remediation",
+                "research_partition": "paper_forward", "execution_mode": "PAPER",
+                "market_data_mode": "LIVE",
+                "market_data_source": "Binance USDⓈ-M reconciled public mark",
+                "exchange": "Binance USDⓈ-M Futures",
+                "opened_at": original_position.get("opened_at"),
+                "closed_at": closed_at,
+            },
+            "market_context": {
+                "structure_state": None, "relevant_swings": [], "zone_id": None,
+                "zone_role": None, "original_zone_role": None,
+                "flipped_zone": None, "zone_low": None, "zone_high": None,
+                "zone_age": None, "touch_count": None,
+                "higher_timeframe_context": None, "market_regime": None,
+                "data_health_state": market_evidence.get("state"),
+                "data_health_reason": market_evidence.get("health_reason"),
+            },
+            "setup": {
+                "setup_id": setup_id, "state": "REMEDIATED",
+                "location_reached_candle": None,
+                "rejection_reclaim_candle": None,
+                "trigger_classification": "LEGACY_POSITION_REMEDIATION",
+                "pattern_metadata": [], "confusion_candle_count": None,
+                "confirmation_boundary": {"high": None, "low": None},
+                "confirmation_candle": None, "invalidation_price": None,
+                "state_transitions": [{
+                    "id": remediation_id, "setup_id": setup_id,
+                    "from_phase": "LEGACY_UNPROTECTED", "to_phase": "REMEDIATED",
+                    "timestamp": closed_at, "candle_identity": None,
+                    "market_data_health": market_evidence.get("state"),
+                    "reason_code": "LEGACY_POSITION_REMEDIATION",
+                    "reason": "user-confirmed paper-account cleanup",
+                    "zone_id": None, "order_id": fill.get("order_id"),
+                    "position_id": symbol,
+                    "strategy_version": "LEGACY / UNVERIFIED",
+                    "configuration_fingerprint": "LEGACY_UNVERIFIED",
+                    "relevant_prices": {
+                        "entry": original_position.get("entry_price"),
+                        "stop": None, "target": None,
+                    },
+                }],
+                "acceptance_reasons": ["explicit authenticated user confirmation"],
+                "rejection_reasons": [
+                    "historical stop, target, risk and R:R provenance unavailable"
+                ],
+            },
+            "order_risk": {
+                "order_id": fill.get("order_id"), "position_id": symbol,
+                "entry_model": "LEGACY_UNVERIFIED",
+                "requested_entry": original_position.get("entry_price"),
+                "actual_simulated_fill": fill.get("price"),
+                "stop": None, "target": None, "initial_risk_price": None,
+                "expected_risk_usdt": None, "expected_risk_r": None,
+                "actual_risk_usdt": None,
+                "quantity": fill.get("quantity") or original_position.get("size"),
+                "leverage": None, "margin": None, "expiry_index": None,
+                "bid_ask_decision": {
+                    "bid": market_evidence.get("bid"),
+                    "ask": market_evidence.get("ask"),
+                },
+                "bid_ask_fill": market_evidence,
+                "spread": None, "fill_spread": None,
+                "fill_quote_evidence_status": "RECONCILED_PUBLIC_STREAM_MARK",
+                "slippage": None, "commission": fill.get("fee"),
+                "funding": {"amount_usdt": None, "normalized_r": None,
+                            "event_count": 0,
+                            "coverage": "LEGACY_ORDER_SCOPE_UNAVAILABLE"},
+                "contract_rounding": None,
+            },
+            "outcome": {
+                "status": "REMEDIATED", "result": "closed",
+                "exit_price": fill.get("price"), "exit_timestamp": closed_at,
+                "exit_reason": "LEGACY_POSITION_REMEDIATION",
+                "gross_r": None, "net_r": None, "costs_r": None,
+                "gross_result_usdt": fill.get("realized_pnl"),
+                "net_result_usdt": (
+                    float(fill.get("realized_pnl") or 0) - float(fill.get("fee") or 0)
+                ),
+                "maximum_favourable_excursion": None,
+                "maximum_adverse_excursion": None, "excursion_unit": "R",
+                "excursion_model": "UNAVAILABLE_LEGACY_PROVENANCE",
+                "bars_to_entry": None, "bars_in_trade": None,
+                "intrabar_ambiguity": None, "premise_remained_valid": None,
+                "execution_materially_different": None,
+            },
+            "review": {
+                "what_happened": "Legacy unprotected PAPER position closed by explicit remediation",
+                "what_worked": ["original position and reconciled close evidence preserved"],
+                "what_failed": ["original protection and risk provenance unavailable"],
+                "learning_classification": "RANDOM_OR_INCONCLUSIVE",
+                "classification_explanation": "operational cleanup is not strategy evidence",
+                "include_in_research_statistics": False,
+                "rule_compliance": None, "researcher_notes": "",
+                "tags": ["legacy", "paper", "remediation"],
+                "initiated_by": initiated_by,
+            },
+            "chart_state": {
+                "candle_timestamp": None, "zone_id": None, "event_id": None,
+                "entry": original_position.get("entry_price"),
+                "stop": None, "target": None,
+            },
+            "audit": {
+                "reason_code": "LEGACY_POSITION_REMEDIATION",
+                "remediation_id": remediation_id,
+                "reference_mark_price": close_result.get("reference_mark_price"),
+                "original_position": original_position,
+                "close_result": close_result,
+                "market_evidence": market_evidence,
+                "real_execution_allowed": False,
+            },
+        })
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO pa_journal_entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (journal_id, session.get("id"), None, setup_id,
+                 "LEGACY_UNVERIFIED", "LEGACY / UNVERIFIED",
+                 "LEGACY_UNVERIFIED", "LEGACY_UNVERIFIED", "LEGACY_UNVERIFIED",
+                 symbol, session.get("timeframe") or "UNKNOWN", direction,
+                 "legacy_position_remediation", "paper_forward", "REMEDIATED",
+                 "closed", str(original_position.get("opened_at") or closed_at),
+                 closed_at, json.dumps(record, sort_keys=True), _now()),
+            )
+            payload_hash = _fingerprint(record, "revision")
+            self._db.execute(
+                "INSERT INTO pa_journal_revisions VALUES (?,?,?,?,?,?,?,?)",
+                (uuid.uuid4().hex, journal_id, 1, "LEGACY_POSITION_REMEDIATION",
+                 _now(), initiated_by, payload_hash,
+                 json.dumps(record, sort_keys=True)),
+            )
+        return journal_id
+
     def _latest_records(self) -> list[dict]:
         rows = self._db.execute("""
           SELECT e.*,r.revision_no,r.payload_json FROM pa_journal_entries e

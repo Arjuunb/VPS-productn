@@ -164,5 +164,13 @@ def test_edit_and_backtest_bot(client):
     assert bot.runtime.state.value == "Created"
 
 
-def test_health_open(client):
-    assert client.get("/health").json()["status"] == "ok"
+def test_health_open(client, monkeypatch):
+    monkeypatch.setenv("GIT_COMMIT", "bcb1e58cafebabedeadbeef")
+    monkeypatch.setenv("GIT_BRANCH", "main")
+    monkeypatch.setenv("DEPLOYED_AT", "2026-08-28T12:00:00Z")
+    health = client.get("/health").json()
+    assert health["status"] == "ok"
+    assert health["commit"] == "bcb1e58cafebabedeadbeef"
+    assert health["commit_short"] == "bcb1e58"
+    assert health["branch"] == "main"
+    assert health["deployed_at"] == "2026-08-28T12:00:00Z"
