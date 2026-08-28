@@ -186,3 +186,16 @@ def test_vps_deploy_exports_runtime_revision_metadata():
     assert "export GIT_COMMIT GIT_BRANCH DEPLOYED_AT" in deploy
     for name in ("GIT_COMMIT", "GIT_BRANCH", "DEPLOYED_AT"):
         assert f"{name}: ${{{name}:-unknown}}" in compose
+
+
+def test_nginx_retains_only_required_startup_capabilities():
+    """Nginx must initialize its tmpfs paths after the drop-all baseline.
+
+    Removing these additions makes the production container restart with
+    ``chown(... client_temp) failed (Operation not permitted)`` before it can
+    create ``/run/nginx.pid`` or accept public HTTPS traffic.
+    """
+    compose = (ROOT / "compose.yaml").read_text()
+
+    assert "cap_drop: [ALL]" in compose
+    assert "cap_add: [CHOWN, DAC_OVERRIDE, SETGID, SETUID, NET_BIND_SERVICE]" in compose

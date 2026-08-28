@@ -49,6 +49,11 @@ services:
     tmpfs: [/var/cache/nginx, /var/run, /tmp, /etc/nginx/conf.d]
     security_opt: ["no-new-privileges:true"]
     cap_drop: [ALL]
+    # The root master process must prepare the tmpfs-backed cache/PID paths,
+    # bind 80/443, then drop privileges to the nginx worker user.  Retain the
+    # drop-all baseline and grant only the capabilities required for that
+    # initialization sequence.
+    cap_add: [CHOWN, DAC_OVERRIDE, SETGID, SETUID, NET_BIND_SERVICE]
     logging:
       driver: local
       options: {max-size: "10m", max-file: "5"}
