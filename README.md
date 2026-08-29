@@ -1,12 +1,26 @@
-# Tradexa Trading Bot
+Nexus
 
-A Python **multi-asset** trading bot with a **broker-adapter layer** so the same strategy code
-runs on crypto (Binance / Coinbase / Kraken / Bybit / 100+ exchanges via
-[ccxt](https://github.com/ccxt/ccxt)), US equities (Alpaca), and FX/CFDs
-(OANDA). Includes a built-in **support / resistance + rejection-candle**
-strategy, an event-driven **backtester**, a **risk manager**, and a **live
-runner** that works against paper and real accounts with the same code.
+Tradexa is a modular, multi-asset algorithmic trading platform built with Python. Its broker-independent architecture allows the same strategy and risk-management logic to run across cryptocurrency exchanges, US equity markets, forex, and CFDs.
 
+The platform supports more than 100 cryptocurrency exchanges through CCXT, US equities through Alpaca, and forex/CFD trading through OANDA. It provides a complete workflow for researching, testing, monitoring, and deploying automated trading strategies.
+
+## Key Features
+
+- Event-driven single-asset and multi-asset backtesting
+- Paper and live trading through a unified broker interface
+- Built-in support and resistance rejection strategy
+- Position sizing, exposure limits, cooldowns, and daily-loss protection
+- Walk-forward validation for evaluating strategy robustness
+- Extended metrics, including Sharpe, Sortino, Calmar, CAGR, expectancy, and profit factor
+- HTML performance reports with equity curves
+- Real-time monitoring dashboard
+- YAML-based configuration with environment-variable support
+- Docker Compose production deployment with FastAPI, Nginx, and persistent SQLite storage
+- Extensible architecture for adding new brokers and strategies
+
+Tradexa is designed for developers, quantitative trading enthusiasts, and researchers who want a flexible foundation for building and evaluating automated trading systems.
+
+> **Risk warning:** Tradexa is educational software and does not provide financial advice. Trading involves significant risk and may result in financial loss. Always validate strategies thoroughly and use paper trading before considering live execution.
 ## v0.3 quick start
 
 The core is stdlib-only. No install needed for backtests, the CLI, the
