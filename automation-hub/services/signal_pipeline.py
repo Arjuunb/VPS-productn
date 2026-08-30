@@ -83,10 +83,9 @@ except Exception:  # noqa: BLE001 - pragma: no cover
                 parts.append(f"× {label} {v:.2f}")
         return " ".join(parts)
 
-# The standalone Risk Engine, wired in as a MANDATORY VETO — see
-# `_risk_engine_veto`. Guarded the same way as the sizing import: a deployment
-# that ships only automation-hub still starts, with the veto absent rather than
-# the process dead. Absence is recorded in the decision trail, not silent.
+# The standalone Risk Engine is a MANDATORY VETO. The guarded import preserves
+# a diagnostic sentinel, but SignalPipeline construction fails closed when the
+# package is absent; execution is never allowed to continue without it.
 try:
     from tradexa.risk import (
         AccountState as _AccountState,
@@ -127,16 +126,48 @@ class PipelineResult:
     reason: str
     steps: list[Step] = field(default_factory=list)
     fill: Optional[dict] = None
+    blocker: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
             "accepted": self.accepted, "stage": self.stage, "reason": self.reason,
             "steps": [s.__dict__ for s in self.steps],
             "fill": self.fill,
+            "blocker": self.blocker,
         }
 
 
-_CLOSE_SIDES = {"CLOSE", "EXIT", "FLAT"}
+_CLOSE_SIDES = {"REDUCE", "CLOSE", "EXIT", "FLAT", "FLATTEN"}
+
+
+def gate_blocker(stage: str, reason: str = "") -> str:
+    """Stable operator-facing rejection code for every pipeline veto."""
+    text = str(reason or "").upper()
+    if "REWARD" in text or "R:R" in text or "RR " in text or "RR_" in text:
+        code = "INSUFFICIENT_RR"
+    elif "WARM" in text or "INSUFFICIENT HISTORY" in text:
+        code = "WARMUP"
+    elif "STALE" in text:
+        code = "STALE_CANDLE"
+    else:
+        code = {
+            "controls": "PAUSED",
+            "market_quality": "MARKET_QUALITY",
+            "dedup": "DUPLICATE_SIGNAL",
+            "execution": "EXECUTION",
+            "risk": "INVALID_RISK",
+            "risk_guard": "RISK_LIMIT",
+            "session": "OUTSIDE_SESSION",
+            "trading_day": "TRADING_DAY_DISABLED",
+            "daily_loss": "DAILY_LOSS_LIMIT",
+            "weekly_loss": "WEEKLY_LOSS_LIMIT",
+            "cooldown": "LOSS_COOLDOWN",
+            "max_trades": "TRADE_LIMIT",
+            "correlation": "CORRELATED_EXPOSURE",
+            "portfolio_exposure": "PORTFOLIO_EXPOSURE",
+            "event_risk": "EVENT_BLACKOUT",
+        }.get(str(stage or "").lower(), str(stage or "UNKNOWN").upper())
+    return f"GATE_REJECTED: {code}"
 
 # Correlation clusters: assets that move together. Crypto majors are treated as
 # ONE cluster — three simultaneous longs on BTC/ETH/SOL are not diversification,
@@ -285,7 +316,7 @@ class SignalPipeline:
 
     # ------------------------------------------------------------ risk engine
     def _build_risk_engine(self):
-        """The engine that vetoes every entry, or ``None`` if unavailable.
+        """Build the mandatory engine that vetoes every entry.
 
         Limits are derived from the pipeline's own settings on top of
         ``PIPELINE_PARITY``, which disables the rules this pipeline has never
@@ -296,18 +327,10 @@ class SignalPipeline:
         see ``tradexa.risk.STRICT``.
         """
         if _RiskEngine is None:
-            # Loudly. The guarded import exists so a partial deployment still
-            # trades, and for one release it did something worse: `tradexa` was
-            # missing from pyproject's package list, so the veto was absent in
-            # production and NOTHING said so. Degrading quietly is the failure
-            # mode, not the resilience. tests/test_packaging.py now stops the
-            # packaging half; this is the half that would have been noticed.
-            print("[risk] tradexa.risk is not importable — the Risk Engine veto "
-                  "is NOT being applied. Every trade is running on the pipeline's "
-                  "own gates only. Check that 'tradexa*' is in pyproject.toml "
-                  "packages.find include and that `pip install -e .` ran.",
-                  flush=True)
-            return None
+            raise RuntimeError(
+                "tradexa.risk is unavailable; refusing to construct an execution "
+                "pipeline without its mandatory risk veto"
+            )
         limits = _PIPELINE_PARITY.with_(
             risk_per_trade_pct=self.risk_per_trade_pct,
             max_risk_per_trade_pct=max(self.risk_per_trade_pct,
@@ -441,7 +464,7 @@ class SignalPipeline:
                         time=payload.get("timestamp") or "")
                 except Exception:  # noqa: BLE001 — grading must never block trading
                     pass
-            return PipelineResult(False, stage, reason, steps)
+            return PipelineResult(False, stage, reason, steps, blocker=gate_blocker(stage, reason))
 
         # Classify exposure direction before applying entry-only controls. Pause
         # is a soft entry gate, never a veto on a protective/risk-reducing exit.
@@ -475,9 +498,9 @@ class SignalPipeline:
             steps.append(Step("market_quality", True, "data + microstructure ok"))
 
         # 2. duplicate protection
-        if self.dedup.is_duplicate(alert_id):
+        if not is_close and self.dedup.is_duplicate(alert_id):
             return reject("dedup", f"Duplicate alert_id within {self.dedup.window_seconds}s", status="duplicate")
-        steps.append(Step("dedup", True, "no duplicate"))
+        steps.append(Step("dedup", True, "protective exit bypass" if is_close else "no duplicate"))
 
         # 3a. CLOSE signal (explicit, or opposite side of an open position)
         if is_close:
@@ -831,21 +854,17 @@ class SignalPipeline:
         # dropping the veto out of the counterfactual tracker's graded stages.
         # Same decision, worse explanation. Here it can only add refusals, never
         # rename existing ones.
-        if self.risk_engine is not None:
-            decision = self.risk_engine.evaluate(self._risk_context(
-                symbol=symbol, side=side, entry=entry, stop=stop,
-                confidence=confidence, payload=payload, equity=realized_equity))
-            if not decision.approved:
-                return reject("risk_engine", decision.explain())
-            steps.append(Step("risk_engine", True,
-                              f"approved by {decision.limits_name} "
-                              f"({len(decision.checks)} rules, "
-                              f"{decision.evaluated_ms:.1f}ms)"))
-        else:
-            # Stated rather than skipped in silence: a decision trail that looks
-            # identical whether or not the engine ran cannot be audited.
-            steps.append(Step("risk_engine", True,
-                              "tradexa.risk unavailable in this deployment — veto not applied"))
+        if self.risk_engine is None:
+            raise RuntimeError("Mandatory risk engine is unavailable; entry failed closed")
+        decision = self.risk_engine.evaluate(self._risk_context(
+            symbol=symbol, side=side, entry=entry, stop=stop,
+            confidence=confidence, payload=payload, equity=realized_equity))
+        if not decision.approved:
+            return reject("risk_engine", decision.explain())
+        steps.append(Step("risk_engine", True,
+                          f"approved by {decision.limits_name} "
+                          f"({len(decision.checks)} rules, "
+                          f"{decision.evaluated_ms:.1f}ms)"))
 
         if self.global_entry_guard is not None:
             try:

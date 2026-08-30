@@ -29,7 +29,7 @@ from typing import Callable, Optional
 from bot.types import Signal, SignalType
 from data.ledger import Ledger
 from execution.paper_engine import PaperExecutionEngine
-from services.signal_pipeline import SignalPipeline
+from services.signal_pipeline import SignalPipeline, gate_blocker
 
 
 class EngineFeedError(RuntimeError):
@@ -147,6 +147,8 @@ class AutoStrategyEngine:
         self.lifecycle_state = "stopped"  # bootstrapping|warming|syncing|ready|running|data_stale|recovering|error|stopped
         self.stop_reason = "Not started"
         self.last_error: Optional[str] = None
+        self.last_blocker: Optional[str] = "GATE_REJECTED: WARMUP" if live else None
+        self.last_blocker_timestamp: Optional[str] = None
         self.last_heartbeat: Optional[str] = None
         self.last_transition: Optional[str] = None
         self.reconnect_attempt = 0
@@ -392,6 +394,8 @@ class AutoStrategyEngine:
             "lifecycle_state": self.lifecycle_state,
             "stop_reason": self.stop_reason,
             "last_error": self.last_error,
+            "last_blocker": self.last_blocker,
+            "last_blocker_timestamp": self.last_blocker_timestamp,
             "last_heartbeat": self.last_heartbeat,
             "last_transition": self.last_transition,
             "instance_id": self.instance_id,
@@ -954,6 +958,8 @@ class AutoStrategyEngine:
         allowed_age = interval * 1.5
         if age > allowed_age:
             self.market_data_status = "stale"
+            self.last_blocker = "GATE_REJECTED: STALE_CANDLE"
+            self.last_blocker_timestamp = newest.timestamp.isoformat()
             raise MarketDataStaleError(
                 f"{symbol} market data stale: age={age:.0f}s allowed={allowed_age:.0f}s")
         self.market_data_status = "healthy"
@@ -1047,7 +1053,7 @@ class AutoStrategyEngine:
         filled_this_bar = self._check_pending(sym, bar)
         # 2. stop-loss / take-profit exits against this bar's range.
         position_before_exit = self.paper.open_position(sym)
-        self._check_exit(sym, bar, strategy, entry_bar=filled_this_bar)
+        exit_taken = self._check_exit(sym, bar, strategy, entry_bar=filled_this_bar)
         position_after_exit = self.paper.open_position(sym)
         # 3. strategy decision on the new bar.
         # A lifecycle-aware strategy must not keep proposing entries while its
@@ -1075,6 +1081,7 @@ class AutoStrategyEngine:
                 f"{label} failed for {sym} {self.timeframe}: "
                 f"{type(exc).__name__}: {exc}") from exc
         outcome: Optional[dict] = None
+        strategy_decision: Optional[dict] = None
         if signal is not None:
             outcome = self._on_signal(
                 sym, signal, strategy, decision_identity=decision_identity)
@@ -1105,6 +1112,45 @@ class AutoStrategyEngine:
                              f"{strategy_decision.get('reason')}")[:500])
             except Exception:  # noqa: BLE001 — decision telemetry never blocks the bar
                 pass
+        trade_taken = bool(
+            filled_this_bar
+            or exit_taken
+            or (position_before_exit is not None and position_after_exit is None)
+            or (outcome or {}).get("kind") in {"opened", "closed"}
+        )
+        if trade_taken:
+            blocker = None
+        elif outcome is not None and outcome.get("blocker"):
+            blocker = str(outcome["blocker"])
+        else:
+            kind = str((outcome or {}).get("kind") or "")
+            reason = str((outcome or {}).get("reason") or "")
+            if kind == "rejected":
+                blocker = gate_blocker(str(outcome.get("stage") or "unknown"), reason)
+            elif kind == "pending":
+                blocker = "GATE_REJECTED: ORDER_PENDING"
+            elif kind == "queued":
+                blocker = "GATE_REJECTED: APPROVAL_REQUIRED"
+            elif kind == "signal":
+                blocker = "GATE_REJECTED: SIGNALS_ONLY"
+            elif kind == "hold":
+                blocker = "GATE_REJECTED: POSITION_ALREADY_ALIGNED"
+            elif kind == "error":
+                blocker = "GATE_REJECTED: PIPELINE_ERROR"
+            elif skip_entry_scan:
+                blocker = "GATE_REJECTED: POSITION_MANAGED"
+            else:
+                decision_reason = str((strategy_decision or {}).get("reason") or "")
+                blocker = (gate_blocker("strategy", decision_reason)
+                           if any(word in decision_reason.upper()
+                                  for word in ("WARM", "STALE", "R:R", "RR ", "REWARD"))
+                           else "GATE_REJECTED: NO_SETUP")
+        self.last_blocker = blocker
+        self.last_blocker_timestamp = bar.timestamp.isoformat()
+        if outcome is None:
+            outcome = {"kind": "no_trade", "blocker": blocker}
+        else:
+            outcome["blocker"] = blocker
         if self.core_v2_observer is not None:
             try:
                 self.core_v2_observer.observe(
@@ -1145,6 +1191,7 @@ class AutoStrategyEngine:
                 self.reports.record(report)
             except Exception as e:  # noqa: BLE001 — never block the engine
                 print(f"[explain] cycle report failed for {sym}: {type(e).__name__}: {e}")
+        return blocker
 
     def _check_pending(self, sym: str, bar) -> bool:
         # A paused/rebooting worker may keep consuming market data so open
@@ -1265,13 +1312,14 @@ class AutoStrategyEngine:
         version = self.strategy_version or self.strategy_label or "unversioned"
         return f"{scope}:{version}:{sym}:{self.timeframe}:{stamp}"
 
-    def _check_exit(self, sym: str, bar, strategy=None, *, entry_bar: bool = False) -> None:
+    def _check_exit(self, sym: str, bar, strategy=None, *, entry_bar: bool = False) -> bool:
         pos = self.paper.open_position(sym)
         if pos is None:
             self._managed.pop(sym, None)
-            return
+            return False
         exit_price = why = None
         act = None
+        trade_taken = False
         # Hold the adjust lock only over the fast, pure management computation so
         # a manual level change can't tear stop/target/risk mid-read. All IO
         # (scale-out fill, close routing) happens AFTER the lock is released.
@@ -1312,6 +1360,7 @@ class AutoStrategyEngine:
                 fill = self.paper.reduce(symbol=sym, exit_price=act.partial_price,
                                          fraction=self.trade_manager.scale_frac)
                 if fill.action == "reduced":
+                    trade_taken = True
                     self.ledger.log(level="info", stage="execution", symbol=sym,
                                     message=f"{sym} scale-out {fill.size:.6f} @ {fill.price}"
                                             f" (PnL {fill.pnl:+.2f})")
@@ -1343,8 +1392,11 @@ class AutoStrategyEngine:
                     reason = should(bar, pos["side"])
                     if reason:
                         exit_price, why = bar.close, reason
-                except Exception:  # noqa: BLE001 — a bad exit rule must never stall the engine
-                    pass
+                except Exception as exc:
+                    raise StrategyExecutionError(
+                        f"Strategy exit evaluation failed closed for {sym}: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
         if exit_price is not None:
             mfe_r, mae_r = self._mfe_mae_r(mt)
             res = self._route({
@@ -1355,10 +1407,12 @@ class AutoStrategyEngine:
                 "timestamp": bar.timestamp.isoformat(),
             })
             if res is not None and res.accepted:
+                trade_taken = True
                 self.stats["trades"] += 1
                 with self._adjust_lock:
                     self._targets.pop(sym, None)
                     self._managed.pop(sym, None)
+        return trade_taken
 
     def _adopt(self, sym: str, pos: dict):
         """Rebuild management state for a position opened before a restart (or
@@ -1459,12 +1513,18 @@ class AutoStrategyEngine:
         # The brain re-asserts its view every bar; only act when it CHANGES the
         # position (open from flat, or flip/close an opposite). Holding the same
         # direction is a no-op, so the decision log stays signal — not spam.
-        desired = "long" if signal.type == SignalType.LONG else "short"
         pos = self.paper.open_position(sym)
+        if signal.type == SignalType.FLAT and pos is None:
+            return {"kind": "rejected", "stage": "execution",
+                    "reason": "Flatten signal with no open position",
+                    "blocker": "GATE_REJECTED: NO_OPEN_POSITION"}
+        desired = ("long" if signal.type == SignalType.LONG else
+                   "short" if signal.type == SignalType.SHORT else None)
         if pos is not None and pos["side"] == desired:
-            return {"kind": "hold"}
+            return {"kind": "hold", "blocker": "GATE_REJECTED: POSITION_ALREADY_ALIGNED"}
         self.stats["signals"] += 1
-        side = "BUY" if signal.type == SignalType.LONG else "SELL"
+        side = ("BUY" if signal.type == SignalType.LONG else
+                "SELL" if signal.type == SignalType.SHORT else "FLATTEN")
         health_factor = self._health_factor(sym) if pos is None else 1.0
         # Preserve the exact per-symbol context that guarded this new entry.
         # It is written into the decision journal only after a fill, never used
@@ -1531,6 +1591,7 @@ class AutoStrategyEngine:
                 except Exception:  # noqa: BLE001
                     pass
             return {"kind": "rejected", "stage": "brain", "reason": why,
+                    "blocker": gate_blocker("brain", why),
                     "decision": decision, "verdict": v}
         # context gate: never long an altcoin against BTC's own trend
         # (cross-asset modifier; OFF unless validated + enabled)
@@ -1555,6 +1616,7 @@ class AutoStrategyEngine:
                 except Exception:  # noqa: BLE001
                     pass
             return {"kind": "rejected", "stage": "context", "reason": ctx_why,
+                    "blocker": gate_blocker("context", ctx_why),
                     "decision": decision, "verdict": v}
         payload = {
             "alert_id": self._auto_execution_id(sym, signal.timestamp, side.lower()),
@@ -1624,6 +1686,7 @@ class AutoStrategyEngine:
             result = self._route(payload)
             return {"kind": "rejected", "stage": "controls",
                     "reason": getattr(result, "reason", "Trading paused — entry blocked"),
+                    "blocker": getattr(result, "blocker", "GATE_REJECTED: PAUSED"),
                     "decision": decision, "verdict": v}
         if self.entry_mode == "limit" and pos is None and signal.stop_loss:
             self._pending[sym] = {"side": side, "price": signal.entry,
@@ -1631,7 +1694,8 @@ class AutoStrategyEngine:
                                   "ttl": self.limit_ttl_bars, "payload": payload,
                                   "decision_id": decision_id}
             self._checkpoint_pending_orders()
-            return {"kind": "pending", "decision": decision, "verdict": v}
+            return {"kind": "pending", "blocker": "GATE_REJECTED: ORDER_PENDING",
+                    "decision": decision, "verdict": v}
         res = self._route(payload)
         if res is None:
             return {"kind": "error", "reason": "pipeline error (see engine log)"}
@@ -1664,6 +1728,7 @@ class AutoStrategyEngine:
             stage = str(res.stage or "unknown")
             self.rejection_counts[stage] = self.rejection_counts.get(stage, 0) + 1
             return {"kind": "rejected", "stage": res.stage, "reason": res.reason,
+                    "blocker": res.blocker or gate_blocker(res.stage, res.reason),
                     "decision": decision, "verdict": v}
         return {"kind": "noop", "decision": decision, "verdict": v}
 
@@ -1781,11 +1846,13 @@ class AutoStrategyEngine:
                     "timestamp": payload.get("timestamp"),
                 }
             return result
-        except Exception as e:  # noqa: BLE001 — a bad bar shouldn't stop the engine
+        except Exception as e:
             self.ledger.log(level="error", stage="engine",
                             message=f"Pipeline error on {payload.get('symbol')}: {e}",
                             symbol=payload.get("symbol", ""))
-            return None
+            raise StrategyExecutionError(
+                f"Pipeline failed closed for {payload.get('symbol')}: {type(e).__name__}: {e}"
+            ) from e
 
 
 # Approx seconds per candle, to judge whether a live feed has stalled.

@@ -17,8 +17,9 @@ which reads agreed, so every decision is explainable.
 """
 from __future__ import annotations
 
-from statistics import median
 from typing import Optional, Sequence
+
+import pandas as pd
 
 from bot.data.indicators import atr, ema, rsi
 from bot.types import Bar, Signal, SignalType
@@ -54,37 +55,31 @@ def _htf_trend_vote(bars: Sequence[Bar], mult: int) -> Optional[float]:
     history for an honest read (needs ≥ 24 HTF buckets)."""
     if mult <= 1 or len(bars) < mult * 24 or len(bars) < 2:
         return None
-    deltas = [
-        (bars[i].timestamp - bars[i - 1].timestamp).total_seconds()
-        for i in range(1, len(bars))
-        if bars[i].timestamp > bars[i - 1].timestamp
-    ]
-    if not deltas:
-        return None
-    source_seconds = int(median(deltas))
-    target_seconds = source_seconds * mult
-    buckets: dict[int, list[Bar]] = {}
-    for bar in bars:
-        ts = bar.timestamp
-        if ts.tzinfo is None:
-            from datetime import timezone
-            ts = ts.replace(tzinfo=timezone.utc)
-        epoch = int(ts.timestamp())
-        start = (epoch // target_seconds) * target_seconds  # origin='epoch'
-        buckets.setdefault(start, []).append(bar)
-    htf: list[float] = []
-    for start, rows in sorted(buckets.items()):
-        rows.sort(key=lambda row: row.timestamp)
-        epochs = []
-        for row in rows:
-            ts = row.timestamp
-            if ts.tzinfo is None:
-                from datetime import timezone
-                ts = ts.replace(tzinfo=timezone.utc)
-            epochs.append(int(ts.timestamp()))
-        expected = [start + i * source_seconds for i in range(mult)]
-        if len(rows) == mult and epochs == expected:
-            htf.append(rows[-1].close)
+    index = pd.DatetimeIndex([pd.Timestamp(bar.timestamp) for bar in bars])
+    index = index.tz_localize("UTC") if index.tz is None else index.tz_convert("UTC")
+    if not index.is_monotonic_increasing or not index.is_unique:
+        raise ValueError("HTF input candles must be strictly increasing and unique")
+    deltas = index.to_series().diff().dropna()
+    source_delta = deltas.median()
+    if source_delta <= pd.Timedelta(0) or not (deltas == source_delta).all():
+        raise ValueError("HTF input candles are missing or have an irregular interval")
+
+    htf_rule = source_delta * mult
+    frame = pd.DataFrame(
+        {"close": [float(bar.close) for bar in bars]}, index=index,
+    )
+    aggregated = frame.resample(
+        htf_rule, origin="epoch", closed="left", label="left",
+    ).agg(close=("close", "last"), source_count=("close", "size"))
+
+    # The newest source candle is already closed when this function is called,
+    # so decision time is its close (open timestamp + one source interval).
+    # The target bucket containing that instant is still forming and must never
+    # vote. This is the explicit anti-lookahead boundary.
+    current_time = index[-1] + source_delta
+    forming_bucket = current_time.floor(htf_rule)
+    aggregated = aggregated.loc[aggregated.index < forming_bucket]
+    htf = aggregated.loc[aggregated["source_count"] == mult, "close"].tolist()
     if len(htf) < 24:
         return None
     hf = ema(htf, 10)[-1]

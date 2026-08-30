@@ -217,6 +217,8 @@ CREATE TABLE IF NOT EXISTS instance_market_state (
  duplicate_candles INTEGER NOT NULL DEFAULT 0,
  missing_candles INTEGER NOT NULL DEFAULT 0,
  out_of_order_candles INTEGER NOT NULL DEFAULT 0,
+ last_blocker TEXT,
+ last_blocker_timestamp TIMESTAMPTZ,
  pending_orders_json JSONB NOT NULL DEFAULT '{}'::jsonb,
  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -229,6 +231,8 @@ ALTER TABLE instance_market_state ADD COLUMN IF NOT EXISTS warmup_bars INTEGER N
 ALTER TABLE instance_market_state ADD COLUMN IF NOT EXISTS duplicate_candles INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE instance_market_state ADD COLUMN IF NOT EXISTS missing_candles INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE instance_market_state ADD COLUMN IF NOT EXISTS out_of_order_candles INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE instance_market_state ADD COLUMN IF NOT EXISTS last_blocker TEXT;
+ALTER TABLE instance_market_state ADD COLUMN IF NOT EXISTS last_blocker_timestamp TIMESTAMPTZ;
 ALTER TABLE instance_market_state ADD COLUMN IF NOT EXISTS pending_orders_json JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE instance_market_state ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 DO $$

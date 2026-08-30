@@ -280,6 +280,7 @@ CREATE TABLE IF NOT EXISTS instance_market_state (
  last_market_data_timestamp TEXT, data_source TEXT, warmup_bars INTEGER NOT NULL DEFAULT 0,
  duplicate_candles INTEGER NOT NULL DEFAULT 0, missing_candles INTEGER NOT NULL DEFAULT 0,
  out_of_order_candles INTEGER NOT NULL DEFAULT 0,
+ last_blocker TEXT, last_blocker_timestamp TEXT,
  pending_orders_json TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS simulation_sessions (
@@ -339,7 +340,8 @@ class InstanceStore:
             "instance_id", "last_processed_candle_timestamp", "market_data_mode",
             "market_data_status", "last_market_data_timestamp", "data_source",
             "warmup_bars", "duplicate_candles", "missing_candles",
-            "out_of_order_candles", "pending_orders_json", "updated_at",
+            "out_of_order_candles", "last_blocker", "last_blocker_timestamp",
+            "pending_orders_json", "updated_at",
         ),
         "instance_metrics": ("instance_id", "data_json", "updated_at"),
         "instance_engine_logs": ("id", "instance_id", "ts", "level", "message"),
@@ -421,6 +423,8 @@ class InstanceStore:
                     ensure_column(ledger._c, "trading_instance_platform_settings", name, definition)
                 ensure_column(ledger._c, "instance_market_state",
                               "pending_orders_json", "TEXT NOT NULL DEFAULT '{}'")
+                ensure_column(ledger._c, "instance_market_state", "last_blocker", "TEXT")
+                ensure_column(ledger._c, "instance_market_state", "last_blocker_timestamp", "TEXT")
                 ledger._c.commit()
 
     def _table(self, name):
@@ -702,7 +706,8 @@ class InstanceStore:
                     "market_data_mode": "paper_forward", "market_data_status": "stopped",
                     "last_market_data_timestamp": None, "data_source": None,
                     "warmup_bars": 0, "duplicate_candles": 0, "missing_candles": 0,
-                    "out_of_order_candles": 0, "pending_orders_json": {}}
+                    "out_of_order_candles": 0, "last_blocker": None,
+                    "last_blocker_timestamp": None, "pending_orders_json": {}}
         try:
             if self.remote:
                 rows = remote_call_with_retry(lambda: self._table("instance_market_state")
@@ -728,7 +733,8 @@ class InstanceStore:
             "market_data_mode": "paper_forward", "market_data_status": "stopped",
             "last_market_data_timestamp": None, "data_source": None,
             "warmup_bars": 0, "duplicate_candles": 0, "missing_candles": 0,
-            "out_of_order_candles": 0, "pending_orders_json": {},
+            "out_of_order_candles": 0, "last_blocker": None,
+            "last_blocker_timestamp": None, "pending_orders_json": {},
         }
         try:
             if self.remote:
@@ -759,14 +765,15 @@ class InstanceStore:
                "market_data_mode": "paper_forward", "market_data_status": "warming_up",
                "last_market_data_timestamp": None, "data_source": None,
                "warmup_bars": 0, "duplicate_candles": 0, "missing_candles": 0,
-               "out_of_order_candles": 0, "updated_at": _now(), **values}
+               "out_of_order_candles": 0, "last_blocker": None,
+               "last_blocker_timestamp": None, "updated_at": _now(), **values}
         if self.remote:
             remote_call_with_retry(lambda: self._table("instance_market_state").upsert(row).execute())
         else:
             with self.ledger._lock:
                 self.ledger._c.execute("""INSERT INTO instance_market_state
-                (instance_id,last_processed_candle_timestamp,market_data_mode,market_data_status,last_market_data_timestamp,data_source,warmup_bars,duplicate_candles,missing_candles,out_of_order_candles,updated_at)
-                VALUES (:instance_id,:last_processed_candle_timestamp,:market_data_mode,:market_data_status,:last_market_data_timestamp,:data_source,:warmup_bars,:duplicate_candles,:missing_candles,:out_of_order_candles,:updated_at)
+                (instance_id,last_processed_candle_timestamp,market_data_mode,market_data_status,last_market_data_timestamp,data_source,warmup_bars,duplicate_candles,missing_candles,out_of_order_candles,last_blocker,last_blocker_timestamp,updated_at)
+                VALUES (:instance_id,:last_processed_candle_timestamp,:market_data_mode,:market_data_status,:last_market_data_timestamp,:data_source,:warmup_bars,:duplicate_candles,:missing_candles,:out_of_order_candles,:last_blocker,:last_blocker_timestamp,:updated_at)
                 ON CONFLICT(instance_id) DO UPDATE SET
                   last_processed_candle_timestamp=excluded.last_processed_candle_timestamp,
                   market_data_mode=excluded.market_data_mode,
@@ -777,6 +784,8 @@ class InstanceStore:
                   duplicate_candles=excluded.duplicate_candles,
                   missing_candles=excluded.missing_candles,
                   out_of_order_candles=excluded.out_of_order_candles,
+                  last_blocker=excluded.last_blocker,
+                  last_blocker_timestamp=excluded.last_blocker_timestamp,
                   updated_at=excluded.updated_at""", row)
                 self.ledger._c.commit()
 
@@ -1263,7 +1272,9 @@ class TradingInstanceManager:
                     data_source=market.get("data_source"), warmup_bars=int(market.get("warmup_bars") or 0),
                     duplicate_candles=int(market.get("duplicate_candles") or 0),
                     missing_candles=int(market.get("missing_candles") or 0),
-                    out_of_order_candles=int(market.get("out_of_order_candles") or 0))
+                    out_of_order_candles=int(market.get("out_of_order_candles") or 0),
+                    last_blocker="GATE_REJECTED: WARMUP",
+                    last_blocker_timestamp=market.get("last_blocker_timestamp"))
             def checkpoint(timestamp: str) -> None:
                 runtime_status = engine_ref["engine"].status() if "engine" in engine_ref else {}
                 self.store.save_market_state(instance_id,
@@ -1275,7 +1286,9 @@ class TradingInstanceManager:
                     warmup_bars=int(runtime_status.get("warmup_bars") or 0),
                     duplicate_candles=int(runtime_status.get("duplicate_candles_ignored") or 0),
                     missing_candles=int(runtime_status.get("missing_candles") or 0),
-                    out_of_order_candles=int(runtime_status.get("out_of_order_candles") or 0))
+                    out_of_order_candles=int(runtime_status.get("out_of_order_candles") or 0),
+                    last_blocker=runtime_status.get("last_blocker"),
+                    last_blocker_timestamp=runtime_status.get("last_blocker_timestamp"))
             def lifecycle(event: dict) -> None:
                 state = str(event["state"])
                 with self._lock:
@@ -1312,6 +1325,8 @@ class TradingInstanceManager:
                         duplicate_candles=int(runtime_status.get("duplicate_candles_ignored") or 0),
                         missing_candles=int(runtime_status.get("missing_candles") or 0),
                         out_of_order_candles=int(runtime_status.get("out_of_order_candles") or 0),
+                        last_blocker=runtime_status.get("last_blocker"),
+                        last_blocker_timestamp=runtime_status.get("last_blocker_timestamp"),
                     )
                 level = "error" if state == "error" else "warning" if state in ("data_stale", "recovering") else "info"
                 self.store.append_engine_log(
@@ -2182,7 +2197,9 @@ class TradingInstanceManager:
                           "warmup_bars": engine.get("warmup_bars", market.get("warmup_bars", 0)),
                           "duplicate_candles": engine.get("duplicate_candles_ignored", market.get("duplicate_candles", 0)),
                           "missing_candles": engine.get("missing_candles", market.get("missing_candles", 0)),
-                          "out_of_order_candles": engine.get("out_of_order_candles", market.get("out_of_order_candles", 0))}
+                          "out_of_order_candles": engine.get("out_of_order_candles", market.get("out_of_order_candles", 0)),
+                          "last_blocker": engine.get("last_blocker"),
+                          "last_blocker_timestamp": engine.get("last_blocker_timestamp")}
         reboot = dict(self._reboots.get(instance_id, {})) or None
         if reboot and reboot.get("status") == _REBOOT_RUNNING:
             state = "rebooting"
@@ -2346,7 +2363,12 @@ class TradingInstanceManager:
                 "performance": {**metrics, "net_pnl": execution.get("realized_pnl"),
                                 "return_pct": execution.get("return_pct")},
                 "strategy_health": metrics.get("strategy_health"),
-                "last_decision": last_decision, "metrics": metrics,
+                "last_decision": last_decision,
+                "last_blocker": ((engine or {}).get("last_blocker")
+                                 or market.get("last_blocker")),
+                "last_blocker_timestamp": ((engine or {}).get("last_blocker_timestamp")
+                                           or market.get("last_blocker_timestamp")),
+                "metrics": metrics,
                 "reboot": reboot}
 
     def snapshot(self) -> tuple[list[dict], list[dict], list[dict]]:

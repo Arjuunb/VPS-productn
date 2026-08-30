@@ -216,9 +216,16 @@ class CCXTBroker(Broker):
                 symbol=order.symbol, type=type_, side=side,
                 amount=qty, price=limit_price, params=params,
             )
-        except Exception:
+        except Exception as exc:
             log.exception("Entry order failed on %s", order.symbol)
-            self._order_state().transition(client_id, "CANCELLED", last_error="entry submission failed")
+            # A transport exception is not proof the venue rejected the order:
+            # it may have accepted it before the response was lost. Preserve the
+            # INTENT so startup reconciliation can locate it by clientOrderId;
+            # marking it CANCELLED here would permit a duplicate entry retry.
+            self._order_state().transition(
+                client_id, "INTENT",
+                last_error=f"entry submission outcome unknown: {type(exc).__name__}: {exc}",
+            )
             raise
 
         entry_id = str(result.get("id") or "")
@@ -238,9 +245,13 @@ class CCXTBroker(Broker):
 
     @staticmethod
     def _confirmed_fill_qty(result: dict) -> float:
-        status = str(result.get("status") or "").lower()
         filled = float(result.get("filled") or 0.0)
-        return filled if filled > 0 and status in {"closed", "filled"} else 0.0
+        # ``filled`` is the venue's authoritative cumulative execution quantity.
+        # A limit order can remain ``open`` after a partial fill; waiting for a
+        # terminal status would leave that real exposure unprotected until the
+        # next reconciliation poll. Any positive confirmed quantity therefore
+        # enters the same cancel-remainder -> protect-exact-fill state path.
+        return filled if filled > 0 else 0.0
 
     def protect_filled_entry(self, entry_order_id: str, filled_qty: float) -> dict:
         """Cancel any unfilled remainder and protect exactly the confirmed fill."""

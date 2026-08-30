@@ -20,10 +20,11 @@ from __future__ import annotations
 import argparse
 import csv
 import math
-from statistics import median
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
+
+import pandas as pd
 
 from bot.types import Bar, SignalType
 from strategies.brain_strategy import DecisionBrain
@@ -76,38 +77,43 @@ def resample(bars: list[Bar], group: int) -> list[Bar]:
         return bars
     if len(bars) < 2:
         return []
-    deltas = [
-        (bars[i].timestamp - bars[i - 1].timestamp).total_seconds()
-        for i in range(1, len(bars))
-        if bars[i].timestamp > bars[i - 1].timestamp
+    index = pd.DatetimeIndex([pd.Timestamp(bar.timestamp) for bar in bars])
+    index = index.tz_localize("UTC") if index.tz is None else index.tz_convert("UTC")
+    if not index.is_monotonic_increasing or not index.is_unique:
+        raise ValueError("Resample input candles must be strictly increasing and unique")
+    deltas = index.to_series().diff().dropna()
+    source_delta = deltas.median()
+    if source_delta <= pd.Timedelta(0) or not (deltas == source_delta).all():
+        raise ValueError("Resample input candles are missing or have an irregular interval")
+
+    htf_rule = source_delta * group
+    frame = pd.DataFrame(
+        {
+            "open": [float(bar.open) for bar in bars],
+            "high": [float(bar.high) for bar in bars],
+            "low": [float(bar.low) for bar in bars],
+            "close": [float(bar.close) for bar in bars],
+            "volume": [float(bar.volume) for bar in bars],
+        },
+        index=index,
+    )
+    aggregated = frame.resample(
+        htf_rule, origin="epoch", closed="left", label="left",
+    ).agg(
+        open=("open", "first"), high=("high", "max"),
+        low=("low", "min"), close=("close", "last"),
+        volume=("volume", "sum"), source_count=("close", "size"),
+    )
+
+    current_time = index[-1] + source_delta
+    forming_bucket = current_time.floor(htf_rule)
+    complete = aggregated.loc[
+        (aggregated.index < forming_bucket) & (aggregated["source_count"] == group)
     ]
-    if not deltas:
-        return []
-    source_seconds = int(median(deltas))
-    target_seconds = source_seconds * group
-    buckets: dict[int, list[Bar]] = {}
-    for bar in bars:
-        ts = bar.timestamp
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        epoch = int(ts.timestamp())
-        bucket = (epoch // target_seconds) * target_seconds  # origin='epoch'
-        buckets.setdefault(bucket, []).append(bar)
-    out: list[Bar] = []
-    for bucket, rows in sorted(buckets.items()):
-        rows.sort(key=lambda row: row.timestamp)
-        contiguous = len(rows) == group and all(
-            abs((rows[i].timestamp - rows[i - 1].timestamp).total_seconds()
-                - source_seconds) < 1e-6
-            for i in range(1, len(rows))
-        )
-        if not contiguous:
-            continue
-        out.append(Bar(datetime.fromtimestamp(bucket, tz=timezone.utc),
-                       rows[0].open, max(b.high for b in rows),
-                       min(b.low for b in rows), rows[-1].close,
-                       sum(b.volume for b in rows)))
-    return out
+    return [
+        Bar(stamp.to_pydatetime(), row.open, row.high, row.low, row.close, row.volume)
+        for stamp, row in complete.iterrows()
+    ]
 
 
 @dataclass

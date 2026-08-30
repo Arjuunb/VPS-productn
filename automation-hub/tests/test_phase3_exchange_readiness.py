@@ -104,6 +104,24 @@ class _FillOnCancelExchange(_FakeExchange):
         entry["filled"] = 0.2
 
 
+class _ImmediatePartialFillExchange(_FakeExchange):
+    def create_order(self, symbol, type, side, amount, price=None, params=None):
+        result = super().create_order(symbol, type, side, amount, price, params)
+        if type == "limit":
+            self.orders[-1]["filled"] = 0.2
+            result.update(status="open", filled=0.2)
+        return result
+
+
+class _AcceptedButResponseLostExchange(_FakeExchange):
+    def create_order(self, symbol, type, side, amount, price=None, params=None):
+        result = super().create_order(symbol, type, side, amount, price, params)
+        if type == "limit":
+            self.orders[-1].update(status="closed", filled=amount)
+            raise TimeoutError("response lost after venue acceptance")
+        return result
+
+
 def _broker_with_fake(state_path=":memory:", exchange=None):
     from bot.brokers.ccxt_broker import CCXTBroker
     from bot.brokers.order_state import OrderStateStore
@@ -230,6 +248,38 @@ def test_partial_fill_cancels_remainder_then_protects_exact_fill():
     assert [row["amount"] for row in b._x.orders[1:]] == [0.2, 0.2]
     assert protected["filled_qty"] == 0.2
     assert protected["state"] == "PROTECTION_ACCEPTED"
+
+
+def test_immediate_open_partial_fill_is_protected_without_waiting_for_poll():
+    exchange = _ImmediatePartialFillExchange()
+    broker = _broker_with_fake(exchange=exchange)
+    entry_id = broker.submit_order(Order(
+        symbol="BTC/USDT", side=Side.BUY, qty=0.5,
+        order_type=OrderType.LIMIT, limit_price=100.0,
+        stop_loss=95.0, take_profit=110.0, client_id="immediate-partial",
+    ))
+    state = broker._order_state().by_entry_id(entry_id)
+    assert state["state"] == "PROTECTION_ACCEPTED"
+    assert state["filled_qty"] == 0.2
+    assert exchange.cancelled == [(entry_id, "BTC/USDT")]
+    assert all(order["params"].get("reduceOnly") is True for order in exchange.orders[1:])
+
+
+def test_unknown_entry_submission_outcome_remains_recoverable_intent(tmp_path):
+    state_path = tmp_path / "orders.db"
+    exchange = _AcceptedButResponseLostExchange()
+    broker = _broker_with_fake(state_path, exchange)
+    with pytest.raises(TimeoutError, match="response lost"):
+        broker.submit_order(Order(
+            symbol="BTC/USDT", side=Side.BUY, qty=0.5,
+            order_type=OrderType.LIMIT, limit_price=100.0,
+            stop_loss=95.0, take_profit=110.0, client_id="lost-response",
+        ))
+    assert broker._order_state().by_client_id("lost-response")["state"] == "INTENT"
+
+    recovered = _broker_with_fake(state_path, exchange).recover_open_orders()
+    assert recovered[0]["state"] == "PROTECTION_ACCEPTED"
+    assert all(order["params"].get("reduceOnly") is True for order in exchange.orders[1:])
 
 
 def test_timeout_cancel_race_protects_late_partial_fill():
