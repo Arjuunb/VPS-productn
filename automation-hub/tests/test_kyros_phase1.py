@@ -158,6 +158,19 @@ def test_pipeline_rejects_when_paused(pipeline):
     assert not res.accepted and res.stage == "controls"
 
 
+def test_pause_blocks_entries_but_never_protective_close(pipeline, paper):
+    assert pipeline.process(_alert(alert_id="open-before-pause")).accepted
+    pipeline.controls.pause_all()
+    payload = _alert(alert_id="stop-while-paused", side="CLOSE", entry=65_000)
+    # Protective exits bypass entry-only freshness/market-quality gates.
+    payload["timestamp"] = "2000-01-01T00:00:00+00:00"
+    closed = pipeline.process(payload)
+    assert closed.accepted and closed.reason == "position closed"
+    assert paper.positions() == []
+    assert any(step.rule == "controls" and "risk-reducing exit allowed" in step.detail
+               for step in closed.steps)
+
+
 def test_pipeline_rejects_invalid_stop(pipeline):
     res = pipeline.process(_alert(stop=None))
     assert not res.accepted and res.stage == "risk"

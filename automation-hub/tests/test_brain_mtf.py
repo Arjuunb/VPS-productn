@@ -7,25 +7,33 @@ Measured on the seeded synthetic regime grid before defaulting ON
 The counter-HTF subset under "off" was net-negative in both suites
 (-29.0R / -11.8R); damping removes exactly those entries.
 """
+from datetime import datetime, timedelta, timezone
+
 from bot.data.synthetic import generate_bars
+from bot.types import Bar
 from strategies.brain_strategy import DecisionBrain, _htf_trend_vote
+
+
+def _trend_bars(up: bool, n: int = 400):
+    start = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    factor = 1.005 if up else 0.995
+    return [Bar(start + timedelta(minutes=5 * i), 100, 101, 99,
+                100 * (factor ** i), 1000) for i in range(n)]
 
 
 # ------------------------------------------------------------- the HTF vote
 def test_htf_vote_reads_uptrend():
-    closes = [100 * (1.005 ** i) for i in range(400)]
-    assert _htf_trend_vote(closes, 12) == 1.0
+    assert _htf_trend_vote(_trend_bars(True), 12) == 1.0
 
 
 def test_htf_vote_reads_downtrend():
-    closes = [100 * (0.995 ** i) for i in range(400)]
-    assert _htf_trend_vote(closes, 12) == -1.0
+    assert _htf_trend_vote(_trend_bars(False), 12) == -1.0
 
 
 def test_htf_vote_honest_without_history():
     # < 24 aggregated buckets -> no read, never a guess
-    assert _htf_trend_vote([100.0] * 100, 12) is None
-    assert _htf_trend_vote([100.0] * 500, 1) is None  # mult<=1 = not an HTF
+    assert _htf_trend_vote(_trend_bars(True, 100), 12) is None
+    assert _htf_trend_vote(_trend_bars(True, 500), 1) is None  # mult<=1 = not an HTF
 
 
 # ------------------------------------------------- damping filters counter-HTF
@@ -39,7 +47,7 @@ def _signals(mode: str, seed: int = 2050):
         sig = strat.on_bar(bar)
         if sig is None:
             continue
-        v = _htf_trend_vote([b.close for b in strat.bars], 12)
+        v = _htf_trend_vote(strat.bars, 12)
         sd = 1.0 if sig.type.name == "LONG" else -1.0
         if v is not None and v * sd < 0:
             counter += 1
@@ -54,6 +62,14 @@ def test_damp_removes_counter_htf_entries_and_keeps_agreeing_ones():
     assert off_counter > 0                # the raw brain does fire against HTF
     assert damp_counter == 0              # damping filters every one of them
     assert damp_agree == off_agree        # agreeing entries pass untouched
+
+
+def test_incomplete_epoch_bucket_does_not_repaint_closed_htf_vote():
+    rows = _trend_bars(True, 396)  # 33 complete 1h buckets
+    baseline = _htf_trend_vote(rows, 12)
+    # Eleven bars of the next left-closed bucket cannot alter the closed HTF read.
+    extended = _trend_bars(True, 407)
+    assert _htf_trend_vote(extended, 12) == baseline
 
 
 # --------------------------------------------------------- honest reporting

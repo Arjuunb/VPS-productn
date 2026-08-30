@@ -443,30 +443,44 @@ class SignalPipeline:
                     pass
             return PipelineResult(False, stage, reason, steps)
 
+        # Classify exposure direction before applying entry-only controls. Pause
+        # is a soft entry gate, never a veto on a protective/risk-reducing exit.
+        existing = self.paper.open_position(symbol)
+        is_close = side in _CLOSE_SIDES or (
+            existing is not None and _dir(side) != existing["side"]
+        )
+
         # 1. emergency controls
-        if not self.controls.trading_allowed():
+        if not self.controls.trading_allowed() and not is_close:
             return reject("controls", f"Trading {self.controls.state.lower()} — entry blocked")
-        steps.append(Step("controls", True, "trading active"))
+        steps.append(Step(
+            "controls", True,
+            (f"risk-reducing exit allowed while trading is {self.controls.state.lower()}"
+             if is_close and not self.controls.trading_allowed() else "trading active"),
+        ))
 
         # 1.5 market-quality gate (fail-closed: bad data / untradeable market -> veto)
-        q = self.quality.check(
-            entry=entry, stop=stop, timestamp=payload.get("timestamp"),
-            bid=payload.get("bid"), ask=payload.get("ask"),
-            spread_bps=payload.get("spread_bps"),
-        )
-        if not q.ok:
-            return reject("market_quality", q.reason)
-        steps.append(Step("market_quality", True, "data + microstructure ok"))
+        if is_close:
+            # An entry may wait for ideal data; an existing position may not.
+            # Exit pricing/fill validation belongs to the execution adapter.
+            steps.append(Step("market_quality", True, "protective exit bypass"))
+        else:
+            q = self.quality.check(
+                entry=entry, stop=stop, timestamp=payload.get("timestamp"),
+                bid=payload.get("bid"), ask=payload.get("ask"),
+                spread_bps=payload.get("spread_bps"),
+            )
+            if not q.ok:
+                return reject("market_quality", q.reason)
+            steps.append(Step("market_quality", True, "data + microstructure ok"))
 
         # 2. duplicate protection
         if self.dedup.is_duplicate(alert_id):
             return reject("dedup", f"Duplicate alert_id within {self.dedup.window_seconds}s", status="duplicate")
         steps.append(Step("dedup", True, "no duplicate"))
 
-        existing = self.paper.open_position(symbol)
-
         # 3a. CLOSE signal (explicit, or opposite side of an open position)
-        if side in _CLOSE_SIDES or (existing and _dir(side) != existing["side"]):
+        if is_close:
             if existing is None:
                 return reject("execution", "Close signal with no open position")
             # link the closing trade to its open journal before the ledger row closes

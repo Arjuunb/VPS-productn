@@ -171,6 +171,14 @@ class InstanceLedger:
             **kw, instance_id=self.instance_id,
             simulation_session_id=self.simulation_session_id)
 
+    def open_position_and_trade(self, *, position, trade):
+        p, t = dict(position), dict(trade)
+        p.update(instance_id=self.instance_id,
+                 simulation_session_id=self.simulation_session_id)
+        t.update(instance_id=self.instance_id,
+                 simulation_session_id=self.simulation_session_id)
+        return self._ledger.open_position_and_trade(position=p, trade=t)
+
     def get_positions(self, status=None):
         return self._ledger.get_positions(
             status, instance_id=self.instance_id,
@@ -200,6 +208,21 @@ class InstanceLedger:
 
     def close_paper_trade(self, trade_id, **kw):
         return self._ledger.close_paper_trade(trade_id, **kw, instance_id=self.instance_id)
+
+    def close_position_and_trade(self, **kw):
+        return self._ledger.close_position_and_trade(**kw, instance_id=self.instance_id)
+
+    def reduce_position_and_trade(self, *, position, remainder_position,
+                                  remainder_trade, **kw):
+        p, rp, rt = dict(position), dict(remainder_position), dict(remainder_trade)
+        p["instance_id"] = self.instance_id
+        rp.update(instance_id=self.instance_id,
+                  simulation_session_id=self.simulation_session_id)
+        rt.update(instance_id=self.instance_id,
+                  simulation_session_id=self.simulation_session_id)
+        return self._ledger.reduce_position_and_trade(
+            position=p, remainder_position=rp, remainder_trade=rt,
+            **kw, instance_id=self.instance_id)
 
     def log(self, *, level, stage, message, symbol=""):
         return self._ledger.log(level=level, stage=stage, message=message, symbol=symbol,

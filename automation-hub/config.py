@@ -64,16 +64,16 @@ class Settings:
         "HUB_DB_PATH", str(DATA_DIR / "hub.db")))
 
     # --- Kyros Phase 1: webhook + ledger ---
-    webhook_secret: str = field(default_factory=lambda: os.environ.get("HUB_WEBHOOK_SECRET", "dev-webhook-secret"))
-    # M-5: admin/control credential for the dashboard, DECOUPLED from the webhook
-    # secret (which is shared with TradingView and so more likely to leak).
-    # Defaults to the webhook secret, so behaviour is unchanged until an operator
-    # sets HUB_API_KEY. With HUB_SCOPE_WEBHOOK=1 the webhook secret is then
-    # rejected on non-webhook endpoints — it can only post alerts, not control.
-    admin_key: str = field(default_factory=lambda: (
-        os.environ.get("HUB_API_KEY") or os.environ.get("HUB_WEBHOOK_SECRET", "dev-webhook-secret")))
-    scope_webhook_secret: bool = field(default_factory=lambda: (
-        os.environ.get("HUB_SCOPE_WEBHOOK", "").lower() in ("1", "true", "yes", "on")))
+    webhook_secret: str = field(default_factory=lambda: os.environ.get(
+        "HUB_WEBHOOK_SECRET", "dev-webhook-secret"))
+    # Control, webhook and exchange credentials are separate namespaces. Never
+    # alias HUB_API_KEY here: that legacy name was also consumed as an exchange
+    # key and made the exchange identifier a full application-control secret.
+    admin_key: str = field(default_factory=lambda: os.environ.get(
+        "HUB_CONTROL_KEY", "dev-control-key"))
+    # Compatibility attribute for status/tests. Webhook credentials are now
+    # unconditionally scoped to webhook ingestion.
+    scope_webhook_secret: bool = True
     exposure_limit_pct: float = field(default_factory=lambda: float(os.environ.get("HUB_EXPOSURE_LIMIT", "0.05")))
     ledger_path: str = field(default_factory=lambda: os.environ.get(
         "HUB_LEDGER_PATH", str(DATA_DIR / "ledger.db")))
@@ -91,6 +91,8 @@ class Settings:
     auto_strategy: str = field(default_factory=lambda: os.environ.get("HUB_AUTO_STRATEGY", "brain"))
     use_live_data: bool = field(default_factory=lambda: os.environ.get("HUB_USE_LIVE_DATA", "").lower() in ("1", "true", "yes"))
     live_poll_s: float = field(default_factory=lambda: float(os.environ.get("HUB_LIVE_POLL", "60")))
+    external_live_enabled: bool = field(default_factory=lambda: os.environ.get(
+        "HUB_ENABLE_EXTERNAL_LIVE", "0").lower() in ("1", "true", "yes", "on"))
 
     # --- market-quality gate (fail-closed pre-trade safety) ---
     quality_min_stop_pct: float = field(default_factory=lambda: float(os.environ.get("HUB_QUALITY_MIN_STOP", "0.0005")))
@@ -176,3 +178,36 @@ class Settings:
 
 
 settings = Settings()
+
+
+def validate_credential_separation(*, production: bool = False) -> None:
+    """Fail startup when control, webhook and exchange secrets overlap.
+
+    Production additionally requires all three credential classes. Development
+    retains distinct non-secret defaults so a local paper-only app can boot.
+    """
+    values = {
+        "HUB_CONTROL_KEY": settings.admin_key,
+        "HUB_WEBHOOK_SECRET": settings.webhook_secret,
+        "HUB_EXCHANGE_API_KEY": os.environ.get("HUB_EXCHANGE_API_KEY", ""),
+        "HUB_EXCHANGE_API_SECRET": os.environ.get("HUB_EXCHANGE_API_SECRET", ""),
+    }
+    present = [(name, value) for name, value in values.items() if value]
+    for index, (left_name, left_value) in enumerate(present):
+        for right_name, right_value in present[index + 1:]:
+            if left_value == right_value:
+                raise RuntimeError(
+                    f"REFUSING TO BOOT: {left_name} and {right_name} must be different values"
+                )
+    if production:
+        required = ("HUB_CONTROL_KEY", "HUB_WEBHOOK_SECRET")
+        if settings.external_live_enabled:
+            required += ("HUB_EXCHANGE_API_KEY", "HUB_EXCHANGE_API_SECRET")
+        missing = [name for name in required if not values[name]]
+        if missing:
+            raise RuntimeError(
+                "REFUSING TO BOOT: missing independent production credentials: "
+                + ", ".join(missing)
+            )
+        if settings.admin_key == "dev-control-key" or settings.webhook_secret == "dev-webhook-secret":
+            raise RuntimeError("REFUSING TO BOOT: development control/webhook credentials are active")

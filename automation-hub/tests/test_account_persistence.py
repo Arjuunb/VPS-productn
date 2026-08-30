@@ -138,9 +138,8 @@ def test_supabase_persistence_is_based_on_real_connection(monkeypatch):
     assert c["persistent"] is True and c["storage"] == "supabase" and c["warning"] is None
 
 
-def test_broken_supabase_falls_back_to_sqlite_instead_of_crashing(monkeypatch):
-    """The failed-deploy fix: a Supabase that raises must never crash boot —
-    get_ledger() falls back to SQLite and records the error."""
+def test_configured_supabase_failure_is_fail_closed(monkeypatch):
+    """A configured primary must never split writes into a local fallback."""
     from data import ledger as ledger_mod
 
     class ExplodingLedger:
@@ -154,21 +153,21 @@ def test_broken_supabase_falls_back_to_sqlite_instead_of_crashing(monkeypatch):
     for k, v in list(ledger_mod.SUPABASE_STATUS.items()):
         monkeypatch.setitem(ledger_mod.SUPABASE_STATUS, k, v)
 
-    led = ledger_mod.get_ledger(":memory:")
-    assert type(led).__name__ == "SqliteLedger"          # fell back, no crash
+    with pytest.raises(RuntimeError, match="fail-closed"):
+        ledger_mod.get_ledger(":memory:")
     assert ledger_mod.SUPABASE_STATUS["configured"] is True
     assert ledger_mod.SUPABASE_STATUS["connected"] is False
     assert "bad key" in ledger_mod.SUPABASE_STATUS["error"]
 
-    # probe failure (client builds, first query raises) also falls back
+    # Probe failure (client builds, first query raises) also fails closed.
     class ProbeFailLedger:
         def __init__(self, url, key): ...
         def get_paper_trades(self):
             raise RuntimeError('relation "paper_trades" does not exist')
 
     monkeypatch.setattr(ledger_mod, "SupabaseLedger", ProbeFailLedger)
-    led2 = ledger_mod.get_ledger(":memory:")
-    assert type(led2).__name__ == "SqliteLedger"
+    with pytest.raises(RuntimeError, match="fail-closed"):
+        ledger_mod.get_ledger(":memory:")
     assert "does not exist" in ledger_mod.SUPABASE_STATUS["error"]
 
     # healthy Supabase is used and reported connected

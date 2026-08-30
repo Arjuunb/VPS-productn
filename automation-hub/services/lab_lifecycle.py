@@ -56,6 +56,7 @@ def lifecycle_state(*, connection_state: str, reliable: bool,
 
 def blockers(*, connection: dict, operating_mode: str, account: dict,
              strategy_valid: bool, positions: Iterable[dict],
+             pending_orders: Iterable[dict] = (),
              risk_pct: float | None = None, max_risk_pct: float = 1.0) -> list[str]:
     """Return explicit execution blockers without granting execution authority."""
     rows: list[str] = []
@@ -76,6 +77,12 @@ def blockers(*, connection: dict, operating_mode: str, account: dict,
             rows.append(
                 f"{position.get('symbol', 'position')} is LEGACY / UNPROTECTED and requires explicit repair or close"
             )
+        else:
+            rows.append(
+                f"{position.get('symbol', 'position')} protected paper position is already open; new entries are blocked"
+            )
+    if any(not row.get("reduce_only") for row in pending_orders):
+        rows.append("a pending paper entry order already exists; new entries are blocked")
     return list(dict.fromkeys(rows))
 
 

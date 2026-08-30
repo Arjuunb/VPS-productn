@@ -48,7 +48,7 @@ class SMCSessionBody(BaseModel):
     symbol: str = "BTCUSDT"
     timeframe: str = "5m"
     starting_balance: float = Field(default=10_000, gt=0)
-    operating_mode: str = "signals_only"
+    operating_mode: str = "automatic"
     model_id: str = "SMC_M1_SWEEP_REVERSAL"
     risk_pct: float = Field(default=0.5, gt=0, le=1)
 
@@ -58,7 +58,7 @@ class SMCSessionConfigBody(BaseModel):
     symbol: str | None = None
     timeframe: str | None = None
     replay_cursor: int | None = Field(default=None, ge=0)
-    operating_mode: str = "signals_only"
+    operating_mode: str = "automatic"
     model_id: str = "SMC_M1_SWEEP_REVERSAL"
     risk_pct: float = Field(default=0.5, gt=0, le=1)
 

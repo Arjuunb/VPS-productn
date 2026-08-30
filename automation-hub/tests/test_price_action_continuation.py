@@ -66,6 +66,30 @@ def test_automatic_paper_lifecycle_sizes_rounds_protects_and_stops_first(tmp_pat
     assert state["account"]["realized_pnl"] < 0
 
 
+def test_historical_proposal_is_not_replayed_as_a_current_order(tmp_path):
+    account = PriceActionPaperAccount(tmp_path / "historical-proposal.db")
+    account.configure(execution_config=PaperExecutionConfig(operating_mode="automatic"))
+    historical = visual()
+    historical["proposals"][0]["signal_at"] = bar(0).timestamp.isoformat()
+
+    first = account.synchronize_strategy(
+        historical, contract_rules=RULES, candle=bar(10), feed_reliable=True)
+
+    assert first["created"] == []
+    assert account.state()["orders"] == []
+    evaluation = account.state()["evaluations"][0]
+    assert evaluation["state"] == "WATCHING"
+    assert evaluation["payload"]["proposal_ids"] == []
+
+    current = visual()
+    current["proposals"][0]["signal_at"] = bar(11).timestamp.isoformat()
+    second = account.synchronize_strategy(
+        current, contract_rules=RULES, candle=bar(11), feed_reliable=True)
+
+    assert len(second["created"]) == 1
+    assert second["created"][0]["accepted"] is True
+
+
 def test_restart_repairs_missing_strategy_protection_without_touching_manual_positions(tmp_path):
     path = tmp_path / "restart-protection.db"
     account = PriceActionPaperAccount(path)
@@ -164,6 +188,7 @@ def test_restart_consolidates_legacy_multiple_owners_and_cancels_pending_entries
 
 def test_signals_manual_approval_duplicate_and_unreliable_feed_are_explicit(tmp_path):
     account = PriceActionPaperAccount(tmp_path / "modes.db")
+    account.configure(execution_config=PaperExecutionConfig(operating_mode="signals_only"))
     signal = account.synchronize_strategy(visual(), contract_rules=RULES,
                                           candle=bar(1), feed_reliable=True)
     assert signal["created"] == []
@@ -183,6 +208,16 @@ def test_signals_manual_approval_duplicate_and_unreliable_feed_are_explicit(tmp_
     assert "unreliable" in rejected["payload"]["reason"]
 
 
+def test_new_price_action_session_defaults_to_automatic_paper(tmp_path):
+    account = PriceActionPaperAccount(tmp_path / "automatic-default.db")
+    result = account.synchronize_strategy(
+        visual(), contract_rules=RULES, candle=bar(1), feed_reliable=True,
+    )
+    assert account.session()["operating_mode"] == "automatic"
+    assert result["created"] and result["created"][0]["accepted"] is True
+    assert account.state()["orders"]
+
+
 def test_ended_session_can_resume_wallet_orders_and_positions(tmp_path):
     account = PriceActionPaperAccount(tmp_path / "sessions.db")
     old = account.session()["id"]
@@ -196,6 +231,24 @@ def test_ended_session_can_resume_wallet_orders_and_positions(tmp_path):
     assert resumed["positions"][0]["symbol"] == "BTCUSDT"
     exported = account.export_session(old)
     assert exported["session"]["state"]["positions"]
+
+
+def test_restart_does_not_create_new_pa_session_over_ended_session_exposure(tmp_path):
+    path = tmp_path / "pa-orphaned-exposure.db"
+    account = PriceActionPaperAccount(path)
+    old = account.session()["id"]
+    account.broker.submit(symbol="BTCUSDT", side="buy", order_type="market", quantity=1)
+    account.broker.process_candle("BTCUSDT", bar(1))
+    account.end()
+
+    reopened = PriceActionPaperAccount(path)
+
+    assert reopened.session() == {}
+    assert len(reopened.sessions()) == 1
+    assert reopened.state()["positions"][0]["symbol"] == "BTCUSDT"
+    resumed = reopened.resume(old)
+    assert resumed["session"]["id"] == old
+    assert resumed["positions"][0]["symbol"] == "BTCUSDT"
 
 
 def test_global_factory_reset_erases_price_action_session_history(tmp_path):
@@ -352,6 +405,24 @@ def test_pending_order_reconciliation_expires_strategy_only_and_preserves_manual
     assert result["after"]["pending_manual_orders"] == 1
     assert result["manual_orders_changed"] == 0
     assert any(row["kind"] == "paper_order_reconciled" for row in account.state()["activity"])
+
+
+def test_pending_order_expiry_uses_absolute_index_beyond_capped_visual_window(tmp_path):
+    account = PriceActionPaperAccount(tmp_path / "absolute-expiry.db")
+    account.configure(execution_config=PaperExecutionConfig(operating_mode="automatic"))
+    initial = visual(count=1500)
+    initial["absolute_last_bar_index"] = 1499
+    initial["proposals"][0]["valid_until_index"] = 1502
+    account.synchronize_strategy(initial, contract_rules=RULES,
+                                 candle=bar(1), feed_reliable=True)
+
+    advanced = visual(proposal=False, count=1500)
+    advanced["absolute_last_bar_index"] = 1503
+    result = account.reconcile_pending_orders(advanced, bar(4))
+
+    assert result["actions"][0]["to"] == "EXPIRED"
+    assert result["after"]["pending_strategy_orders"] == 0
+    assert account.state()["orders"][0]["status"] == "cancelled"
 
 
 def test_session_identity_change_is_blocked_while_paper_exposure_exists(tmp_path):

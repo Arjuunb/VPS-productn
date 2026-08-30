@@ -87,6 +87,18 @@ class Ledger(Protocol):
     def get_positions(self, status: Optional[str] = None, instance_id: str = "",
                       simulation_session_id: str = "") -> list[dict]: ...
     def record_paper_trade(self, trade: dict) -> str: ...
+    def open_position_and_trade(self, *, position: dict, trade: dict) -> tuple[str, str]: ...
+    def close_position_and_trade(self, *, position_id: str, trade_id: str,
+                                 exit_price: float, pnl: float, rr: float,
+                                 fees: float = 0.0, realized_pnl: float | None = None,
+                                 equity_after_close: float | None = None,
+                                 instance_id: str = "") -> None: ...
+    def reduce_position_and_trade(self, *, position: dict, trade_id: str,
+                                  remainder_position: dict, remainder_trade: dict,
+                                  exit_price: float, pnl: float, rr: float,
+                                  closed_size: float, fees: float,
+                                  equity_after_close: float,
+                                  instance_id: str = "") -> tuple[str, str]: ...
     def close_paper_trade(self, trade_id: str, *, exit_price: float, pnl: float, rr: float,
                           size: float | None = None, fees: float = 0.0,
                           realized_pnl: float | None = None,
@@ -202,6 +214,41 @@ class SqliteLedger:
             self._c.commit()
         return pid
 
+    def open_position_and_trade(self, *, position: dict, trade: dict) -> tuple[str, str]:
+        """Create the position and its accounting trade in one transaction."""
+        pid, tid, opened_at = _id(), trade.get("id") or _id(), _now()
+        instance_id = position.get("instance_id") or trade.get("instance_id") or ""
+        session_id = (position.get("simulation_session_id")
+                      or trade.get("simulation_session_id") or "")
+        with self._lock:
+            try:
+                self._c.execute("BEGIN IMMEDIATE")
+                self._c.execute(
+                    "INSERT INTO positions(id,symbol,side,size,entry,stop,target,management_json,status,pnl,opened_at,instance_id,simulation_session_id)"
+                    " VALUES (?,?,?,?,?,?,?,?, 'open', 0, ?,?,?)",
+                    (pid, position["symbol"], position["side"], position["size"],
+                     position["entry"], position.get("stop"), position.get("target"),
+                     json.dumps(position.get("management") or {}, separators=(",", ":")),
+                     opened_at, instance_id, session_id),
+                )
+                self._c.execute(
+                    "INSERT INTO paper_trades(id,alert_id,symbol,side,size,entry,stop,target,status,"
+                    "opened_at,strategy_id,instance_id,simulation_session_id,sizing_mode,sizing_engine_version,"
+                    "risk_basis_at_entry,risk_pct_at_entry,risk_amount_at_entry,equity_before_trade,fees) "
+                    "VALUES (?,?,?,?,?,?,?,?, 'open', ?,?,?,?,?,?,?,?,?,?,0)",
+                    (tid, trade.get("alert_id"), trade["symbol"], trade["side"],
+                     trade["size"], trade["entry"], trade.get("stop"), trade.get("target"),
+                     opened_at, trade.get("strategy_id") or "", instance_id, session_id,
+                     trade.get("sizing_mode"), trade.get("sizing_engine_version"),
+                     trade.get("risk_basis_at_entry"), trade.get("risk_pct_at_entry"),
+                     trade.get("risk_amount_at_entry"), trade.get("equity_before_trade")),
+                )
+                self._c.commit()
+            except Exception:
+                self._c.rollback()
+                raise
+        return pid, tid
+
     def close_position(self, position_id, *, exit_price, pnl, instance_id=""):
         with self._lock:
             query = "UPDATE positions SET status='closed', pnl=?, closed_at=? WHERE id=?"
@@ -212,6 +259,94 @@ class SqliteLedger:
             cur = self._c.execute(query, args)
             self._c.commit()
             return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+    def close_position_and_trade(self, *, position_id: str, trade_id: str,
+                                 exit_price: float, pnl: float, rr: float,
+                                 fees: float = 0.0, realized_pnl: float | None = None,
+                                 equity_after_close: float | None = None,
+                                 instance_id: str = "") -> None:
+        """Close matching position/trade rows or roll both back."""
+        closed_at = _now()
+        with self._lock:
+            try:
+                self._c.execute("BEGIN IMMEDIATE")
+                pq = "UPDATE positions SET status='closed', pnl=?, closed_at=? WHERE id=? AND status='open'"
+                pargs: list = [pnl, closed_at, position_id]
+                if instance_id:
+                    pq += " AND instance_id=?"; pargs.append(instance_id)
+                pcur = self._c.execute(pq, pargs)
+                tq = ("UPDATE paper_trades SET status='closed', exit=?, pnl=?, rr=?, fees=?, "
+                      "realized_pnl=?, equity_after_close=?, closed_at=? "
+                      "WHERE id=? AND status='open'")
+                targs: list = [exit_price, pnl, rr, fees,
+                               pnl if realized_pnl is None else realized_pnl,
+                               equity_after_close, closed_at, trade_id]
+                if instance_id:
+                    tq += " AND instance_id=?"; targs.append(instance_id)
+                tcur = self._c.execute(tq, targs)
+                if pcur.rowcount != 1 or tcur.rowcount != 1:
+                    raise RuntimeError("paper close invariant failed: position/trade pair not open")
+                self._c.commit()
+            except Exception:
+                self._c.rollback()
+                raise
+
+    def reduce_position_and_trade(self, *, position: dict, trade_id: str,
+                                  remainder_position: dict, remainder_trade: dict,
+                                  exit_price: float, pnl: float, rr: float,
+                                  closed_size: float, fees: float,
+                                  equity_after_close: float,
+                                  instance_id: str = "") -> tuple[str, str]:
+        """Close the fraction and open the remainder as one indivisible unit."""
+        new_pid, new_tid, now = _id(), remainder_trade.get("id") or _id(), _now()
+        session_id = (remainder_position.get("simulation_session_id")
+                      or remainder_trade.get("simulation_session_id") or "")
+        instance_id = instance_id or remainder_position.get("instance_id") or ""
+        with self._lock:
+            try:
+                self._c.execute("BEGIN IMMEDIATE")
+                pq = "UPDATE positions SET status='closed',pnl=?,closed_at=? WHERE id=? AND status='open'"
+                pargs: list = [pnl, now, position["id"]]
+                if instance_id:
+                    pq += " AND instance_id=?"; pargs.append(instance_id)
+                pcur = self._c.execute(pq, pargs)
+                tq = ("UPDATE paper_trades SET status='closed',exit=?,pnl=?,rr=?,fees=?,"
+                      "realized_pnl=?,equity_after_close=?,size=?,closed_at=? "
+                      "WHERE id=? AND status='open'")
+                targs: list = [exit_price, pnl, rr, fees, pnl, equity_after_close,
+                               closed_size, now, trade_id]
+                if instance_id:
+                    tq += " AND instance_id=?"; targs.append(instance_id)
+                tcur = self._c.execute(tq, targs)
+                if pcur.rowcount != 1 or tcur.rowcount != 1:
+                    raise RuntimeError("paper reduce invariant failed: position/trade pair not open")
+                self._c.execute(
+                    "INSERT INTO positions(id,symbol,side,size,entry,stop,target,management_json,status,pnl,opened_at,instance_id,simulation_session_id)"
+                    " VALUES (?,?,?,?,?,?,?,?, 'open', 0, ?,?,?)",
+                    (new_pid, remainder_position["symbol"], remainder_position["side"],
+                     remainder_position["size"], remainder_position["entry"],
+                     remainder_position.get("stop"), remainder_position.get("target"),
+                     json.dumps(remainder_position.get("management") or {}, separators=(",", ":")),
+                     now, instance_id, session_id),
+                )
+                self._c.execute(
+                    "INSERT INTO paper_trades(id,alert_id,symbol,side,size,entry,stop,target,status,"
+                    "opened_at,strategy_id,instance_id,simulation_session_id,sizing_mode,sizing_engine_version,"
+                    "risk_basis_at_entry,risk_pct_at_entry,risk_amount_at_entry,equity_before_trade,fees) "
+                    "VALUES (?,?,?,?,?,?,?,?, 'open', ?,?,?,?,?,?,?,?,?,?,0)",
+                    (new_tid, remainder_trade.get("alert_id"), remainder_trade["symbol"],
+                     remainder_trade["side"], remainder_trade["size"], remainder_trade["entry"],
+                     remainder_trade.get("stop"), remainder_trade.get("target"), now,
+                     remainder_trade.get("strategy_id") or "", instance_id, session_id,
+                     remainder_trade.get("sizing_mode"), remainder_trade.get("sizing_engine_version"),
+                     remainder_trade.get("risk_basis_at_entry"), remainder_trade.get("risk_pct_at_entry"),
+                     remainder_trade.get("risk_amount_at_entry"), remainder_trade.get("equity_before_trade")),
+                )
+                self._c.commit()
+            except Exception:
+                self._c.rollback()
+                raise
+        return new_pid, new_tid
 
     def get_positions(self, status=None, instance_id="", simulation_session_id=""):
         q = "SELECT * FROM positions"
@@ -491,6 +626,12 @@ class SupabaseLedger:
         self._t("positions").insert(row).execute()
         return pid
 
+    def open_position_and_trade(self, *, position: dict, trade: dict):  # pragma: no cover
+        pid, tid = _id(), trade.get("id") or _id()
+        payload = {"position": {**position, "id": pid}, "trade": {**trade, "id": tid}}
+        self._db.rpc("paper_open_atomic", {"p_payload": payload}).execute()
+        return pid, tid
+
     def close_position(self, position_id, *, exit_price, pnl, instance_id=""):  # pragma: no cover
         q = self._t("positions").update({"status": "closed", "pnl": pnl, "closed_at": _now()})\
             .eq("id", position_id)
@@ -498,6 +639,17 @@ class SupabaseLedger:
             q = q.eq("instance_id", instance_id)
         result = q.execute()
         return len(result.data or [])
+
+    def close_position_and_trade(self, **kwargs):  # pragma: no cover
+        self._db.rpc("paper_close_atomic", {"p_payload": kwargs}).execute()
+
+    def reduce_position_and_trade(self, **kwargs):  # pragma: no cover
+        new_pid, new_tid = _id(), kwargs.get("remainder_trade", {}).get("id") or _id()
+        payload = dict(kwargs)
+        payload["remainder_position"] = {**kwargs["remainder_position"], "id": new_pid}
+        payload["remainder_trade"] = {**kwargs["remainder_trade"], "id": new_tid}
+        self._db.rpc("paper_reduce_atomic", {"p_payload": payload}).execute()
+        return new_pid, new_tid
 
     def get_positions(self, status=None, instance_id="", simulation_session_id=""):  # pragma: no cover
         def query():
@@ -629,27 +781,25 @@ SUPABASE_STATUS: dict = {"configured": False, "connected": False, "error": None}
 
 
 def get_ledger(sqlite_path: str = ":memory:") -> Ledger:
-    """Supabase when configured AND reachable, else local SQLite.
-
-    A misconfigured Supabase (bad URL/key, or the schema was never run) used to
-    crash the app on boot — the startup event writes to the ledger — which made
-    the whole deploy fail. Now we probe it once and fall back to SQLite with a
-    loud log line instead; /paper/account surfaces the same error in the UI.
-    """
+    """Use the configured primary ledger; never silently create a second truth."""
     url, key = os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY")
     SUPABASE_STATUS.update({"configured": bool(url and key),
                             "connected": False, "error": None})
+    if bool(url) != bool(key):
+        SUPABASE_STATUS["error"] = "SUPABASE_URL and SUPABASE_KEY must be configured together"
+        raise RuntimeError(SUPABASE_STATUS["error"])
     if url and key:
         try:
             led = SupabaseLedger(url, key)
             led.get_paper_trades()   # probe: fails fast on bad creds / missing schema
             SUPABASE_STATUS["connected"] = True
             return led
-        except Exception as e:  # noqa: BLE001 — fall back, never crash the boot
+        except Exception as e:  # noqa: BLE001 — configured primary must fail closed
             SUPABASE_STATUS["error"] = f"{type(e).__name__}: {e}"
-            print(f"[ledger] Supabase configured but UNUSABLE — falling back to local "
-                  f"SQLite. Error: {e}\n[ledger] Fix: run automation-hub/data/"
-                  f"ledger_schema.sql in the Supabase SQL editor and verify "
-                  f"SUPABASE_URL / SUPABASE_KEY (service_role), then redeploy.",
-                  flush=True)
+            raise RuntimeError(
+                "Configured Supabase ledger is unavailable; execution is fail-closed. "
+                "Run automation-hub/data/ledger_schema.sql and "
+                "automation-hub/data/trading_instances_schema.sql, verify "
+                f"SUPABASE_URL/SUPABASE_KEY, then restart. Cause: {e}"
+            ) from e
     return SqliteLedger(sqlite_path)

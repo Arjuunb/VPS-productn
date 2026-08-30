@@ -4,19 +4,23 @@ Install:  pip install ccxt
 
 Notes
 -----
-* ``submit_order`` attaches SL/TP as LINKED siblings: if either fills, the other
-  is cancelled. If the entry fails, both legs are cancelled. This avoids
-  leaving naked stops/targets on the book.
+* ``submit_order`` persists and submits only the entry. Protective orders are
+  created by ``protect_filled_entry`` after a fill is confirmed; every exit is
+  reduce-only. This prevents an unfilled limit entry from leaving naked reverse
+  orders on the venue.
 * ``get_account`` marks each non-quote holding to its **last price** before
   summing into equity.  USDT is treated as the quote/cash currency.
 """
 from __future__ import annotations
 
 import logging
+import os
+import uuid
 from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 from bot.brokers.base import Broker
+from bot.brokers.order_state import OrderStateStore
 from bot.types import AccountSnapshot, Bar, Fill, Order, OrderType, Position, Side
 
 log = logging.getLogger("bot.ccxt")
@@ -36,6 +40,7 @@ class CCXTBroker(Broker):
         api_secret: Optional[str] = None,
         sandbox: bool = True,
         quote_currency: str = "USDT",
+        state_path: Optional[str] = None,
     ):
         import ccxt   # lazy import — stays optional
         klass = getattr(ccxt, exchange_id)
@@ -51,7 +56,36 @@ class CCXTBroker(Broker):
         # entry_id -> {"sl_id": ..., "tp_id": ..., "symbol": ...}
         self._brackets: dict[str, dict] = {}
         self._rules: dict[str, object] = {}       # symbol -> SymbolRules cache
-        self._submitted_client_ids: set[str] = set()  # idempotency guard
+        durable_path = state_path or os.environ.get("HUB_ORDER_STATE_DB", "")
+        if not durable_path:
+            raise ValueError(
+                "CCXTBroker requires state_path or HUB_ORDER_STATE_DB; "
+                "external execution cannot use volatile order state"
+            )
+        self._state = OrderStateStore(durable_path)
+        # Retained as a compatibility view for callers/tests that inspected it;
+        # durable idempotency is enforced by ``self._state``.
+        self._submitted_client_ids: set[str] = {
+            row["client_id"] for row in self._state.open_orders()
+        }
+        self._restore_brackets()
+
+    def _order_state(self) -> OrderStateStore:
+        """Return the durable store (lazy in tests that bypass ``__init__``)."""
+        state = getattr(self, "_state", None)
+        if state is None:
+            state = self._state = OrderStateStore(":memory:")
+        return state
+
+    def _restore_brackets(self) -> None:
+        for row in self._order_state().open_orders():
+            if row["state"] == "PROTECTION_ACCEPTED" and row.get("entry_order_id"):
+                self._brackets[row["entry_order_id"]] = {
+                    "sl_id": row.get("stop_order_id"),
+                    "tp_id": row.get("target_order_id"),
+                    "symbol": row["symbol"],
+                    "client_id": row["client_id"],
+                }
 
     # ------------------------------------------------------------ symbol rules
     def rules_for(self, symbol: str):
@@ -145,23 +179,9 @@ class CCXTBroker(Broker):
 
     # ----------------------------------------------------------------- orders
     def submit_order(self, order: Order) -> str:
-        """Submit entry; attach SL/TP as linked siblings.
-
-        If the entry order id can be retrieved, store the SL/TP ids alongside.
-        Callers can invoke ``on_fill(entry_id)`` to cancel the unfilled sibling
-        when one of the brackets executes.
-        """
+        """Persist and submit an entry; never place exits before a confirmed fill."""
         side = order.side.value
         type_ = order.order_type.value
-
-        # Idempotency: a retried submit with the same client id must not
-        # double-buy. Guard locally and pass the id to the exchange, which
-        # enforces uniqueness server-side too.
-        if order.client_id:
-            if order.client_id in self._submitted_client_ids:
-                log.warning("Duplicate client order id %s — skipping resubmit", order.client_id)
-                return f"duplicate:{order.client_id}"
-            self._submitted_client_ids.add(order.client_id)
 
         # Exchange symbol filters: floor qty to lot size, prices to tick size,
         # and refuse orders below the minimum notional BEFORE the API rejects
@@ -174,8 +194,23 @@ class CCXTBroker(Broker):
         limit_price = rules.round_price(order.limit_price)
         sl_price = rules.round_price(order.stop_loss)
         tp_price = rules.round_price(order.take_profit)
+        if sl_price is None or tp_price is None:
+            raise ValueError("External entries require both stop_loss and take_profit")
 
-        params = {"clientOrderId": order.client_id} if order.client_id else {}
+        client_id = order.client_id or f"nexus-{uuid.uuid4().hex}"
+        order.client_id = client_id
+        existing, created = self._order_state().create_intent(
+            client_id=client_id, symbol=order.symbol, side=side,
+            requested_qty=qty, limit_price=limit_price,
+            stop_loss=sl_price, take_profit=tp_price,
+        )
+        if not created:
+            log.warning("Duplicate client order id %s — returning durable state %s",
+                        client_id, existing["state"])
+            return str(existing.get("entry_order_id") or f"duplicate:{client_id}")
+        self._submitted_client_ids.add(client_id)
+
+        params = {"clientOrderId": client_id}
         try:
             result = self._x.create_order(
                 symbol=order.symbol, type=type_, side=side,
@@ -183,43 +218,261 @@ class CCXTBroker(Broker):
             )
         except Exception:
             log.exception("Entry order failed on %s", order.symbol)
-            self._submitted_client_ids.discard(order.client_id or "")
+            self._order_state().transition(client_id, "CANCELLED", last_error="entry submission failed")
             raise
 
         entry_id = str(result.get("id") or "")
-        sl_id = tp_id = None
-        exit_side = "sell" if order.side == Side.BUY else "buy"
-
-        try:
-            if sl_price:
-                sl_res = self._x.create_order(
-                    order.symbol, "stop_market", exit_side,
-                    qty, None, {"stopPrice": sl_price},
-                )
-                sl_id = str(sl_res.get("id") or "")
-            if tp_price:
-                tp_res = self._x.create_order(
-                    order.symbol, "take_profit_market", exit_side,
-                    qty, None, {"stopPrice": tp_price},
-                )
-                tp_id = str(tp_res.get("id") or "")
-        except Exception:
-            # If we couldn't attach one leg, cancel everything we placed so
-            # no naked exposure or naked stop lingers on the book.
-            log.exception("Bracket leg failed on %s; cancelling siblings", order.symbol)
-            for oid in (entry_id, sl_id, tp_id):
-                if oid:
-                    try:
-                        self._x.cancel_order(oid, order.symbol)
-                    except Exception as e:
-                        log.warning("Cancel cleanup failed for %s: %s", oid, e)
-            raise
-
-        if entry_id and (sl_id or tp_id):
-            self._brackets[entry_id] = {
-                "sl_id": sl_id, "tp_id": tp_id, "symbol": order.symbol,
-            }
+        if not entry_id:
+            self._order_state().transition(client_id, "CANCELLED",
+                                           last_error="exchange returned no entry order id")
+            raise RuntimeError("Exchange accepted entry without returning an order id")
+        self._order_state().transition(
+            client_id, "ENTRY_ACCEPTED", entry_order_id=entry_id,
+        )
+        # Some venues return a synchronously completed market order. Protection
+        # is still fill-driven: it is created only when the response proves fill.
+        immediate_fill = self._confirmed_fill_qty(result)
+        if immediate_fill > 0:
+            self.protect_filled_entry(entry_id, immediate_fill)
         return entry_id
+
+    @staticmethod
+    def _confirmed_fill_qty(result: dict) -> float:
+        status = str(result.get("status") or "").lower()
+        filled = float(result.get("filled") or 0.0)
+        return filled if filled > 0 and status in {"closed", "filled"} else 0.0
+
+    def protect_filled_entry(self, entry_order_id: str, filled_qty: float) -> dict:
+        """Cancel any unfilled remainder and protect exactly the confirmed fill."""
+        row = self._order_state().by_entry_id(entry_order_id)
+        if row is None:
+            raise KeyError(f"Unknown entry order {entry_order_id}")
+        if row["state"] == "PROTECTION_ACCEPTED":
+            return row
+        if row["state"] not in {"ENTRY_ACCEPTED", "FILLED"}:
+            raise RuntimeError(f"Cannot protect entry in state {row['state']}")
+        qty = min(float(filled_qty), float(row["requested_qty"]))
+        if qty <= 0:
+            raise ValueError("A positive confirmed fill quantity is required")
+        if qty < float(row["requested_qty"]) and row["state"] == "ENTRY_ACCEPTED":
+            # Freeze exposure before sizing protection; later fills must not race
+            # a bracket sized to an earlier partial quantity.
+            try:
+                self._x.cancel_order(entry_order_id, row["symbol"])
+                refreshed = self._x.fetch_order(entry_order_id, row["symbol"])
+                status = str(refreshed.get("status") or "").lower()
+                if status not in {"cancelled", "canceled", "closed", "filled"}:
+                    raise RuntimeError(f"entry remainder cancellation is unconfirmed ({status or 'unknown'})")
+                qty = min(float(refreshed.get("filled") or qty), float(row["requested_qty"]))
+            except Exception as exc:
+                exit_side = "sell" if row["side"] == Side.BUY.value else "buy"
+                flatten_id = "FAILED"
+                try:
+                    flatten_id = self._emergency_flatten(row, qty, exit_side)
+                except Exception as flatten_exc:
+                    exc = RuntimeError(f"{exc}; flatten_failed={flatten_exc}")
+                if row["state"] == "ENTRY_ACCEPTED":
+                    row = self._order_state().transition(
+                        row["client_id"], "FILLED", filled_qty=qty,
+                    )
+                self._order_state().transition(
+                    row["client_id"], "HALTED_UNPROTECTED", filled_qty=qty,
+                    last_error=(f"partial-fill remainder could not be frozen: {exc}; "
+                                f"emergency_flatten={flatten_id}"),
+                )
+                raise RuntimeError(
+                    f"Partial entry {entry_order_id} could not be frozen; execution halted"
+                ) from exc
+        if row["state"] == "ENTRY_ACCEPTED":
+            row = self._order_state().transition(
+                row["client_id"], "FILLED", filled_qty=qty,
+            )
+
+        exit_side = "sell" if row["side"] == Side.BUY.value else "buy"
+        sl_id = row.get("stop_order_id")
+        tp_id = row.get("target_order_id")
+        try:
+            common = {"reduceOnly": True}
+            if not sl_id:
+                sl_id = self._submit_protection_leg(
+                    row, kind="sl", type_="stop_market", exit_side=exit_side,
+                    qty=qty, trigger=row["stop_loss"], common=common,
+                )
+                row = self._order_state().transition(
+                    row["client_id"], "FILLED", filled_qty=qty,
+                    stop_order_id=sl_id,
+                )
+            if not tp_id:
+                tp_id = self._submit_protection_leg(
+                    row, kind="tp", type_="take_profit_market", exit_side=exit_side,
+                    qty=qty, trigger=row["take_profit"], common=common,
+                )
+                row = self._order_state().transition(
+                    row["client_id"], "FILLED", filled_qty=qty,
+                    target_order_id=tp_id,
+                )
+        except Exception as exc:
+            log.exception("Protection failed on %s; cancelling leg and flattening", row["symbol"])
+            if sl_id:
+                self._safe_cancel(sl_id, row["symbol"])
+            flatten_id = "FAILED"
+            flatten_error = ""
+            try:
+                flatten_id = self._emergency_flatten(row, qty, exit_side)
+            except Exception as flatten_exc:
+                flatten_error = f"; flatten_failed={flatten_exc}"
+            self._order_state().transition(
+                row["client_id"], "HALTED_UNPROTECTED", filled_qty=qty,
+                stop_order_id=sl_id, target_order_id=tp_id,
+                last_error=(f"protection failed: {exc}; emergency_flatten={flatten_id}"
+                            f"{flatten_error}"),
+            )
+            outcome = ("emergency reduce-only flatten submitted"
+                       if flatten_id != "FAILED" else "EMERGENCY FLATTEN FAILED")
+            raise RuntimeError(f"Protection failed for {entry_order_id}; {outcome}") from exc
+
+        protected = self._order_state().transition(
+            row["client_id"], "PROTECTION_ACCEPTED", filled_qty=qty,
+            stop_order_id=sl_id, target_order_id=tp_id, last_error="",
+        )
+        self._brackets[entry_order_id] = {
+            "sl_id": sl_id, "tp_id": tp_id, "symbol": row["symbol"],
+            "client_id": row["client_id"],
+        }
+        return protected
+
+    def _submit_protection_leg(self, row: dict, *, kind: str, type_: str,
+                               exit_side: str, qty: float, trigger: float,
+                               common: dict) -> str:
+        """Create one leg idempotently, recovering a pre-crash venue order."""
+        client_id = f"{row['client_id']}:{kind}"
+        existing = self._find_order_by_client_id(row["symbol"], client_id)
+        if existing:
+            order_id = str(existing.get("id") or "")
+            if order_id:
+                return order_id
+        result = self._x.create_order(
+            row["symbol"], type_, exit_side, qty, None,
+            {**common, "stopPrice": trigger, "clientOrderId": client_id},
+        )
+        order_id = str(result.get("id") or "")
+        if not order_id:
+            raise RuntimeError(f"exchange returned no {kind} order id")
+        return order_id
+
+    def _find_order_by_client_id(self, symbol: str, client_id: str) -> Optional[dict]:
+        """Best-effort venue lookup used only to recover crash boundaries."""
+        for method_name in ("fetch_open_orders", "fetch_orders"):
+            method = getattr(self._x, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                rows = method(symbol)
+            except Exception:
+                continue
+            for order in rows or []:
+                candidate = (order.get("clientOrderId")
+                             or (order.get("info") or {}).get("clientOrderId")
+                             or (order.get("info") or {}).get("clientOid"))
+                if str(candidate or "") == client_id:
+                    return order
+        return None
+
+    def _emergency_flatten(self, row: dict, qty: float, exit_side: str) -> str:
+        result = self._x.create_order(
+            row["symbol"], "market", exit_side, qty, None,
+            {"reduceOnly": True, "clientOrderId": f"{row['client_id']}:flatten"},
+        )
+        flatten_id = str(result.get("id") or "")
+        if not flatten_id:
+            raise RuntimeError("Emergency flatten returned no order id")
+        return flatten_id
+
+    def refresh_entry(self, entry_order_id: str) -> dict:
+        """Reconcile one accepted entry with the venue and attach protection."""
+        row = self._order_state().by_entry_id(entry_order_id)
+        if row is None:
+            raise KeyError(f"Unknown entry order {entry_order_id}")
+        if row["state"] != "ENTRY_ACCEPTED":
+            return row
+        result = self._x.fetch_order(entry_order_id, row["symbol"])
+        filled = float(result.get("filled") or 0.0)
+        if filled > 0:
+            return self.protect_filled_entry(entry_order_id, filled)
+        return row
+
+    def cancel_unfilled_entry(self, entry_order_id: str) -> dict:
+        """Resolve a timed-out accepted entry before the runner can continue."""
+        row = self._order_state().by_entry_id(entry_order_id)
+        if row is None:
+            raise KeyError(f"Unknown entry order {entry_order_id}")
+        if row["state"] != "ENTRY_ACCEPTED":
+            return row
+        result = self._x.fetch_order(entry_order_id, row["symbol"])
+        filled = float(result.get("filled") or 0.0)
+        if filled > 0:
+            return self.protect_filled_entry(entry_order_id, filled)
+        self._x.cancel_order(entry_order_id, row["symbol"])
+        # Close the fetch/cancel race: an entry can fill between the first
+        # observation and cancellation acknowledgement.
+        settled = self._x.fetch_order(entry_order_id, row["symbol"])
+        status = str(settled.get("status") or "").lower()
+        settled_fill = min(float(settled.get("filled") or 0.0),
+                           float(row["requested_qty"]))
+        if settled_fill > 0:
+            row = self._order_state().transition(
+                row["client_id"], "FILLED", filled_qty=settled_fill,
+            )
+            return self.protect_filled_entry(entry_order_id, settled_fill)
+        if status not in {"cancelled", "canceled", "closed"}:
+            raise RuntimeError(
+                f"Entry {entry_order_id} cancellation is unconfirmed ({status or 'unknown'})"
+            )
+        return self._order_state().transition(
+            row["client_id"], "CANCELLED", last_error="entry timed out without a fill",
+        )
+
+    def recover_open_orders(self) -> list[dict]:
+        """Reconcile durable intents before any new exposure is permitted.
+
+        Protected brackets are restored locally. Filled-but-unprotected entries
+        resume the idempotent leg workflow. Any unresolved intent or emergency
+        state raises so the caller fails closed.
+        """
+        recovered: list[dict] = []
+        unresolved: list[str] = []
+        for row in self._order_state().open_orders():
+            state = row["state"]
+            if state == "PROTECTION_ACCEPTED":
+                recovered.append(row)
+                continue
+            if state == "HALTED_UNPROTECTED":
+                unresolved.append(f"{row['client_id']} is HALTED_UNPROTECTED")
+                continue
+            if state == "INTENT":
+                venue = self._find_order_by_client_id(row["symbol"], row["client_id"])
+                entry_id = str((venue or {}).get("id") or "")
+                if not entry_id:
+                    unresolved.append(f"{row['client_id']} intent has no confirmed venue order")
+                    continue
+                row = self._order_state().transition(
+                    row["client_id"], "ENTRY_ACCEPTED", entry_order_id=entry_id,
+                )
+            if row["state"] == "ENTRY_ACCEPTED":
+                result = self._x.fetch_order(row["entry_order_id"], row["symbol"])
+                filled = float(result.get("filled") or 0.0)
+                if filled <= 0:
+                    unresolved.append(f"{row['client_id']} entry remains unfilled")
+                    continue
+                row = self.protect_filled_entry(row["entry_order_id"], filled)
+            elif row["state"] == "FILLED":
+                row = self.protect_filled_entry(
+                    row["entry_order_id"], float(row["filled_qty"]),
+                )
+            recovered.append(row)
+        if unresolved:
+            raise RuntimeError("Unresolved durable execution state: " + "; ".join(unresolved))
+        return recovered
 
     def on_fill(self, filled_order_id: str) -> None:
         """Caller hook: when one bracket leg fills, cancel its sibling.
@@ -231,12 +484,19 @@ class CCXTBroker(Broker):
             symbol = br["symbol"]
             if filled_order_id == br.get("sl_id") and br.get("tp_id"):
                 self._safe_cancel(br["tp_id"], symbol)
+                self._mark_bracket_closed(entry_id, br)
                 self._brackets.pop(entry_id, None)
                 return
             if filled_order_id == br.get("tp_id") and br.get("sl_id"):
                 self._safe_cancel(br["sl_id"], symbol)
+                self._mark_bracket_closed(entry_id, br)
                 self._brackets.pop(entry_id, None)
                 return
+
+    def _mark_bracket_closed(self, entry_id: str, bracket: dict) -> None:
+        row = self._order_state().by_entry_id(entry_id)
+        if row and row["state"] == "PROTECTION_ACCEPTED":
+            self._order_state().transition(row["client_id"], "CLOSED")
 
     def _safe_cancel(self, order_id: str, symbol: str) -> None:
         try:

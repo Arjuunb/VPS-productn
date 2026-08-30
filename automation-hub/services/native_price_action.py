@@ -1050,7 +1050,9 @@ class NativePriceActionEngine:
             snapshot = self.snapshots[max(eligible)] if eligible else None
         candle_cutoff = snapshot.candle_open if snapshot else (self.bars[-1].timestamp if self.bars else None)
         knowledge_cutoff = snapshot.candle_close if snapshot else candle_cutoff
-        bars = [row for row in self.bars if candle_cutoff is None or row.timestamp <= candle_cutoff][-max(1, min(candle_window, 3000)):]
+        eligible_bars = [row for row in self.bars if candle_cutoff is None or row.timestamp <= candle_cutoff]
+        absolute_last_bar_index = len(eligible_bars) - 1
+        bars = eligible_bars[-max(1, min(candle_window, 3000)):]
         start = bars[0].timestamp if bars else None
         swings = [row for row in self.swings.values() if knowledge_cutoff is None or row.confirmed_at <= knowledge_cutoff]
         historical_zones = self._zone_snapshots.get(snapshot.candle_open, ()) if snapshot else ()
@@ -1092,6 +1094,10 @@ class NativePriceActionEngine:
             "volume_signal_input": False,
             "symbol": self.config.symbol,
             "timeframe": self.config.timeframe,
+            # Proposal expiry is expressed in the engine's absolute bar-index
+            # coordinate system.  Keep that coordinate independent of the
+            # bounded candle slice returned for rendering.
+            "absolute_last_bar_index": absolute_last_bar_index,
             "candles": [asdict(row) for row in bars],
             "swings": [asdict(row) for row in swings if start is None or row.confirmed_at >= start],
             "zones": [row for row in zone_payload if knowledge_cutoff is None or row["confirmed_at"] <= knowledge_cutoff],

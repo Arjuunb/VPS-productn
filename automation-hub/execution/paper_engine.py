@@ -175,15 +175,23 @@ class PaperExecutionEngine:
                 "be": False, "scaled": False, "best": entry, "age": 0,
                 "mfe": entry, "mae": entry,
             }
-        pid = self.ledger.open_position(
-            symbol=symbol, side=direction, size=size, entry=entry, stop=stop,
-            target=target, management=initial_management)
-        tid = self.ledger.record_paper_trade({
+        trade_row = {
             "alert_id": alert_id, "symbol": symbol, "side": direction,
             "size": size, "entry": entry, "stop": stop, "target": target,
             "strategy_id": self.strategy_id,
             **entry_sizing,
-        })
+        }
+        atomic_open = getattr(self.ledger, "open_position_and_trade", None)
+        if not callable(atomic_open):
+            raise RuntimeError("Ledger does not support atomic position/trade open")
+        pid, tid = atomic_open(
+            position={
+                "symbol": symbol, "side": direction, "size": size,
+                "entry": entry, "stop": stop, "target": target,
+                "management": initial_management,
+            },
+            trade=trade_row,
+        )
         self._invalidate_history()
         return FillResult("opened", symbol, direction, size, entry, 0.0, pid, tid)
 
@@ -211,19 +219,11 @@ class PaperExecutionEngine:
                 management = json.loads(management)
             except (TypeError, ValueError):
                 management = {}
-        self.ledger.close_position(pos["id"], exit_price=exit_price, pnl=pnl)
-        self.ledger.open_position(symbol=symbol, side=pos["side"], size=remainder,
-                                  entry=pos["entry"], stop=pos.get("stop"),
-                                  target=pos.get("target"),
-                                  management=management)
         open_trade = next((t for t in self.ledger.get_paper_trades()
                            if t["symbol"] == symbol and t["status"] == "open"), None)
-        if open_trade:
-            self.ledger.close_paper_trade(open_trade["id"], exit_price=exit_price,
-                                          pnl=pnl, rr=rr, size=closed_size,
-                                          fees=fee, realized_pnl=pnl,
-                                          equity_after_close=equity_before_close + pnl)
-        self.ledger.record_paper_trade({
+        if open_trade is None:
+            raise RuntimeError(f"Paper ledger invariant failed: {symbol} position has no open trade")
+        remainder_trade = {
             "alert_id": "", "symbol": symbol, "side": pos["side"],
             "size": remainder, "entry": pos["entry"], "stop": pos.get("stop"),
             "target": pos.get("target"),
@@ -232,7 +232,21 @@ class PaperExecutionEngine:
                 "sizing_mode", "sizing_engine_version", "risk_basis_at_entry",
                 "risk_pct_at_entry", "risk_amount_at_entry", "equity_before_trade",
             )} if open_trade else {}),
-        })
+        }
+        atomic_reduce = getattr(self.ledger, "reduce_position_and_trade", None)
+        if not callable(atomic_reduce):
+            raise RuntimeError("Ledger does not support atomic paper position reduction")
+        atomic_reduce(
+            position=pos, trade_id=open_trade["id"],
+            remainder_position={
+                "symbol": symbol, "side": pos["side"], "size": remainder,
+                "entry": pos["entry"], "stop": pos.get("stop"),
+                "target": pos.get("target"), "management": management,
+            },
+            remainder_trade=remainder_trade, exit_price=exit_price, pnl=pnl,
+            rr=rr, closed_size=closed_size, fees=fee,
+            equity_after_close=equity_before_close + pnl,
+        )
         self._invalidate_history()
         self._persist_account_snapshot()
         return FillResult("reduced", symbol, pos["side"], closed_size, exit_price, pnl, pos["id"], fee=fee)
@@ -254,13 +268,21 @@ class PaperExecutionEngine:
         pnl = gross - fee          # realized P&L is net of commission
         equity_before_close = self.balance()
         rr = self._rr(pos, exit_price)
-        self.ledger.close_position(pos["id"], exit_price=exit_price, pnl=pnl)
-        for t in self.ledger.get_paper_trades():
-            if t["symbol"] == symbol and t["status"] == "open":
-                self.ledger.close_paper_trade(t["id"], exit_price=exit_price, pnl=pnl, rr=rr,
-                                              fees=fee, realized_pnl=pnl,
-                                              equity_after_close=equity_before_close + pnl)
-                break
+        open_trade = next((t for t in self.ledger.get_paper_trades()
+                           if t["symbol"] == symbol and t["status"] == "open"), None)
+        if open_trade is None:
+            # Repair a pre-remediation orphan by closing the exposure; do not
+            # manufacture a trade record with unknown provenance.
+            self.ledger.close_position(pos["id"], exit_price=exit_price, pnl=pnl)
+        else:
+            atomic_close = getattr(self.ledger, "close_position_and_trade", None)
+            if not callable(atomic_close):
+                raise RuntimeError("Ledger does not support atomic paper close")
+            atomic_close(
+                position_id=pos["id"], trade_id=open_trade["id"],
+                exit_price=exit_price, pnl=pnl, rr=rr, fees=fee,
+                realized_pnl=pnl, equity_after_close=equity_before_close + pnl,
+            )
         self._invalidate_history()
         self._persist_account_snapshot()
         return FillResult("closed", symbol, pos["side"], pos["size"], exit_price, pnl, pos["id"], fee=fee)

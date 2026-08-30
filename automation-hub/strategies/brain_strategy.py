@@ -17,7 +17,8 @@ which reads agreed, so every decision is explainable.
 """
 from __future__ import annotations
 
-from typing import Optional
+from statistics import median
+from typing import Optional, Sequence
 
 from bot.data.indicators import atr, ema, rsi
 from bot.types import Bar, Signal, SignalType
@@ -42,17 +43,50 @@ def _clip(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
 
 
-def _htf_trend_vote(closes: list[float], mult: int) -> Optional[float]:
-    """TRUE higher-timeframe trend read. Samples every ``mult``-th close
-    (bucket closes anchored to the newest bar — e.g. 12 × 5m ≈ 1h) and compares
-    fast/slow EMAs on that aggregated series. Unlike the same-timeframe EMA50
-    filter, this sees the structure a bigger-timeframe trader sees.
+def _htf_trend_vote(bars: Sequence[Bar], mult: int) -> Optional[float]:
+    """Closed higher-timeframe trend on UTC epoch-aligned buckets.
+
+    Buckets are left-closed/right-open and incomplete buckets are excluded.
+    Appending another base candle therefore cannot repaint a previously closed
+    HTF candle or move the timeframe origin.
 
     Returns +1 (HTF up), -1 (HTF down), or None when there isn't enough
     history for an honest read (needs ≥ 24 HTF buckets)."""
-    if mult <= 1 or len(closes) < mult * 24:
+    if mult <= 1 or len(bars) < mult * 24 or len(bars) < 2:
         return None
-    htf = [closes[i] for i in range(len(closes) - 1, -1, -mult)][::-1]
+    deltas = [
+        (bars[i].timestamp - bars[i - 1].timestamp).total_seconds()
+        for i in range(1, len(bars))
+        if bars[i].timestamp > bars[i - 1].timestamp
+    ]
+    if not deltas:
+        return None
+    source_seconds = int(median(deltas))
+    target_seconds = source_seconds * mult
+    buckets: dict[int, list[Bar]] = {}
+    for bar in bars:
+        ts = bar.timestamp
+        if ts.tzinfo is None:
+            from datetime import timezone
+            ts = ts.replace(tzinfo=timezone.utc)
+        epoch = int(ts.timestamp())
+        start = (epoch // target_seconds) * target_seconds  # origin='epoch'
+        buckets.setdefault(start, []).append(bar)
+    htf: list[float] = []
+    for start, rows in sorted(buckets.items()):
+        rows.sort(key=lambda row: row.timestamp)
+        epochs = []
+        for row in rows:
+            ts = row.timestamp
+            if ts.tzinfo is None:
+                from datetime import timezone
+                ts = ts.replace(tzinfo=timezone.utc)
+            epochs.append(int(ts.timestamp()))
+        expected = [start + i * source_seconds for i in range(mult)]
+        if len(rows) == mult and epochs == expected:
+            htf.append(rows[-1].close)
+    if len(htf) < 24:
+        return None
     hf = ema(htf, 10)[-1]
     hs = ema(htf, 21)[-1]
     if hf == hs:
@@ -85,8 +119,8 @@ class DecisionBrain(HubStrategy):
         # volume_conf: volume-surge conviction multiplier in [0.9, 1.1]
         self.er_mode = er_mode
         self.volume_conf = bool(volume_conf)
-        # True multi-timeframe confirmation: aggregate own bars ``htf_mult``:1
-        # (12 × 5m ≈ 1h) and damp conviction ×``htf_damp`` when the HTF trend
+        # Multi-timeframe confirmation: aggregate closed bars ``htf_mult``:1 on
+        # UTC epoch boundaries and damp conviction ×``htf_damp`` when HTF trend
         # disagrees with the trade direction. Measured on the seeded synthetic
         # regime grid (drift × vol × seeds, pessimistic fills, tune + holdout)
         # before defaulting ON:
@@ -162,7 +196,7 @@ class DecisionBrain(HubStrategy):
         # True multi-timeframe confirmation: when the aggregated HTF trend
         # disagrees with the trade direction, damp conviction so only
         # exceptionally strong counter-HTF setups survive the threshold.
-        v_htf = _htf_trend_vote(closes, self.htf_mult) if self.htf_mode != "off" else None
+        v_htf = _htf_trend_vote(self.bars, self.htf_mult) if self.htf_mode != "off" else None
         if v_htf is not None and v_htf * side < 0:
             conviction *= self.htf_damp
 

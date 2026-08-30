@@ -264,7 +264,7 @@ import json, os, urllib.request
 request = urllib.request.Request(
     "http://127.0.0.1:8000/instances/platform",
     data=json.dumps({"max_active_slots": 3}).encode(),
-    headers={"x-webhook-secret": os.environ["HUB_API_KEY"], "content-type": "application/json"},
+    headers={"x-webhook-secret": os.environ["HUB_CONTROL_KEY"], "content-type": "application/json"},
     method="POST",
 )
 with urllib.request.urlopen(request, timeout=30) as response:
@@ -287,7 +287,7 @@ docker compose exec -T app python - <<'PY'
 import json, os, urllib.request
 request = urllib.request.Request(
     "http://127.0.0.1:8000/instances",
-    headers={"x-webhook-secret": os.environ["HUB_API_KEY"]},
+    headers={"x-webhook-secret": os.environ["HUB_CONTROL_KEY"]},
 )
 with urllib.request.urlopen(request, timeout=30) as response:
     payload = json.load(response)
