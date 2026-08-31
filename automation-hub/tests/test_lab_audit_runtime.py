@@ -170,8 +170,9 @@ def test_dashboard_status_is_scope_accurate_and_fails_closed(tmp_path):
         smc_status = smc.bot_status()
         assert pa_status["account_scope"] == "PRICE_ACTION_VISUAL_LAB_ONLY"
         assert smc_status["account_scope"] == "SMC_STRATEGY_LAB_ONLY"
-        assert pa_status["session_state"] == smc_status["session_state"] == "RUNNING"
-        assert pa_status["execution_armed"] is smc_status["execution_armed"] is True
+        assert pa_status["session_state"] == smc_status["session_state"] == "BLOCKED"
+        assert pa_status["execution_armed"] is False
+        assert smc_status["execution_armed"] is True
         assert pa_status["execution_state"] == smc_status["execution_state"] == "BLOCKED"
         assert pa_status["feed"]["state"] == smc_status["feed"]["state"] == "DISCONNECTED"
         assert pa_status["performance"].keys() == {"backtest", "forward_validation", "live_paper"}
@@ -179,8 +180,8 @@ def test_dashboard_status_is_scope_accurate_and_fails_closed(tmp_path):
 
         pa_account.configure(execution_config=PaperExecutionConfig(operating_mode="signals_only"))
         smc_account.configure(config=SMCPaperConfig(operating_mode="signals_only"))
-        assert pa.bot_status()["execution_state"] == "RUNNING_UNARMED"
-        assert smc.bot_status()["execution_state"] == "RUNNING_UNARMED"
+        assert pa.bot_status()["execution_state"] == "BLOCKED"
+        assert smc.bot_status()["execution_state"] == "BLOCKED"
     finally:
         pa.stop()
         smc.stop()

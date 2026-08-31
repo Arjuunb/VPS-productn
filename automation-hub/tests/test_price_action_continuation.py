@@ -208,14 +208,15 @@ def test_signals_manual_approval_duplicate_and_unreliable_feed_are_explicit(tmp_
     assert "unreliable" in rejected["payload"]["reason"]
 
 
-def test_new_price_action_session_defaults_to_automatic_paper(tmp_path):
-    account = PriceActionPaperAccount(tmp_path / "automatic-default.db")
+def test_new_price_action_session_defaults_to_signals_only_and_never_orders(tmp_path):
+    account = PriceActionPaperAccount(tmp_path / "signals-default.db")
     result = account.synchronize_strategy(
         visual(), contract_rules=RULES, candle=bar(1), feed_reliable=True,
     )
-    assert account.session()["operating_mode"] == "automatic"
-    assert result["created"] and result["created"][0]["accepted"] is True
-    assert account.state()["orders"]
+    assert account.session()["operating_mode"] == "signals_only"
+    assert result["created"] == []
+    assert account.state()["candidates"][0]["status"] == "SIGNAL_ONLY"
+    assert account.state()["orders"] == []
 
 
 def test_ended_session_can_resume_wallet_orders_and_positions(tmp_path):

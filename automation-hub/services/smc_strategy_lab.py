@@ -1399,6 +1399,11 @@ class SMCStrategyLabRuntime:
             orders=paper.get("orders") or [])
         activity = paper.get("activity") or []
         execution_armed = session.get("operating_mode") == "automatic"
+        operator_state = (
+            "ERROR" if orphaned_exposure else
+            "BLOCKED" if not session or blockers else
+            "RUNNING_ARMED" if execution_armed else "RUNNING_UNARMED"
+        )
         return {
             "lab": "SMC", "account_scope": paper["account_scope"],
             "scope_label": "SMC Strategy Lab session · isolated paper ledger",
@@ -1407,10 +1412,7 @@ class SMCStrategyLabRuntime:
                          "version": STRATEGY_VERSION},
             "symbol": session.get("symbol"), "timeframe": session.get("timeframe"),
             "mode": session.get("operating_mode"),
-            "session_state": (
-                "BLOCKED_ORPHANED_EXPOSURE" if orphaned_exposure else
-                "RUNNING" if session else "STOPPED"
-            ),
+            "session_state": operator_state,
             "execution_armed": execution_armed,
             "saved_configuration": {
                 "operating_mode": session.get("operating_mode"),
@@ -1421,13 +1423,7 @@ class SMCStrategyLabRuntime:
                 reliable=bool(connection.get("reliable")),
                 has_position=bool(paper.get("positions")), has_order=bool(pending),
                 last_decision_state=(latest or {}).get("state")),
-            "execution_state": (
-                "BLOCKED_ORPHANED_EXPOSURE" if orphaned_exposure else
-                "RUNNING_UNARMED" if session and not execution_armed else
-                "POSITION_OPEN" if positions else
-                "ORDER_SUBMITTED" if pending_entries else
-                "ELIGIBLE_ON_CONFIRMED_CLOSED_CANDLE" if not blockers else "BLOCKED"
-            ),
+            "execution_state": operator_state,
             "blockers": blockers,
             "account": paper.get("account"), "open_positions": len(positions),
             "pending_orders": len(pending), "positions": paper.get("positions") or [],

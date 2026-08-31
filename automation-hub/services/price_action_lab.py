@@ -50,7 +50,7 @@ OPEN_STRATEGY_ORDER_STATUSES = {"ORDER_PENDING", "PARTIALLY_FILLED", "ENTERED"}
 
 @dataclass(frozen=True)
 class PaperExecutionConfig:
-    operating_mode: Literal["signals_only", "manual_approval", "automatic"] = "automatic"
+    operating_mode: Literal["signals_only", "manual_approval", "automatic"] = "signals_only"
     strategy_id: str = "PA1_SR_REJECTION"
     risk_pct: float = 0.5
     max_risk_pct: float = 1.0
@@ -145,7 +145,7 @@ class PriceActionPaperAccount:
                 ("symbol", "TEXT NOT NULL DEFAULT 'BTCUSDT'"),
                 ("timeframe", "TEXT NOT NULL DEFAULT '5m'"),
                 ("replay_cursor", "INTEGER NOT NULL DEFAULT 0"),
-                ("operating_mode", "TEXT NOT NULL DEFAULT 'automatic'"),
+                ("operating_mode", "TEXT NOT NULL DEFAULT 'signals_only'"),
                 ("strategy_config_json", "TEXT NOT NULL DEFAULT '{}'"),
                 ("execution_config_json", "TEXT NOT NULL DEFAULT '{}'"),
                 ("state_json", "TEXT NOT NULL DEFAULT '{}'"),
@@ -857,7 +857,7 @@ class PriceActionPaperAccount:
                     self._db.execute(
                         "UPDATE pa_sessions SET mode=?,symbol=?,timeframe=?,operating_mode=?,strategy_config_json=?,execution_config_json=?,updated_at=? WHERE id=?",
                         (old.get("mode", "LIVE_PAPER"), old.get("symbol", "BTCUSDT"), old.get("timeframe", "5m"),
-                         old.get("operating_mode", "automatic"), old.get("strategy_config_json", "{}"),
+                         old.get("operating_mode", "signals_only"), old.get("strategy_config_json", "{}"),
                          old.get("execution_config_json", "{}"), now, new_id),
                     )
                 self._audit("session_reset", object_id=new_id,
@@ -1790,7 +1790,7 @@ class PriceActionLabRuntime:
         orphaned_exposure = not session and bool(positions or pending_entries)
         config = session.get("execution_config") or {}
         blockers = lifecycle_blockers(
-            connection=connection, operating_mode=session.get("operating_mode", "automatic"),
+            connection=connection, operating_mode=session.get("operating_mode", "signals_only"),
             account=paper.get("account") or {}, strategy_valid=bool(config.get("strategy_id")),
             positions=positions, pending_orders=pending_entries,
             risk_pct=config.get("risk_pct"),
@@ -1813,6 +1813,11 @@ class PriceActionLabRuntime:
                                if row.get("outcome", {}).get("net_r") is not None])
         activity = paper.get("activity") or []
         execution_armed = session.get("operating_mode") == "automatic"
+        operator_state = (
+            "ERROR" if orphaned_exposure else
+            "BLOCKED" if not session or blockers else
+            "RUNNING_ARMED" if execution_armed else "RUNNING_UNARMED"
+        )
         return {
             "lab": "PRICE_ACTION", "account_scope": paper["account_scope"],
             "scope_label": "Price Action session · isolated paper ledger",
@@ -1821,10 +1826,7 @@ class PriceActionLabRuntime:
                          "version": PRICE_ACTION_STRATEGY_VERSION},
             "symbol": session.get("symbol"), "timeframe": session.get("timeframe"),
             "mode": session.get("operating_mode"), "saved_configuration": config,
-            "session_state": (
-                "BLOCKED_ORPHANED_EXPOSURE" if orphaned_exposure else
-                "RUNNING" if session else "STOPPED"
-            ),
+            "session_state": operator_state,
             "execution_armed": execution_armed,
             "feed": connection,
             "decision_state": lifecycle_state(
@@ -1832,13 +1834,7 @@ class PriceActionLabRuntime:
                 reliable=bool(connection.get("reliable")),
                 has_position=bool(paper.get("positions")), has_order=bool(pending),
                 last_decision_state=(latest or {}).get("state")),
-            "execution_state": (
-                "BLOCKED_ORPHANED_EXPOSURE" if orphaned_exposure else
-                "RUNNING_UNARMED" if session and not execution_armed else
-                "POSITION_OPEN" if positions else
-                "ORDER_SUBMITTED" if pending_entries else
-                "ELIGIBLE_ON_CONFIRMED_CLOSED_CANDLE" if not blockers else "BLOCKED"
-            ),
+            "execution_state": operator_state,
             "blockers": blockers,
             "account": paper.get("account"), "open_positions": len(positions),
             "pending_orders": len(pending), "positions": paper.get("positions") or [],
