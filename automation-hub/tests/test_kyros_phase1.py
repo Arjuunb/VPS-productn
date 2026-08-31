@@ -244,20 +244,21 @@ def client():
     webhook_api.engine.stop()
 
 
-SECRET = "dev-webhook-secret"
+CONTROL_SECRET = "dev-control-key"
+WEBHOOK_SECRET = "dev-webhook-secret"
 
 
 def test_engine_endpoints_gated_and_status(client):
     assert client.post("/engine/start").status_code == 401      # secret required
-    r = client.post("/engine/start", headers={"X-Webhook-Secret": SECRET})
+    r = client.post("/engine/start", headers={"X-Webhook-Secret": CONTROL_SECRET})
     assert r.status_code == 200 and r.json()["status"]["running"] is True
     assert client.get("/engine/status").json()["running"] is True
-    stopped = client.post("/engine/stop", headers={"X-Webhook-Secret": SECRET})
+    stopped = client.post("/engine/stop", headers={"X-Webhook-Secret": CONTROL_SECRET})
     assert stopped.json()["stopped"] is True
 
 
 def test_engine_lifecycle_control_endpoints(client):
-    headers = {"X-Webhook-Secret": SECRET}
+    headers = {"X-Webhook-Secret": CONTROL_SECRET}
     assert client.post("/engine/start", headers=headers).status_code == 200
     paused = client.post("/engine/pause", headers=headers)
     assert paused.status_code == 200 and paused.json()["status"]["state"] == "paused"
@@ -270,7 +271,7 @@ def test_engine_lifecycle_control_endpoints(client):
 
 
 def test_manual_pair_selection_runs_exactly_one_symbol(client):
-    headers = {"X-Webhook-Secret": SECRET}
+    headers = {"X-Webhook-Secret": CONTROL_SECRET}
     r = client.post("/engine/symbol-selection", json={
         "mode": "manual", "manual_symbol": "ETHUSDT",
         "auto_symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
@@ -298,7 +299,7 @@ def test_webhook_rejects_wrong_secret(client):
 
 def test_webhook_accepts_valid_signal(client):
     r = client.post("/webhook/tradingview", json=_alert(),
-                    headers={"X-Webhook-Secret": SECRET})
+                    headers={"X-Webhook-Secret": WEBHOOK_SECRET})
     assert r.status_code == 200
     body = r.json()
     assert body["status"] == "ok" and body["accepted"] is True
@@ -309,25 +310,25 @@ def test_webhook_accepts_valid_signal(client):
 
 def test_webhook_invalid_payload_is_422(client):
     r = client.post("/webhook/tradingview", json={"symbol": "BTCUSDT"},
-                    headers={"X-Webhook-Secret": SECRET})
+                    headers={"X-Webhook-Secret": WEBHOOK_SECRET})
     assert r.status_code == 422
 
 
 def test_controls_endpoints_gated_and_work(client):
     assert client.post("/controls/pause-all").status_code == 401
-    r = client.post("/controls/pause-all", headers={"X-Webhook-Secret": SECRET})
+    r = client.post("/controls/pause-all", headers={"X-Webhook-Secret": CONTROL_SECRET})
     assert r.json()["state"] == "Paused"
     # paused -> webhook rejects the entry
     res = client.post("/webhook/tradingview", json=_alert(),
-                      headers={"X-Webhook-Secret": SECRET}).json()
+                      headers={"X-Webhook-Secret": WEBHOOK_SECRET}).json()
     assert res["accepted"] is False and res["stage"] == "controls"
-    client.post("/controls/resume", headers={"X-Webhook-Secret": SECRET})
+    client.post("/controls/resume", headers={"X-Webhook-Secret": CONTROL_SECRET})
     assert client.get("/controls/state").json()["state"] == "Active"
 
 
 def test_ledger_read_endpoints(client):
     client.post("/webhook/tradingview", json=_alert(),
-                headers={"X-Webhook-Secret": SECRET})
+                headers={"X-Webhook-Secret": WEBHOOK_SECRET})
     assert client.get("/paper/positions").json()
     assert isinstance(client.get("/paper/trades").json(), list)
     assert client.get("/ledger/logs").json()
@@ -337,9 +338,9 @@ def test_ledger_read_endpoints(client):
 def test_live_summary_endpoints(client):
     # open then close a trade so there is realized P&L + history
     client.post("/webhook/tradingview", json=_alert(alert_id="o"),
-                headers={"X-Webhook-Secret": SECRET})
+                headers={"X-Webhook-Secret": WEBHOOK_SECRET})
     client.post("/webhook/tradingview", json=_alert(alert_id="c", side="CLOSE", entry=68000),
-                headers={"X-Webhook-Secret": SECRET})
+                headers={"X-Webhook-Secret": WEBHOOK_SECRET})
 
     risk = client.get("/risk/summary").json()
     assert "exposure_pct" in risk and risk["exposure_limit_pct"] == 0.05
@@ -514,7 +515,7 @@ def hub_client():
 
 def test_paper_page_reflects_open_position(hub_client):
     hub_client.post("/webhook/tradingview", json=_alert(),
-                    headers={"X-Webhook-Secret": SECRET})
+                    headers={"X-Webhook-Secret": WEBHOOK_SECRET})
     body = hub_client.get("/paper-trading").text
     assert "BTCUSDT" in body and "Open Positions" in body
     assert "Emergency Controls" in body
@@ -526,7 +527,7 @@ def test_ui_emergency_controls_block_entries(hub_client):
     assert webhook_api_state(hub_client) == "Paused"
     # paused -> a new webhook entry is rejected
     res = hub_client.post("/webhook/tradingview", json=_alert(),
-                          headers={"X-Webhook-Secret": SECRET}).json()
+                          headers={"X-Webhook-Secret": WEBHOOK_SECRET}).json()
     assert res["accepted"] is False and res["stage"] == "controls"
     hub_client.post("/paper-trading/resume")
     assert webhook_api_state(hub_client) == "Active"
@@ -538,7 +539,7 @@ def webhook_api_state(hub_client) -> str:
 
 def test_alerts_and_logs_pages(hub_client):
     hub_client.post("/webhook/tradingview", json=_alert(),
-                    headers={"X-Webhook-Secret": SECRET})
+                    headers={"X-Webhook-Secret": WEBHOOK_SECRET})
     alerts = hub_client.get("/alerts").text
     assert "Paper trade opened" in alerts
     logs = hub_client.get("/logs").text
@@ -547,7 +548,7 @@ def test_alerts_and_logs_pages(hub_client):
 
 def test_export_endpoints(client):
     client.post("/webhook/tradingview", json=_alert(),
-                headers={"X-Webhook-Secret": SECRET})
+                headers={"X-Webhook-Secret": WEBHOOK_SECRET})
     csv_r = client.get("/ledger/logs/export?fmt=csv")
     assert csv_r.status_code == 200 and "text/csv" in csv_r.headers["content-type"]
     assert "attachment" in csv_r.headers.get("content-disposition", "")

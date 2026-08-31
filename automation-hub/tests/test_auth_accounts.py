@@ -28,7 +28,7 @@ def test_react_dashboard_requires_login(client):
 
 def test_api_is_walled_for_anonymous_but_open_with_secret_or_session(client):
     assert client.get("/settings").status_code == 401          # anonymous: no
-    ok = client.get("/settings", headers={"X-Webhook-Secret": "dev-webhook-secret"})
+    ok = client.get("/settings", headers={"X-Webhook-Secret": "dev-control-key"})
     assert ok.status_code == 200                               # secret header: yes
     _login(client)
     assert client.get("/settings").status_code == 200          # session cookie: yes
@@ -104,7 +104,7 @@ def test_entry_mode_and_report_hour_settings(client):
     _login(client)
     import webhook_api
     r = client.post("/settings", json={"entry_mode": "market", "daily_report_hour": 6},
-                    headers={"X-Webhook-Secret": "dev-webhook-secret"})
+                    headers={"X-Webhook-Secret": "dev-control-key"})
     assert r.status_code == 200
     assert webhook_api.engine.entry_mode == "market"
     assert webhook_api.daily_tasks.hour == 6
@@ -113,6 +113,6 @@ def test_entry_mode_and_report_hour_settings(client):
     assert body["editable"]["daily_report_hour"] == 6
     # invalid values rejected; restore defaults
     assert client.post("/settings", json={"entry_mode": "yolo"},
-                       headers={"X-Webhook-Secret": "dev-webhook-secret"}).status_code == 400
+                       headers={"X-Webhook-Secret": "dev-control-key"}).status_code == 400
     client.post("/settings", json={"entry_mode": "limit", "daily_report_hour": 8},
-                headers={"X-Webhook-Secret": "dev-webhook-secret"})
+                headers={"X-Webhook-Secret": "dev-control-key"})

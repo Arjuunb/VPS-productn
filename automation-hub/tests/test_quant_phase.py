@@ -88,7 +88,7 @@ def client(tmp_path):
     return TestClient(app)
 
 
-SECRET = "dev-webhook-secret"
+SECRET = "dev-control-key"
 
 
 def test_phase_endpoints(client):

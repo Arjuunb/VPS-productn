@@ -287,7 +287,7 @@ def test_monitor_status_endpoint_reports_without_running_a_backtest(client):
 def test_monitor_check_endpoint_forces_a_cycle(client):
     from config import settings
     r = client.post("/strategy/monitor/check",
-                    headers={"X-Webhook-Secret": settings.webhook_secret})
+                    headers={"X-Webhook-Secret": settings.admin_key})
     assert r.status_code == 200
     assert r.json()["auto_modify"] is False
 

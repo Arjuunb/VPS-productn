@@ -77,7 +77,7 @@ def test_safety_endpoints():
     # the kill-switch test requires the webhook secret
     assert client.post("/safety/test-emergency-stop").status_code == 401
     ok = client.post("/safety/test-emergency-stop",
-                     headers={"X-Webhook-Secret": webhook_api.settings.webhook_secret}).json()
+                     headers={"X-Webhook-Secret": webhook_api.settings.admin_key}).json()
     assert ok["verified"] is True and ok["state_after"] == "Active"
     # and it flips the checklist item to passed
     after = client.get("/safety/live-readiness").json()

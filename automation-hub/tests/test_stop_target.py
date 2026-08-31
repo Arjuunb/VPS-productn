@@ -27,7 +27,7 @@ def test_stop_target_endpoint(client):
     wa.paper = PaperExecutionEngine(SqliteLedger(":memory:"), starting_balance=10_000)
     try:
         wa.paper.open(symbol="BTCUSDT", side="long", size=0.5, entry=100.0, stop=95.0)
-        sec = {"X-Webhook-Secret": wa.settings.webhook_secret}
+        sec = {"X-Webhook-Secret": wa.settings.admin_key}
 
         # move the stop up (trail toward break-even) — persists to the ledger
         r = client.post("/paper/stop-target", json={"symbol": "BTCUSDT", "stop": 98.0}, headers=sec)
@@ -63,7 +63,7 @@ def test_stop_target_guards(client):
     wa.paper = PaperExecutionEngine(SqliteLedger(":memory:"), starting_balance=10_000)
     try:
         wa.paper.open(symbol="ETHUSDT", side="long", size=1.0, entry=2000.0, stop=1900.0)
-        sec = {"X-Webhook-Secret": wa.settings.webhook_secret}
+        sec = {"X-Webhook-Secret": wa.settings.admin_key}
 
         assert client.post("/paper/stop-target", json={"symbol": "ETHUSDT"}, headers=sec).status_code == 400   # nothing to change
         assert client.post("/paper/stop-target", json={"symbol": "ETHUSDT", "stop": -1}, headers=sec).status_code == 400

@@ -57,7 +57,7 @@ def client(tmp_path):
     webhook_api.engine.stop()
 
 
-SECRET = "dev-webhook-secret"
+SECRET = "dev-control-key"
 
 
 def test_get_settings_returns_real_values(client):

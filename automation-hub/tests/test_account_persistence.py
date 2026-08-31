@@ -90,7 +90,7 @@ def test_account_endpoint_shape_and_no_reset():
     assert "starting_balance" in a and "balance" in a
 
     # changing initial capital needs confirm + secret
-    sec = {"X-Webhook-Secret": webhook_api.settings.webhook_secret}
+    sec = {"X-Webhook-Secret": webhook_api.settings.admin_key}
     assert client.post("/paper/initial-capital", json={"amount": 5}).status_code == 401
     assert client.post("/paper/initial-capital", headers=sec, json={"amount": 5}).status_code == 400
     ok = client.post("/paper/initial-capital", headers=sec,

@@ -1,7 +1,7 @@
 import pytest
 
 
-SECRET = "dev-webhook-secret"
+SECRET = "dev-control-key"
 
 
 @pytest.fixture()

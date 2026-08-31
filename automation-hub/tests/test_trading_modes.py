@@ -125,7 +125,7 @@ def client():
 
 def _secret():
     import webhook_api as _wa
-    return {"X-Webhook-Secret": _wa.settings.webhook_secret}
+    return {"X-Webhook-Secret": _wa.settings.admin_key}
 
 
 def test_mode_endpoints_roundtrip(client):

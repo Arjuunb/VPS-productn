@@ -363,7 +363,7 @@ def test_paper_close_endpoint(client):
     wa.paper = PaperExecutionEngine(SqliteLedger(":memory:"), starting_balance=10_000)
     try:
         wa.paper.open(symbol="BTCUSDT", side="long", size=0.5, entry=100.0, stop=95.0)
-        sec = {"X-Webhook-Secret": wa.settings.webhook_secret}
+        sec = {"X-Webhook-Secret": wa.settings.admin_key}
         r = client.post("/paper/close", json={"symbol": "BTCUSDT", "price": 120.0}, headers=sec)
         assert r.status_code == 200 and r.json()["ok"] is True
         assert not any(p["symbol"] == "BTCUSDT" for p in wa.paper.positions())   # flattened

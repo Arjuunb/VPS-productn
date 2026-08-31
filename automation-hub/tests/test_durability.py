@@ -88,7 +88,7 @@ def client():
 
 def test_ops_storage_reports_tier(client):
     import webhook_api as _wa
-    r = client.get("/ops/storage", headers={"X-Webhook-Secret": _wa.settings.webhook_secret})
+    r = client.get("/ops/storage", headers={"X-Webhook-Secret": _wa.settings.admin_key})
     assert r.status_code == 200
     body = r.json()
     assert body["tier"] in ("disk", "supabase", "ephemeral")

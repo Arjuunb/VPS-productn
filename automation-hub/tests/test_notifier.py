@@ -43,7 +43,7 @@ def client():
     webhook_api.engine.stop()
 
 
-SECRET = "dev-webhook-secret"
+SECRET = "dev-control-key"
 
 
 def test_notifications_endpoints(client):

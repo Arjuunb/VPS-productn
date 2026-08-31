@@ -140,7 +140,7 @@ def test_webhook_api_proxy_mutations_delegate_without_shadowing(monkeypatch):
     assert "instance_manager" not in vars(_wa)
 
 
-SECRET = "dev-webhook-secret"
+SECRET = "dev-control-key"
 
 
 def test_options_endpoint(client):

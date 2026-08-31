@@ -33,14 +33,15 @@ def test_health_bot_surfaces_last_rejection_from_skip_log():
     import webhook_api
     app = FastAPI(); app.include_router(webhook_api.router)
     client = TestClient(app)
-    sec = {"X-Webhook-Secret": webhook_api.settings.webhook_secret}
+    control = {"X-Webhook-Secret": webhook_api.settings.admin_key}
+    webhook = {"X-Webhook-Secret": webhook_api.settings.webhook_secret}
 
     # force a rejection through the real pipeline, then it must appear in health
-    client.post("/controls/stop-all", headers=sec)
-    client.post("/webhook/tradingview", headers=sec, json={
+    client.post("/controls/stop-all", headers=control)
+    client.post("/webhook/tradingview", headers=webhook, json={
         "alert_id": "health-rej", "symbol": "BTCUSDT", "side": "BUY",
         "entry": 100.0, "stop": 95.0})
-    client.post("/controls/resume", headers=sec)
+    client.post("/controls/resume", headers=control)
 
     lr = client.get("/health/bot").json()["last_rejected"]
     assert lr is not None
