@@ -133,7 +133,20 @@ def _broker_with_fake(state_path=":memory:", exchange=None):
     b._rules = {}
     b._submitted_client_ids = set()
     b._state = OrderStateStore(str(state_path))
+    b._external_execution_enabled = True
     return b
+
+
+def test_ccxt_submit_is_disabled_without_explicit_feature_flag():
+    b = _broker_with_fake()
+    b._external_execution_enabled = False
+    with pytest.raises(RuntimeError, match="External execution is disabled"):
+        b.submit_order(Order(
+            symbol="BTC/USDT", side=Side.BUY, qty=0.5,
+            order_type=OrderType.LIMIT, limit_price=100,
+            stop_loss=95, take_profit=110,
+        ))
+    assert b._x.orders == []
 
 
 def test_broker_rounds_all_legs_and_passes_client_id():

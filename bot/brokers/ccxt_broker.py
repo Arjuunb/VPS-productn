@@ -41,6 +41,7 @@ class CCXTBroker(Broker):
         sandbox: bool = True,
         quote_currency: str = "USDT",
         state_path: Optional[str] = None,
+        external_execution_enabled: Optional[bool] = None,
     ):
         import ccxt   # lazy import — stays optional
         klass = getattr(ccxt, exchange_id)
@@ -53,6 +54,11 @@ class CCXTBroker(Broker):
             self._x.set_sandbox_mode(True)
         self._exchange_id = exchange_id
         self._quote = quote_currency
+        self._external_execution_enabled = (
+            os.environ.get("HUB_ENABLE_EXTERNAL_LIVE", "0").lower()
+            in ("1", "true", "yes", "on")
+            if external_execution_enabled is None else bool(external_execution_enabled)
+        )
         # entry_id -> {"sl_id": ..., "tp_id": ..., "symbol": ...}
         self._brackets: dict[str, dict] = {}
         self._rules: dict[str, object] = {}       # symbol -> SymbolRules cache
@@ -180,6 +186,11 @@ class CCXTBroker(Broker):
     # ----------------------------------------------------------------- orders
     def submit_order(self, order: Order) -> str:
         """Persist and submit an entry; never place exits before a confirmed fill."""
+        if not getattr(self, "_external_execution_enabled", False):
+            raise RuntimeError(
+                "External execution is disabled. Set HUB_ENABLE_EXTERNAL_LIVE=1 "
+                "only after the separate live-certification release is approved."
+            )
         side = order.side.value
         type_ = order.order_type.value
 
