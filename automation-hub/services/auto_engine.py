@@ -140,6 +140,10 @@ class AutoStrategyEngine:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        # Serializes one complete closed-candle decision. Pause acknowledgement
+        # acquires this after closing the entry gate, proving no earlier cycle
+        # can still create exposure when the API reports success.
+        self._cycle_lock = threading.Lock()
         self.running = False
         self.started_at: Optional[str] = None
         # Lifecycle state is server-owned.  A page refresh must never infer it
@@ -317,6 +321,17 @@ class AutoStrategyEngine:
             "last_processed_candle_timestamp": self.last_processed_candle,
         }
 
+    def acknowledge_entry_pause(self, timeout_s: float = 5.0) -> dict:
+        """Wait for the current candle cycle, then durably checkpoint state."""
+        acquired = self._cycle_lock.acquire(timeout=max(0.01, float(timeout_s)))
+        if not acquired:
+            raise TimeoutError("worker did not acknowledge the entry pause before timeout")
+        try:
+            checkpoint = self.flush_runtime_state()
+            return {**checkpoint, "acknowledged_at": self._utc_now()}
+        finally:
+            self._cycle_lock.release()
+
     def restart(self) -> bool:
         """Restart the worker without changing its strategy/risk configuration."""
         self.stop("Restart requested by operator")
@@ -389,6 +404,7 @@ class AutoStrategyEngine:
             "interval": self.interval,
             "mode": "live" if self.live else "replay",
             "strategy": self.strategy_label,
+            "strategy_key": getattr(self, "strategy_key", ""),
             "started_at": self.started_at,
             "uptime_s": uptime_s,
             "lifecycle_state": self.lifecycle_state,
@@ -586,7 +602,8 @@ class AutoStrategyEngine:
                 if not live[sym]:
                     continue
                 bar = live[sym].pop(0)
-                self._process_bar(sym, bar, strategies[sym])
+                with self._cycle_lock:
+                    self._process_bar(sym, bar, strategies[sym])
                 self.stats["bars"] += 1
                 advanced = True
             if not advanced:
@@ -746,7 +763,8 @@ class AutoStrategyEngine:
             if last_ts is None or b.timestamp > last_ts:
                 if self._is_multi_timeframe_strategy(strat):
                     self._apply_multi_timeframe_context(strat, b.timestamp)
-                self._process_bar(sym, b, strat)
+                with self._cycle_lock:
+                    self._process_bar(sym, b, strat)
                 self.stats["bars"] += 1
                 last_ts = b.timestamp
                 self.last_processed_candle = last_ts.isoformat()

@@ -1363,6 +1363,7 @@ class TradingInstanceManager:
                     f"the {required_decision_timeframe} decision timeframe")
             engine.ws_feed = ws_feed
             engine.strategy_label = f"{inst.strategy_label} {inst.strategy_version}"
+            engine.strategy_key = inst.strategy_key
             engine.strategy_version = inst.strategy_version
             engine.decisions = self.decision_store
             engine.reports = self.cycle_store
@@ -1722,8 +1723,21 @@ class TradingInstanceManager:
         with self._lock:
             self._assert_reboot_idle(instance_id)
             inst = self._instances[instance_id]; runtime = self._runtime.get(instance_id)
-        if runtime: runtime[3].pause_all()
-        inst.state, inst.desired_running = "paused", False; self.store.save(inst); return inst
+        if runtime:
+            runtime[3].pause_all()
+            try:
+                acknowledgement = runtime[0].acknowledge_entry_pause()
+                self.store.append_engine_log(
+                    instance_id, level="info",
+                    message=f"pause_acknowledged checkpoint={acknowledgement}")
+            except Exception as exc:
+                inst.state, inst.desired_running = "degraded", False
+                inst.last_error = f"Pause acknowledgement failed: {type(exc).__name__}: {exc}"
+                self.store.save(inst)
+                raise RuntimeError(inst.last_error) from exc
+        inst.state, inst.desired_running = "paused", False
+        self.store.save(inst)
+        return inst
 
     def resume(self, instance_id: str) -> TradingInstance:
         with self._lock:
@@ -2336,7 +2350,8 @@ class TradingInstanceManager:
         market_status = str(market.get("market_data_status") or "").lower()
         last_blocker = ((engine or {}).get("last_blocker") or market.get("last_blocker"))
         worker_strategy = str((engine or {}).get("strategy") or "")
-        strategy_matches = not worker_strategy or worker_strategy == inst.strategy_label
+        worker_strategy_key = str((engine or {}).get("strategy_key") or "")
+        strategy_matches = not worker_strategy_key or worker_strategy_key == inst.strategy_key
         controls_armed = bool(runtime and runtime[3].trading_allowed())
         if state in ("error", "degraded") or not strategy_matches:
             ui_status = "ERROR"
@@ -2396,6 +2411,7 @@ class TradingInstanceManager:
                 "strategy_identity": {
                     "configured_id": inst.strategy_key,
                     "configured_label": inst.strategy_label,
+                    "worker_id": worker_strategy_key or None,
                     "worker_label": worker_strategy or None,
                     "matches": strategy_matches,
                 },
