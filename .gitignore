@@ -27,6 +27,8 @@ dist/
 
 # Automation Hub local state
 *.db
+*.db-wal
+*.db-shm
 automation-hub/logs/*.json
 
 # React builds bundled into the backend image (built in Docker, never committed)

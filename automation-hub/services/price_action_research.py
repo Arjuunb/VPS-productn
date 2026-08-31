@@ -3,13 +3,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
 from bot.types import Bar
+from data.sqlite_runtime import runtime_connection
 from services.native_price_action import NativePriceActionEngine, PriceActionConfig
 from services.research_funding import (
     DISABLED, HistoricalFundingSeries, unavailable_series,
@@ -135,8 +135,7 @@ class PriceActionExperimentStore:
     def __init__(self, path: str | Path):
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(self.path, check_same_thread=False)
-        self._db.row_factory = sqlite3.Row
+        self._db = runtime_connection(self.path)
         with self._db:
             self._db.executescript("""
               CREATE TABLE IF NOT EXISTS pa_experiments(

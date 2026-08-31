@@ -8,12 +8,13 @@ generator and no client-provided fill-price escape hatch.
 from __future__ import annotations
 
 import math
-import sqlite3
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+from data.sqlite_runtime import runtime_connection
 
 
 ORDER_TYPES = {"market", "limit", "stop", "stop_limit", "trailing_stop"}
@@ -49,8 +50,7 @@ class PaperBrokerV2:
         self.slippage_bps = max(0.0, float(slippage_bps))
         self.participation_rate = min(1.0, max(0.0, float(participation_rate)))
         self._lock = threading.RLock()
-        self._c = sqlite3.connect(self.path, check_same_thread=False)
-        self._c.row_factory = sqlite3.Row
+        self._c = runtime_connection(self.path)
         self._schema(starting_balance)
 
     def _schema(self, starting_balance: float) -> None:

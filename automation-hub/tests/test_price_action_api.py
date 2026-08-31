@@ -1,4 +1,5 @@
 import pytest
+import sqlite3
 
 pytest.importorskip("fastapi")
 
@@ -8,6 +9,44 @@ from fastapi.testclient import TestClient
 import webhook_api
 from routers.price_action import router
 from services.price_action_lab import PriceActionPaperAccount
+
+
+def test_pa_read_endpoints_surface_persistence_block_instead_of_500(monkeypatch):
+    class Broker:
+        @staticmethod
+        def positions():
+            return []
+
+    class Paper:
+        broker = Broker()
+
+        @staticmethod
+        def state(_marks=None):
+            raise sqlite3.OperationalError("database is locked")
+
+        @staticmethod
+        def sessions():
+            raise sqlite3.OperationalError("database is locked")
+
+    class Runtime:
+        @staticmethod
+        def bot_status():
+            raise sqlite3.OperationalError("database is locked")
+
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+    monkeypatch.setattr(webhook_api, "price_action_paper", Paper())
+    monkeypatch.setattr(webhook_api, "price_action_runtime", Runtime())
+
+    for path in (
+            "/research/price-action/paper",
+            "/research/price-action/bot-status",
+            "/research/price-action/sessions"):
+        response = client.get(path)
+        assert response.status_code == 503
+        assert response.json()["detail"]["state"] == "PERSISTENCE_BLOCKED"
+        assert response.json()["detail"]["retryable"] is True
 
 
 def test_price_action_api_manifest_and_destructive_mutations_are_protected(monkeypatch, tmp_path):

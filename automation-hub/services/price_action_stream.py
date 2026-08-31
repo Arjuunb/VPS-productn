@@ -53,6 +53,8 @@ class PriceActionPublicStream:
         self.duplicate_events = 0
         self.missing_candles = 0
         self.reconciled_candles = 0
+        self.persistence_blocked_events = 0
+        self.last_sink_error = ""
         self.history_loaded = False
         self.reconciliation_complete = False
         self._health_state = "DISCONNECTED"
@@ -93,6 +95,28 @@ class PriceActionPublicStream:
                 "timestamp": self.clock().isoformat(), "symbol": self.symbol,
                 "timeframe": self.timeframe,
             })
+
+    def _deliver_closed_bar(self, bar: Bar) -> bool:
+        """Deliver a candle without translating journal contention to a feed outage."""
+        if not self.bar_sink:
+            return True
+        try:
+            self.bar_sink(bar)
+            self.last_sink_error = ""
+            return True
+        except Exception as exc:
+            if getattr(exc, "code", None) != "PERSISTENCE_BLOCKED":
+                raise
+            self.persistence_blocked_events += 1
+            self.last_sink_error = str(exc)[:500]
+            if self.event_sink:
+                self.event_sink({
+                    "kind": "persistence", "state": "PERSISTENCE_BLOCKED",
+                    "reason": self.last_sink_error, "retryable": True,
+                    "timestamp": self.clock().isoformat(), "symbol": self.symbol,
+                    "timeframe": self.timeframe,
+                })
+            return False
 
     def _refresh_transport_state(self) -> None:
         """Aggregate the required routed Binance transports into one state."""
@@ -313,8 +337,7 @@ class PriceActionPublicStream:
                 if not known:
                     if self._merge_closed(row):
                         count += 1
-                        if self.bar_sink:
-                            self.bar_sink(row)
+                        self._deliver_closed_bar(row)
             self.reconciled_candles += count
             with self._lock:
                 self.reconciliation_complete = self._unresolved_gaps() == 0
@@ -394,9 +417,11 @@ class PriceActionPublicStream:
             if bool(kline["x"]):
                 accepted = self._merge_closed(bar)
                 self._forming = None
-                if accepted and self.bar_sink:
-                    self.bar_sink(bar)
-                return {"accepted": accepted, "closed": True, "bar": bar}
+                persisted = self._deliver_closed_bar(bar) if accepted else True
+                return {"accepted": accepted, "closed": True, "bar": bar,
+                        "sink_persisted": persisted,
+                        "persistence_state": (
+                            "AVAILABLE" if persisted else "PERSISTENCE_BLOCKED")}
             self._forming = bar
             return {"accepted": True, "closed": False, "bar": bar}
         if event == "bookTicker" or {"b", "a", "s"}.issubset(data):
@@ -518,6 +543,8 @@ class PriceActionPublicStream:
                     "transport_errors": dict(self._channel_errors),
                     "duplicate_events": self.duplicate_events, "missing_candles": self.missing_candles,
                     "reconciled_candles": self.reconciled_candles, "last_error": self.last_error,
+                    "persistence_blocked_events": self.persistence_blocked_events,
+                    "last_sink_error": self.last_sink_error or None,
                     "public_streams": {
                         "market": ["kline", "markPrice"], "public": ["bookTicker"],
                     },
