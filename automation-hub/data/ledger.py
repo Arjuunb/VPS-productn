@@ -87,18 +87,19 @@ class Ledger(Protocol):
     def get_positions(self, status: Optional[str] = None, instance_id: str = "",
                       simulation_session_id: str = "") -> list[dict]: ...
     def record_paper_trade(self, trade: dict) -> str: ...
-    def open_position_and_trade(self, *, position: dict, trade: dict) -> tuple[str, str]: ...
+    def open_position_and_trade(self, *, position: dict, trade: dict,
+                                execution_id: str) -> tuple[str, str]: ...
     def close_position_and_trade(self, *, position_id: str, trade_id: str,
                                  exit_price: float, pnl: float, rr: float,
                                  fees: float = 0.0, realized_pnl: float | None = None,
                                  equity_after_close: float | None = None,
-                                 instance_id: str = "") -> None: ...
+                                 instance_id: str = "", execution_id: str) -> None: ...
     def reduce_position_and_trade(self, *, position: dict, trade_id: str,
                                   remainder_position: dict, remainder_trade: dict,
                                   exit_price: float, pnl: float, rr: float,
                                   closed_size: float, fees: float,
                                   equity_after_close: float,
-                                  instance_id: str = "") -> tuple[str, str]: ...
+                                  instance_id: str = "", execution_id: str) -> tuple[str, str]: ...
     def close_paper_trade(self, trade_id: str, *, exit_price: float, pnl: float, rr: float,
                           size: float | None = None, fees: float = 0.0,
                           realized_pnl: float | None = None,
@@ -214,7 +215,8 @@ class SqliteLedger:
             self._c.commit()
         return pid
 
-    def open_position_and_trade(self, *, position: dict, trade: dict) -> tuple[str, str]:
+    def open_position_and_trade(self, *, position: dict, trade: dict,
+                                execution_id: str) -> tuple[str, str]:
         """Create the position and its accounting trade in one transaction."""
         pid, tid, opened_at = _id(), trade.get("id") or _id(), _now()
         instance_id = position.get("instance_id") or trade.get("instance_id") or ""
@@ -243,6 +245,11 @@ class SqliteLedger:
                      trade.get("risk_basis_at_entry"), trade.get("risk_pct_at_entry"),
                      trade.get("risk_amount_at_entry"), trade.get("equity_before_trade")),
                 )
+                self._c.execute(
+                    "INSERT INTO paper_executions(execution_id,action,position_id,trade_id,instance_id,created_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (execution_id, "OPEN", pid, tid, instance_id, opened_at),
+                )
                 self._c.commit()
             except Exception:
                 self._c.rollback()
@@ -264,7 +271,7 @@ class SqliteLedger:
                                  exit_price: float, pnl: float, rr: float,
                                  fees: float = 0.0, realized_pnl: float | None = None,
                                  equity_after_close: float | None = None,
-                                 instance_id: str = "") -> None:
+                                 instance_id: str = "", execution_id: str) -> None:
         """Close matching position/trade rows or roll both back."""
         closed_at = _now()
         with self._lock:
@@ -286,6 +293,11 @@ class SqliteLedger:
                 tcur = self._c.execute(tq, targs)
                 if pcur.rowcount != 1 or tcur.rowcount != 1:
                     raise RuntimeError("paper close invariant failed: position/trade pair not open")
+                self._c.execute(
+                    "INSERT INTO paper_executions(execution_id,action,position_id,trade_id,instance_id,created_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (execution_id, "CLOSE", position_id, trade_id, instance_id, closed_at),
+                )
                 self._c.commit()
             except Exception:
                 self._c.rollback()
@@ -296,7 +308,7 @@ class SqliteLedger:
                                   exit_price: float, pnl: float, rr: float,
                                   closed_size: float, fees: float,
                                   equity_after_close: float,
-                                  instance_id: str = "") -> tuple[str, str]:
+                                  instance_id: str = "", execution_id: str) -> tuple[str, str]:
         """Close the fraction and open the remainder as one indivisible unit."""
         new_pid, new_tid, now = _id(), remainder_trade.get("id") or _id(), _now()
         session_id = (remainder_position.get("simulation_session_id")
@@ -341,6 +353,11 @@ class SqliteLedger:
                      remainder_trade.get("sizing_mode"), remainder_trade.get("sizing_engine_version"),
                      remainder_trade.get("risk_basis_at_entry"), remainder_trade.get("risk_pct_at_entry"),
                      remainder_trade.get("risk_amount_at_entry"), remainder_trade.get("equity_before_trade")),
+                )
+                self._c.execute(
+                    "INSERT INTO paper_executions(execution_id,action,position_id,trade_id,instance_id,created_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (execution_id, "REDUCE", new_pid, new_tid, instance_id, now),
                 )
                 self._c.commit()
             except Exception:
@@ -626,9 +643,12 @@ class SupabaseLedger:
         self._t("positions").insert(row).execute()
         return pid
 
-    def open_position_and_trade(self, *, position: dict, trade: dict):  # pragma: no cover
+    def open_position_and_trade(self, *, position: dict, trade: dict,
+                                execution_id: str):  # pragma: no cover
         pid, tid = _id(), trade.get("id") or _id()
-        payload = {"position": {**position, "id": pid}, "trade": {**trade, "id": tid}}
+        payload = {"position": {**position, "id": pid},
+                   "trade": {**trade, "id": tid},
+                   "execution_id": execution_id}
         self._db.rpc("paper_open_atomic", {"p_payload": payload}).execute()
         return pid, tid
 

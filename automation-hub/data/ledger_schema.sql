@@ -65,6 +65,17 @@ CREATE TABLE IF NOT EXISTS paper_trades (
 CREATE INDEX IF NOT EXISTS idx_paper_status ON paper_trades(status);
 CREATE INDEX IF NOT EXISTS idx_paper_opened ON paper_trades(opened_at);
 
+CREATE TABLE IF NOT EXISTS paper_executions (
+    execution_id TEXT PRIMARY KEY,
+    action       TEXT NOT NULL,        -- OPEN | REDUCE | CLOSE
+    position_id  TEXT NOT NULL,
+    trade_id     TEXT NOT NULL,
+    instance_id  TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_paper_executions_instance
+    ON paper_executions(instance_id, created_at);
+
 CREATE TABLE IF NOT EXISTS bot_logs (
     id       TEXT PRIMARY KEY,
     ts       TEXT NOT NULL,

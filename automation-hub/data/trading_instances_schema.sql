@@ -20,6 +20,17 @@ ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DE
 ALTER TABLE bot_logs ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT '';
 
+CREATE TABLE IF NOT EXISTS paper_executions (
+ execution_id TEXT PRIMARY KEY,
+ action TEXT NOT NULL CHECK (action IN ('OPEN','REDUCE','CLOSE')),
+ position_id TEXT NOT NULL,
+ trade_id TEXT NOT NULL,
+ instance_id TEXT NOT NULL DEFAULT '',
+ created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_paper_executions_instance
+ ON paper_executions(instance_id, created_at DESC);
+
 -- Position and accounting-trade rows are one logical unit. PostgREST calls are
 -- individually transactional, so expose one RPC for each compound mutation.
 CREATE OR REPLACE FUNCTION public.paper_open_atomic(p_payload JSONB)
@@ -40,7 +51,7 @@ BEGIN
    instance_id,simulation_session_id,sizing_mode,sizing_engine_version,
    risk_basis_at_entry,risk_pct_at_entry,risk_amount_at_entry,equity_before_trade,fees)
  VALUES
-  (v_tid,t->>'alert_id',t->>'symbol',t->>'side',(t->>'size')::DOUBLE PRECISION,
+ (v_tid,t->>'alert_id',t->>'symbol',t->>'side',(t->>'size')::DOUBLE PRECISION,
    (t->>'entry')::DOUBLE PRECISION,(t->>'stop')::DOUBLE PRECISION,
    (t->>'target')::DOUBLE PRECISION,'open',v_now,COALESCE(t->>'strategy_id',''),
    COALESCE(t->>'instance_id',p->>'instance_id',''),
@@ -48,6 +59,9 @@ BEGIN
    t->>'sizing_mode',t->>'sizing_engine_version',(t->>'risk_basis_at_entry')::DOUBLE PRECISION,
    (t->>'risk_pct_at_entry')::DOUBLE PRECISION,(t->>'risk_amount_at_entry')::DOUBLE PRECISION,
    (t->>'equity_before_trade')::DOUBLE PRECISION,0);
+ INSERT INTO paper_executions(execution_id,action,position_id,trade_id,instance_id,created_at)
+ VALUES (p_payload->>'execution_id','OPEN',v_pid,v_tid,
+         COALESCE(t->>'instance_id',p->>'instance_id',''),v_now);
  RETURN jsonb_build_object('position_id',v_pid,'trade_id',v_tid);
 END $$;
 
@@ -70,6 +84,9 @@ BEGIN
  IF p_count <> 1 OR t_count <> 1 THEN
   RAISE EXCEPTION 'paper close invariant failed: position %, trade %', p_count, t_count;
  END IF;
+ INSERT INTO paper_executions(execution_id,action,position_id,trade_id,instance_id,created_at)
+ VALUES (p_payload->>'execution_id','CLOSE',p_payload->>'position_id',p_payload->>'trade_id',
+         COALESCE(p_payload->>'instance_id',''),v_now);
 END $$;
 
 CREATE OR REPLACE FUNCTION public.paper_reduce_atomic(p_payload JSONB)
@@ -106,13 +123,16 @@ BEGIN
    instance_id,simulation_session_id,sizing_mode,sizing_engine_version,
    risk_basis_at_entry,risk_pct_at_entry,risk_amount_at_entry,equity_before_trade,fees)
  VALUES
-  (rt->>'id',rt->>'alert_id',rt->>'symbol',rt->>'side',(rt->>'size')::DOUBLE PRECISION,
+ (rt->>'id',rt->>'alert_id',rt->>'symbol',rt->>'side',(rt->>'size')::DOUBLE PRECISION,
    (rt->>'entry')::DOUBLE PRECISION,(rt->>'stop')::DOUBLE PRECISION,
    (rt->>'target')::DOUBLE PRECISION,'open',v_now,COALESCE(rt->>'strategy_id',''),
    COALESCE(rt->>'instance_id',''),COALESCE(rt->>'simulation_session_id',''),
    rt->>'sizing_mode',rt->>'sizing_engine_version',(rt->>'risk_basis_at_entry')::DOUBLE PRECISION,
    (rt->>'risk_pct_at_entry')::DOUBLE PRECISION,(rt->>'risk_amount_at_entry')::DOUBLE PRECISION,
    (rt->>'equity_before_trade')::DOUBLE PRECISION,0);
+ INSERT INTO paper_executions(execution_id,action,position_id,trade_id,instance_id,created_at)
+ VALUES (p_payload->>'execution_id','REDUCE',rp->>'id',rt->>'id',
+         COALESCE(p_payload->>'instance_id',rp->>'instance_id',''),v_now);
  RETURN jsonb_build_object('position_id',rp->>'id','trade_id',rt->>'id');
 END $$;
 

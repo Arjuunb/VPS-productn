@@ -8,6 +8,7 @@ unrealized P&L is computed against supplied mark prices.
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass
 from typing import Optional
 
@@ -26,6 +27,7 @@ class FillResult:
     position_id: str = ""
     trade_id: str = ""
     fee: float = 0.0            # round-trip commission charged on this fill
+    execution_id: str = ""
 
 
 def _dir(side: str) -> str:
@@ -148,11 +150,17 @@ class PaperExecutionEngine:
             pass
 
     # --------------------------------------------------------------- actions
+    @staticmethod
+    def _execution_id(action: str, supplied: str = "") -> str:
+        value = str(supplied or "").strip()
+        return value or f"paper:{action.lower()}:{uuid.uuid4().hex}"
+
     def open(self, *, symbol: str, side: str, size: float, entry: float,
              stop: Optional[float], target: Optional[float] = None,
              alert_id: str = "", maker: bool = False,
              sizing_context: Optional[dict] = None) -> FillResult:
         direction = _dir(side)
+        execution_id = self._execution_id("OPEN", alert_id)
         # route the entry through the fill model (price/size/rejection);
         # maker fills (resting limits) execute at the limit price exactly
         action = "buy" if direction == "long" else "sell"
@@ -191,11 +199,14 @@ class PaperExecutionEngine:
                 "management": initial_management,
             },
             trade=trade_row,
+            execution_id=execution_id,
         )
         self._invalidate_history()
-        return FillResult("opened", symbol, direction, size, entry, 0.0, pid, tid)
+        return FillResult("opened", symbol, direction, size, entry, 0.0, pid, tid,
+                          execution_id=execution_id)
 
-    def reduce(self, *, symbol: str, exit_price: float, fraction: float) -> FillResult:
+    def reduce(self, *, symbol: str, exit_price: float, fraction: float,
+               execution_id: str = "") -> FillResult:
         """Partial close (scale-out): realize P&L on ``fraction`` of the position
         and keep the remainder open at the same entry/stop. Implemented as
         close-then-reopen so every Ledger backend works unchanged."""
@@ -236,6 +247,7 @@ class PaperExecutionEngine:
         atomic_reduce = getattr(self.ledger, "reduce_position_and_trade", None)
         if not callable(atomic_reduce):
             raise RuntimeError("Ledger does not support atomic paper position reduction")
+        execution_id = self._execution_id("REDUCE", execution_id)
         atomic_reduce(
             position=pos, trade_id=open_trade["id"],
             remainder_position={
@@ -246,12 +258,15 @@ class PaperExecutionEngine:
             remainder_trade=remainder_trade, exit_price=exit_price, pnl=pnl,
             rr=rr, closed_size=closed_size, fees=fee,
             equity_after_close=equity_before_close + pnl,
+            execution_id=execution_id,
         )
         self._invalidate_history()
         self._persist_account_snapshot()
-        return FillResult("reduced", symbol, pos["side"], closed_size, exit_price, pnl, pos["id"], fee=fee)
+        return FillResult("reduced", symbol, pos["side"], closed_size, exit_price,
+                          pnl, pos["id"], fee=fee, execution_id=execution_id)
 
-    def close(self, *, symbol: str, exit_price: float) -> FillResult:
+    def close(self, *, symbol: str, exit_price: float,
+              execution_id: str = "") -> FillResult:
         pos = self.open_position(symbol)
         if pos is None:
             return FillResult("noop", symbol, "", 0.0, exit_price)
@@ -271,21 +286,24 @@ class PaperExecutionEngine:
         open_trade = next((t for t in self.ledger.get_paper_trades()
                            if t["symbol"] == symbol and t["status"] == "open"), None)
         if open_trade is None:
-            # Repair a pre-remediation orphan by closing the exposure; do not
-            # manufacture a trade record with unknown provenance.
-            self.ledger.close_position(pos["id"], exit_price=exit_price, pnl=pnl)
+            raise RuntimeError(
+                f"Paper ledger invariant failed: {symbol} position has no open trade; "
+                "execution is fail-closed pending operator reconciliation")
         else:
             atomic_close = getattr(self.ledger, "close_position_and_trade", None)
             if not callable(atomic_close):
                 raise RuntimeError("Ledger does not support atomic paper close")
+            execution_id = self._execution_id("CLOSE", execution_id)
             atomic_close(
                 position_id=pos["id"], trade_id=open_trade["id"],
                 exit_price=exit_price, pnl=pnl, rr=rr, fees=fee,
                 realized_pnl=pnl, equity_after_close=equity_before_close + pnl,
+                execution_id=execution_id,
             )
         self._invalidate_history()
         self._persist_account_snapshot()
-        return FillResult("closed", symbol, pos["side"], pos["size"], exit_price, pnl, pos["id"], fee=fee)
+        return FillResult("closed", symbol, pos["side"], pos["size"], exit_price,
+                          pnl, pos["id"], fee=fee, execution_id=execution_id)
 
     # --------------------------------------------------------------- helpers
     def _fee_rate(self, *, maker: bool = False) -> float:

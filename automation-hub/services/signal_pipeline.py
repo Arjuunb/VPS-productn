@@ -509,7 +509,8 @@ class SignalPipeline:
             # link the closing trade to its open journal before the ledger row closes
             _open_tid = next((t["id"] for t in self.ledger.get_paper_trades()
                               if t["symbol"] == symbol and t["status"] == "open"), None)
-            fill = self.paper.close(symbol=symbol, exit_price=entry)
+            fill = self.paper.close(symbol=symbol, exit_price=entry,
+                                    execution_id=alert_id)
             if self.journal is not None and _open_tid:
                 try:
                     self.journal.record_exit(

@@ -171,13 +171,14 @@ class InstanceLedger:
             **kw, instance_id=self.instance_id,
             simulation_session_id=self.simulation_session_id)
 
-    def open_position_and_trade(self, *, position, trade):
+    def open_position_and_trade(self, *, position, trade, execution_id):
         p, t = dict(position), dict(trade)
         p.update(instance_id=self.instance_id,
                  simulation_session_id=self.simulation_session_id)
         t.update(instance_id=self.instance_id,
                  simulation_session_id=self.simulation_session_id)
-        return self._ledger.open_position_and_trade(position=p, trade=t)
+        return self._ledger.open_position_and_trade(
+            position=p, trade=t, execution_id=execution_id)
 
     def get_positions(self, status=None):
         return self._ledger.get_positions(
