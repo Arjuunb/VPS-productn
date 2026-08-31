@@ -140,7 +140,7 @@ def test_webhook_api_proxy_mutations_delegate_without_shadowing(monkeypatch):
     assert "instance_manager" not in vars(_wa)
 
 
-SECRET = "dev-webhook-secret"
+SECRET = "dev-control-key"
 
 
 def test_options_endpoint(client):
@@ -184,6 +184,16 @@ def test_strategy_select_switches_active_engine_strategy(client):
     back = client.post("/strategy/select", json={"strategy": "Decision Brain"},
                        headers={"X-Webhook-Secret": SECRET}).json()
     assert back["active"] == start
+
+
+def test_canonical_factory_constructs_smc_and_rejects_unknown():
+    from services.strategy_factory import make_builtin_strategy
+    from strategies.smc_strategy import SMCStrategy
+
+    assert isinstance(make_builtin_strategy("smc", "BTCUSDT"), SMCStrategy)
+
+    with pytest.raises(ValueError, match="unknown built-in strategy"):
+        make_builtin_strategy("not-a-strategy", "BTCUSDT")
 
 
 def test_auto_tune_returns_honest_verdict():

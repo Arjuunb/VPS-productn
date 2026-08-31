@@ -1,6 +1,7 @@
 from dataclasses import replace
 
-from services.smc_strategy_v1 import ENTRY_MODELS, evaluate, manifest, strategy_models
+from services.native_smc import PivotPoint
+from services.smc_strategy_v1 import ENTRY_MODELS, _trade_plan, evaluate, manifest, strategy_models
 from tests.test_smc_strategy_ladder import seeded_engine
 
 
@@ -34,6 +35,28 @@ def test_sweep_reversal_prefers_causal_order_block_and_builds_split_targets():
     assert result["native_object_ids"] == ["sweep-low", "structure-bull", "ob-bull"]
     assert [row["status"] for row in result["ordered_condition_results"][:2]] == ["PASS", "PASS"]
     assert result["missing_conditions"] == []
+
+
+def test_trade_plan_keeps_scale_out_and_runner_targets_strictly_ordered():
+    proposal = {"entry": 100.0, "stop": 90.0, "direction": "bullish"}
+    expected = {
+        115.0: (115.0, 130.0),
+        130.0: (120.0, 130.0),
+        140.0: (120.0, 140.0),
+    }
+    for external_price, targets in expected.items():
+        engine = seeded_engine()
+        at = engine.bars[-1].timestamp
+        pivot = PivotPoint(
+            f"external-{external_price}", "high", external_price,
+            at, at, len(engine.bars) - 1, "external")
+        engine.pivots = {pivot.id: pivot}
+
+        plan = _trade_plan(engine, proposal)
+
+        assert (plan["target_1"], plan["target_2"]) == targets
+        assert plan["target_1"] < plan["target_2"]
+        assert plan["target_1_r"] < plan["target_2_r"]
 
 
 def test_sweep_reversal_falls_back_to_causal_fvg():

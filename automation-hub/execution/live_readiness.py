@@ -15,8 +15,9 @@ Three things every bot needs BEFORE its first real order, exposed honestly:
 
 Environment:
     HUB_EXCHANGE     ccxt exchange id (default "binance")
-    HUB_API_KEY      exchange API key
-    HUB_API_SECRET   exchange API secret
+    HUB_EXCHANGE_API_KEY      exchange API key
+    HUB_EXCHANGE_API_SECRET   exchange API secret
+    HUB_ORDER_STATE_DB        durable execution state database
     HUB_TESTNET      "0" to trade real (default is testnet/sandbox)
 """
 from __future__ import annotations
@@ -29,16 +30,22 @@ from typing import Optional
 def make_live_broker():
     """Build a CCXTBroker from env. Raises with a clear message when the
     environment isn't ready — callers surface it instead of guessing."""
-    key = os.environ.get("HUB_API_KEY", "")
-    secret = os.environ.get("HUB_API_SECRET", "")
+    if os.environ.get("HUB_ENABLE_EXTERNAL_LIVE", "0").lower() not in (
+            "1", "true", "yes", "on"):
+        raise RuntimeError("HUB_ENABLE_EXTERNAL_LIVE is disabled")
+    key = os.environ.get("HUB_EXCHANGE_API_KEY", "")
+    secret = os.environ.get("HUB_EXCHANGE_API_SECRET", "")
     if not key or not secret:
-        raise RuntimeError("HUB_API_KEY / HUB_API_SECRET not set — cannot "
+        raise RuntimeError("HUB_EXCHANGE_API_KEY / HUB_EXCHANGE_API_SECRET not set — cannot "
                            "connect to an exchange")
+    from config import DATA_DIR
+    state_path = os.environ.get("HUB_ORDER_STATE_DB", str(DATA_DIR / "execution_orders.db"))
     from bot.brokers.ccxt_broker import CCXTBroker
     return CCXTBroker(
         exchange_id=os.environ.get("HUB_EXCHANGE", "binance"),
         api_key=key, api_secret=secret,
         sandbox=os.environ.get("HUB_TESTNET", "1") != "0",
+        state_path=state_path,
     )
 
 
@@ -112,9 +119,13 @@ def live_readiness(broker=None, symbols: Optional[list[str]] = None) -> dict:
     except ImportError:
         check("ccxt installed", False, "pip install ccxt")
 
-    has_keys = bool(os.environ.get("HUB_API_KEY")) and bool(os.environ.get("HUB_API_SECRET"))
-    check("api keys", has_keys, "HUB_API_KEY / HUB_API_SECRET set"
-          if has_keys else "HUB_API_KEY / HUB_API_SECRET not set")
+    has_keys = bool(os.environ.get("HUB_EXCHANGE_API_KEY")) and bool(
+        os.environ.get("HUB_EXCHANGE_API_SECRET"))
+    check("api keys", has_keys, "HUB_EXCHANGE_API_KEY / HUB_EXCHANGE_API_SECRET set"
+          if has_keys else "HUB_EXCHANGE_API_KEY / HUB_EXCHANGE_API_SECRET not set")
+    enabled = os.environ.get("HUB_ENABLE_EXTERNAL_LIVE", "0").lower() in (
+        "1", "true", "yes", "on")
+    check("external live feature flag", enabled, "explicitly enabled" if enabled else "disabled")
     check("testnet mode", True,
           "sandbox/testnet (set HUB_TESTNET=0 for real trading)" if is_testnet()
           else "REAL trading mode", blocking=False)

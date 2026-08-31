@@ -27,7 +27,7 @@ def test_router_endpoint_aliased_under_v1(client):
     # Authenticate with the webhook secret so the auth wall lets the read
     # through at BOTH paths (the alias must NOT bypass the wall on its own).
     import app as hub_app
-    sec = {"X-Webhook-Secret": hub_app.settings.webhook_secret}
+    sec = {"X-Webhook-Secret": hub_app.settings.admin_key}
     legacy = client.get("/bot-os", headers=sec)
     v1 = client.get("/api/v1/bot-os", headers=sec)
     assert legacy.status_code != 404, "legacy path missing"

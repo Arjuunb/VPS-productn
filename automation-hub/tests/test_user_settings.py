@@ -95,6 +95,6 @@ def test_market_symbols_endpoint_persists(client, monkeypatch):
     saved = {}
     monkeypatch.setattr(_wa, "save_overrides", lambda path, snap: saved.update(snap))
     r = client.post("/market/symbols", json={"symbols": ["btcusdt", "ethusdt"]},
-                    headers={"X-Webhook-Secret": _wa.settings.webhook_secret})
+                    headers={"X-Webhook-Secret": _wa.settings.admin_key})
     assert r.status_code == 200
     assert saved.get("engine_symbols") == "BTCUSDT,ETHUSDT"

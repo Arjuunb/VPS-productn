@@ -54,4 +54,4 @@ def test_settings_get_requires_auth(client=None):
     # no session, no secret -> the auth wall blocks it
     assert c.get("/settings").status_code == 401
     # with the control secret it's reachable (operator path)
-    assert c.get("/settings", headers={"X-Webhook-Secret": settings.webhook_secret}).status_code == 200
+    assert c.get("/settings", headers={"X-Webhook-Secret": settings.admin_key}).status_code == 200

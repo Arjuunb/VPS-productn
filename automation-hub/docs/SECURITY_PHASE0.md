@@ -51,16 +51,12 @@ interval firing `setState` on an unmounted component.
 Portfolio and Simulation now render a shared **OfflineBanner** when the backend
 is unreachable, so `$0` equity reads as “connection issue,” not “wiped account.”
 
-## M-5 — webhook secret decoupled from control (done)
-The webhook secret is shared with TradingView (it rides in the alert webhook),
-so it is the credential most likely to leak. It used to authorize everything.
-Now the dashboard/control credential is a separate **admin key** (`HUB_API_KEY`),
-and with `HUB_SCOPE_WEBHOOK=1` the webhook secret is **rejected on every
-non-webhook endpoint** — it can post alerts but cannot stop the engine, reset the
-account, or change settings. Default behaviour is unchanged: the admin key falls
-back to the webhook secret until an operator opts in.
-- `_check_webhook_secret` guards `/webhook/tradingview`; `_check_secret` (all
-  control actions) + the auth wall accept the admin key, and the webhook secret
-  only when unscoped. The same-origin dashboard is served the admin key in its
-  runtime config; cross-origin (Vercel) sets `VITE_WEBHOOK_SECRET` to the admin
-  key. Covered by `tests/test_webhook_scope.py`.
+## M-5 — credentials separated and enforced (done)
+Control, TradingView webhook, and exchange access use independent credentials:
+`HUB_CONTROL_KEY`, `HUB_WEBHOOK_SECRET`, `HUB_EXCHANGE_API_KEY`, and
+`HUB_EXCHANGE_API_SECRET`. Startup rejects any overlap. The webhook secret can
+post alerts only; it cannot stop the engine, reset an account, or change settings.
+Control mutations additionally require an operator or owner role. The dashboard
+receives the control key in its runtime configuration; exchange credentials are
+never exposed to the browser. Covered by `tests/test_credential_separation.py`,
+`tests/test_webhook_scope.py`, and `tests/test_rbac_gating.py`.

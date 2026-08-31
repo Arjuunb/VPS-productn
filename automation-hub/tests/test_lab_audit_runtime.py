@@ -7,6 +7,7 @@ from services.price_action_lab import (
     PriceActionLabRuntime,
     PriceActionPaperAccount,
 )
+from services.lab_lifecycle import blockers as lifecycle_blockers
 from services.smc_strategy_lab import SMCPaperAccount, SMCPaperConfig, SMCStrategyLabRuntime
 from services.smc_strategy_v1 import evaluate
 from tests.test_smc_strategy_ladder import seeded_engine
@@ -126,7 +127,8 @@ def test_smc_automatic_order_has_one_correlation_and_protected_fill(tmp_path):
     assert state["order_metadata"][0]["config"]["correlation_id"] == correlation
 
     entry = float(decision["trade_plan"]["entry"])
-    account.process_candle("BTCUSDT", Bar(NOW, entry, entry + 1, entry - 1, entry, 10_000))
+    fill_time = decision["proposal"]["signal_timestamp"] + timedelta(minutes=5)
+    account.process_candle("BTCUSDT", Bar(fill_time, entry, entry + 1, entry - 1, entry, 10_000))
     position = account.state()["positions"][0]
     assert position["protection_status"] == "PROTECTED"
     assert position["stop_loss"] is not None and position["take_profit"] is not None
@@ -168,10 +170,31 @@ def test_dashboard_status_is_scope_accurate_and_fails_closed(tmp_path):
         smc_status = smc.bot_status()
         assert pa_status["account_scope"] == "PRICE_ACTION_VISUAL_LAB_ONLY"
         assert smc_status["account_scope"] == "SMC_STRATEGY_LAB_ONLY"
+        assert pa_status["session_state"] == smc_status["session_state"] == "BLOCKED"
+        assert pa_status["execution_armed"] is False
+        assert smc_status["execution_armed"] is True
         assert pa_status["execution_state"] == smc_status["execution_state"] == "BLOCKED"
         assert pa_status["feed"]["state"] == smc_status["feed"]["state"] == "DISCONNECTED"
         assert pa_status["performance"].keys() == {"backtest", "forward_validation", "live_paper"}
         assert smc_status["performance"]["backtest"]["available"] is False
+
+        pa_account.configure(execution_config=PaperExecutionConfig(operating_mode="signals_only"))
+        smc_account.configure(config=SMCPaperConfig(operating_mode="signals_only"))
+        assert pa.bot_status()["execution_state"] == "BLOCKED"
+        assert smc.bot_status()["execution_state"] == "BLOCKED"
     finally:
         pa.stop()
         smc.stop()
+
+
+def test_existing_exposure_is_an_explicit_new_entry_blocker():
+    reasons = lifecycle_blockers(
+        connection={"reliable": True}, operating_mode="automatic",
+        account={"balance": 10_000, "free_margin": 9_000}, strategy_valid=True,
+        positions=[{"symbol": "BTCUSDT", "protection_status": "PROTECTED"}],
+        pending_orders=[{"id": "entry-1", "reduce_only": False}],
+        risk_pct=.5, max_risk_pct=1.0,
+    )
+
+    assert any("protected paper position" in reason for reason in reasons)
+    assert any("pending paper entry" in reason for reason in reasons)

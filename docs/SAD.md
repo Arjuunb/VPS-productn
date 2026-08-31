@@ -398,8 +398,8 @@ flowchart TD
 | Session auth | HMAC-SHA256 signed cookie (`secret_key`, 7-day exp, constant-time verify); **not** signed with the webhook secret (CR-1) | JWT (Supabase) at the gateway; short-lived access + refresh |
 | OAuth | Supabase Google/GitHub on landing (demo unless configured) | First-class via Auth Service; backend trusts the JWT |
 | Password | PBKDF2 + per-user salt | keep; add breach-check + strength policy |
-| API keys / secrets | single shared `X-Webhook-Secret`; `HUB_API_KEY`+`HUB_SCOPE_WEBHOOK` can decouple control from webhook | per-tenant scoped keys; secrets in a manager (not env) |
-| Exchange keys | n/a (paper) | **encrypted at rest** (pgcrypto/KMS), never returned to client, scoped no-withdraw |
+| API keys / secrets | independent `HUB_CONTROL_KEY` and `HUB_WEBHOOK_SECRET`; startup rejects overlap with exchange credentials | per-tenant scoped keys; secrets in a manager (not env) |
+| Exchange keys | separate `HUB_EXCHANGE_API_KEY` / `HUB_EXCHANGE_API_SECRET`, never returned to the client; external live is feature-gated off by default | **encrypted at rest** (pgcrypto/KMS), scoped no-withdraw |
 | Boot hardening | refuses dev `secret_key` on cloud; warns on `admin` password (M-7) | enforce non-default + first-run owner as a hard gate |
 | Rate limiting | ⚠ **none** | per-IP + per-user on `/login`, `/signup`, `/webhook`, order POSTs |
 | Input validation | Pydantic + in-handler range/spec checks | `response_model` + schema on every route |

@@ -66,7 +66,7 @@ def manifest():
         "volume_preserved_for_display": True,
         "volume_used_for_signals": False,
         "historical_and_live_share_engine": True,
-        "automatic_strategy_mode": "SIGNALS_ONLY",
+        "automatic_strategy_mode": "AUTOMATIC_PAPER",
         "paper_account_isolated": True,
         "real_order_path": False,
         "live_execution_allowed": False,
@@ -174,7 +174,7 @@ class SessionStartBody(BaseModel):
     symbol: str = "BTCUSDT"
     timeframe: str = "5m"
     starting_balance: float = Field(default=10_000, gt=0)
-    operating_mode: str = "signals_only"
+    operating_mode: str = "automatic"
     strategy_id: str = "PA1_SR_REJECTION"
     risk_pct: float = Field(default=.5, gt=0, le=5)
     swing_sensitivity: int = Field(default=3, ge=2, le=5)
@@ -225,7 +225,7 @@ class SessionConfigBody(BaseModel):
     symbol: Optional[str] = None
     timeframe: Optional[str] = None
     replay_cursor: Optional[int] = Field(default=None, ge=0)
-    operating_mode: str = "signals_only"
+    operating_mode: str = "automatic"
     strategy_id: str = "PA1_SR_REJECTION"
     risk_pct: float = Field(default=.5, gt=0, le=5)
     swing_sensitivity: int = Field(default=3, ge=2, le=5)

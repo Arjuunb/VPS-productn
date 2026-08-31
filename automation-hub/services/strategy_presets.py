@@ -154,8 +154,8 @@ def _run_on(strategy: str, symbol: str, timeframe: str, tuning: dict, custom_spe
     min_score = int((tuning or {}).get("min_score", DEFAULT_TUNING["min_score"]))
     brain = TradeBrain()
     if desc["kind"] == "builtin":
-        from webhook_api import _build_builtin
-        strat = _build_builtin(desc["key"], symbol)
+        from services.strategy_factory import make_builtin_strategy
+        strat = make_builtin_strategy(desc["key"], symbol)
         results = simulate_strategy(strat, rows, brain=brain, min_score=min_score, slippage=slippage,
                                     mtf_lookup=mtf_lookup, mtf_tfs=mtf_tfs,
                                     **_risk_kwargs(tuning))
@@ -190,8 +190,8 @@ def make_replay_strategy(strategy: str, symbol: str, timeframe: str, custom_spec
         return None, desc["error"], None
     sid = _NAME_TO_ID.get(strategy, strategy)
     if desc["kind"] == "builtin":
-        from webhook_api import _build_builtin
-        strat = _build_builtin(desc["key"], symbol)
+        from services.strategy_factory import make_builtin_strategy
+        strat = make_builtin_strategy(desc["key"], symbol)
     else:
         from strategies.custom_adapter import CustomStrategyAdapter
         spec = {**desc["spec"], "quality_filter": False, "mtf_filter": False}

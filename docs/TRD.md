@@ -406,7 +406,7 @@ Fleet Manager (§Phase 4a), Grid & DCA, Bot Health, Logs, Alerts, Markets, Symbo
 **Strengths**
 - HMAC-SHA256 session, **constant-time** compare (`hmac.compare_digest`); session signed with `secret_key`, deliberately **not** the webhook secret (prevents authed users forging owner tokens — CR-1).
 - **Boot hardening (M-7):** on a cloud host refuses to start with the dev `secret_key`; loudly warns on `password=admin`.
-- **Credential separation (M-5):** `HUB_API_KEY` + `HUB_SCOPE_WEBHOOK=1` decouples the control key from the TradingView webhook secret; webhook secret can be limited to alert-posting only.
+- **Credential separation (M-5):** `HUB_CONTROL_KEY`, `HUB_WEBHOOK_SECRET`, and the `HUB_EXCHANGE_API_*` pair are independent; startup rejects shared values and the webhook credential is limited to alert ingestion.
 - PBKDF2 password hashing (salt per user); cookies `HttpOnly`, `SameSite` configurable (`None`→`Secure`); optional CSP `frame-ancestors`.
 - CORS `allow_credentials=False` (cookies never sent cross-origin → cross-origin must use the header secret).
 
@@ -442,7 +442,8 @@ Fleet Manager (§Phase 4a), Grid & DCA, Bot Health, Logs, Alerts, Markets, Symbo
 
 **Secrets / config**
 - [ ] Set `HUB_SECRET` (32+ random) — app refuses dev value on cloud ✅ enforced
-- [ ] Set `HUB_API_KEY` **and** `HUB_SCOPE_WEBHOOK=1` (decouple control from webhook)
+- [ ] Set a unique `HUB_CONTROL_KEY` (never reuse the webhook or exchange credentials)
+- [ ] Set unique `HUB_EXCHANGE_API_KEY` and `HUB_EXCHANGE_API_SECRET`; leave `HUB_ENABLE_EXTERNAL_LIVE=0` through the paper soak
 - [ ] Set `HUB_WEBHOOK_SECRET` (rotate from default)
 - [ ] Change owner password from `admin` (or complete first-run owner signup)
 - [ ] `SUPABASE_URL` + `SUPABASE_KEY` set on the **backend** service (durability across redeploys)

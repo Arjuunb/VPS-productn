@@ -129,7 +129,7 @@ def test_v2_api_processes_only_a_cached_provider_candle(tmp_path, monkeypatch):
     monkeypatch.setattr(webhook_api, "paper_broker_v2", PaperBrokerV2(tmp_path / "api-broker.db", fee_rate=0,
                                                                         spread_bps=0, slippage_bps=0, participation_rate=1))
     app = FastAPI(); app.include_router(webhook_api.router)
-    client, headers = TestClient(app), {"X-Webhook-Secret": "dev-webhook-secret"}
+    client, headers = TestClient(app), {"X-Webhook-Secret": "dev-control-key"}
     assert client.get("/market-data-v2/latest/BTCUSDT").status_code == 200
     order = client.post("/paper-v2/orders", json={"symbol": "BTCUSDT", "side": "buy",
                                                     "type": "market", "quantity": 1}, headers=headers)

@@ -88,6 +88,29 @@ def test_anonymous_blocked(env):
     assert env.store.get_user("x") is None
 
 
+def test_viewer_cannot_mutate_trading_state(env):
+    from fastapi.testclient import TestClient
+    env.store.create_user("observer", "pw12345678", role="viewer")
+    c = TestClient(env.app)
+    _login(c, "observer", "pw12345678")
+    response = c.post("/emergency-stop", follow_redirects=False)
+    assert response.status_code == 303
+    assert "Operator+role+required" in response.headers.get("location", "")
+
+
+@pytest.mark.parametrize("action", ["start", "pause", "stop", "restart"])
+def test_viewer_cannot_control_trading_instance(env, action):
+    from fastapi.testclient import TestClient
+    env.store.create_user(f"observer-{action}", "pw12345678", role="viewer")
+    client = TestClient(env.app)
+    _login(client, f"observer-{action}", "pw12345678")
+
+    response = client.post(f"/instances/not-owned/{action}")
+
+    assert response.status_code == 403
+    assert response.json()["error"].startswith("Operator role required")
+
+
 # ------------------------------------- privilege-escalation guard on role mint
 
 def test_only_owner_can_mint_admins(env):

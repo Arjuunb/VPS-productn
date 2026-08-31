@@ -119,7 +119,7 @@ def client(tmp_path, monkeypatch):
     return TestClient(app)
 
 
-SECRET = "dev-webhook-secret"
+SECRET = "dev-control-key"
 
 
 def test_fill_model_endpoint(client):

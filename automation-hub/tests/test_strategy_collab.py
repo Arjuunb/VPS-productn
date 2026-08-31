@@ -263,7 +263,7 @@ def client(tmp_path, monkeypatch):
 
 def _secret():
     from config import settings
-    return {"X-Webhook-Secret": settings.webhook_secret}
+    return {"X-Webhook-Secret": settings.admin_key}
 
 
 @pytest.fixture()

@@ -10,9 +10,8 @@ Key safety behaviors
    ``broker.get_position()`` and aborts if its internal view disagrees with
    the broker's view (e.g. out-of-band manual closes, liquidations).
 3. Partial-fill aware: after submitting an entry, the runner waits briefly,
-   queries fills, and re-uses the **actually filled** quantity rather than
-   the requested one. SL/TP have already been attached by the broker as a
-   bracket — we just record what was filled.
+   queries fills, cancels any remainder, and protects the **actually filled**
+   quantity. A timed-out entry is resolved before another signal is accepted.
 """
 from __future__ import annotations
 
@@ -51,6 +50,11 @@ class LiveRunner:
         self._internal_in_position: bool = False
 
     def _warmup(self) -> None:
+        recover = getattr(self.broker, "recover_open_orders", None)
+        if callable(recover):
+            # Crash recovery is a precondition for consuming another signal.
+            # Any unresolved entry or emergency state raises and stops startup.
+            recover()
         log.info("Warming up with %d historical bars...", self.warmup_bars)
         end = datetime.now(timezone.utc)
         bars = self.broker.get_historical_bars(
@@ -117,6 +121,10 @@ class LiveRunner:
                 symbol=signal.symbol, side=side, qty=qty,
                 order_type=OrderType.MARKET,
                 stop_loss=signal.stop_loss, take_profit=signal.take_profit,
+                # Stable across a restart/replay of the same closed-candle
+                # decision, so the durable broker store can reject resubmission.
+                client_id=(f"nexus:{signal.symbol}:{side.value}:"
+                           f"{int(signal.timestamp.timestamp())}"),
             )
             if self.dry_run:
                 log.info("[DRY] Would submit: %s", order)
@@ -132,15 +140,35 @@ class LiveRunner:
             time.sleep(self.fill_wait_seconds)
             filled_qty = self._verify_fill(oid, qty, since=bar.timestamp)
             if filled_qty <= 0:
-                log.warning("Order %s did not fill (filled_qty=0).", oid)
-                continue
-            if filled_qty < qty:
-                log.warning(
-                    "Order %s only partially filled: requested=%.6f filled=%.6f. "
-                    "SL/TP attached by broker remain sized to the original request — "
-                    "monitor manually if your venue does not re-size brackets.",
-                    oid, qty, filled_qty,
-                )
+                resolve = getattr(self.broker, "cancel_unfilled_entry", None)
+                if callable(resolve):
+                    resolved = resolve(oid)
+                    if resolved.get("state") == "PROTECTION_ACCEPTED":
+                        filled_qty = float(resolved.get("filled_qty") or 0.0)
+                    elif resolved.get("state") == "CANCELLED":
+                        log.warning("Order %s timed out and was cancelled without a fill.", oid)
+                        continue
+                    else:
+                        raise RuntimeError(
+                            f"Order {oid} remains unresolved in state {resolved.get('state')}"
+                        )
+                else:
+                    log.warning("Order %s did not fill (filled_qty=0).", oid)
+                    continue
+
+            # External protection is fill-driven. The CCXT adapter cancels any
+            # unfilled remainder and attaches reduce-only exits sized to the
+            # confirmed quantity. Never declare the position active first.
+            protect = getattr(self.broker, "protect_filled_entry", None)
+            if callable(protect):
+                try:
+                    protect(oid, filled_qty)
+                except Exception:
+                    log.exception("Order %s filled but protection was not accepted", oid)
+                    # The broker submits an emergency reduce-only flatten on a
+                    # protection failure. Stop this runner: continuing could add
+                    # exposure while venue state is unresolved.
+                    raise RuntimeError(f"Filled order {oid} could not be protected")
 
             self._internal_in_position = True
             log.info(

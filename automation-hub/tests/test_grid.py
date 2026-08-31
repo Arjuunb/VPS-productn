@@ -102,7 +102,7 @@ def client():
 
 def test_grid_endpoints_lifecycle(client):
     import webhook_api as wa
-    sec = {"X-Webhook-Secret": wa.settings.webhook_secret}
+    sec = {"X-Webhook-Secret": wa.settings.admin_key}
     try:
         assert client.get("/grid/status").json()["running"] is False
         assert client.post("/grid/start", json={"symbol": "BTCUSDT"}).status_code == 401  # secret required

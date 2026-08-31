@@ -131,11 +131,19 @@ def _trade_plan(engine: SMCMarketStructureEngine, proposal: dict) -> dict:
     risk = abs(entry - stop)
     externals = _external_targets(engine, direction, entry)
     first_r = 2.0
+    first_target_object_id = None
     first_external = next(((price, object_id) for price, object_id in externals
                            if ((price - entry) / risk if direction == "bullish" else (entry - price) / risk) >= 1.0), None)
     if first_external:
-        first_r = ((first_external[0] - entry) / risk if direction == "bullish"
-                   else (entry - first_external[0]) / risk)
+        external_r = ((first_external[0] - entry) / risk if direction == "bullish"
+                      else (entry - first_external[0]) / risk)
+        # When the nearest structural objective is already at the runner
+        # threshold or beyond, preserve a distinct 2R scale-out and use that
+        # external as the runner.  Two equal targets are invalid for the paper
+        # broker's split-exit contract.
+        if external_r < MIN_RUNNER_R:
+            first_r = external_r
+            first_target_object_id = first_external[1]
     target_1 = entry + risk * first_r if direction == "bullish" else entry - risk * first_r
     runner_r = MIN_RUNNER_R
     runner_external = next(((price, object_id) for price, object_id in externals
@@ -150,7 +158,7 @@ def _trade_plan(engine: SMCMarketStructureEngine, proposal: dict) -> dict:
         "entry": entry, "stop": stop, "risk_distance": risk,
         "target_1": target_1, "target_1_r": first_r, "target_1_fraction": 0.5,
         "target_2": target_2, "target_2_r": runner_r, "target_2_fraction": 0.5,
-        "target_1_object_id": first_external[1] if first_external else None,
+        "target_1_object_id": first_target_object_id,
         "target_2_object_id": runner_external[1] if runner_external else None,
         "risk_percent": DEFAULT_RISK_PERCENT,
         "paper_only": True, "execution_allowed": False,

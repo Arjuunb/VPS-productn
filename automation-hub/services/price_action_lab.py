@@ -162,7 +162,11 @@ class PriceActionPaperAccount:
             if "order_id" not in funding_columns:
                 self._db.execute("ALTER TABLE pa_funding_events ADD COLUMN order_id TEXT")
             self._db.execute("INSERT OR IGNORE INTO pa_settings VALUES (1,1)")
-            if not self._db.execute("SELECT 1 FROM pa_sessions WHERE status='active' LIMIT 1").fetchone():
+            active_session = self._db.execute(
+                "SELECT 1 FROM pa_sessions WHERE status='active' LIMIT 1").fetchone()
+            broker_exposure = bool(self.broker.positions()) or any(
+                row.get("status") in OPEN_BROKER_ORDER_STATUSES for row in self.broker.orders())
+            if not active_session and not broker_exposure:
                 self._db.execute(
                     "INSERT INTO pa_sessions(id,started_at,ended_at,starting_balance,status,end_reason,updated_at) VALUES (?,?,?,?,?,?,?)",
                     (uuid.uuid4().hex, _iso(), None, self.starting_balance, "active", None, _iso()),
@@ -179,7 +183,8 @@ class PriceActionPaperAccount:
             self.broker.leverage = float(leverage)
             self._snapshot_current()
         self.journal = PriceActionJournalStore(self.path)
-        self.reconcile_pending_orders()
+        if self.session():
+            self.reconcile_pending_orders()
 
     def session(self) -> dict:
         with self._lock:
@@ -519,7 +524,14 @@ class PriceActionPaperAccount:
         current = self.session()
         session_id = current.get("id", "")
         zones = {row["id"]: row for row in (visual_state or {}).get("zones", [])}
-        index = len((visual_state or {}).get("candles", [])) - 1
+        state = visual_state or {}
+        absolute_index = state.get("absolute_last_bar_index")
+        # Native engine proposals store absolute signal/expiry indices.  The
+        # candle payload is only a bounded visual window, so its length cannot
+        # be used after the engine has processed more candles than that window.
+        # Retain the fallback for imported legacy/synthetic states.
+        index = (int(absolute_index) if absolute_index is not None
+                 else len(state.get("candles", [])) - 1)
         positions = {row["symbol"]: row for row in self.broker.positions()}
         actions: list[dict] = []
         manual_orders_changed = 0
@@ -1188,7 +1200,16 @@ class PriceActionPaperAccount:
         evaluation = self.record_evaluation(visual_state, candle, observed_health)
         correlation = evaluation["correlation_id"]
         idempotency = evaluation["idempotency_key"]
-        proposals = {row["id"]: row for row in visual_state.get("proposals", [])}
+        evaluation_payload = json.loads(evaluation.get("payload_json") or "{}")
+        eligible_proposal_ids = set(evaluation_payload.get("proposal_ids") or [])
+        # The visual state intentionally contains historical proposals for
+        # research.  Execution authority belongs only to proposals attested by
+        # this closed-candle evaluation; replayed bootstrap history must never
+        # be converted into a new paper order.
+        proposals = {
+            row["id"]: row for row in visual_state.get("proposals", [])
+            if row.get("id") in eligible_proposal_ids
+        }
         setups = {row["id"]: row for row in visual_state.get("setups", [])}
         reconciliation = self.reconcile_pending_orders(
             visual_state, candle, feed_reliable=feed_reliable)
@@ -1764,12 +1785,18 @@ class PriceActionLabRuntime:
         latest = evaluations[0] if evaluations else None
         pending = [row for row in paper.get("orders", [])
                    if row.get("status") in OPEN_BROKER_ORDER_STATUSES]
+        pending_entries = [row for row in pending if not row.get("reduce_only")]
+        positions = paper.get("positions") or []
+        orphaned_exposure = not session and bool(positions or pending_entries)
         config = session.get("execution_config") or {}
         blockers = lifecycle_blockers(
             connection=connection, operating_mode=session.get("operating_mode", "signals_only"),
             account=paper.get("account") or {}, strategy_valid=bool(config.get("strategy_id")),
-            positions=paper.get("positions") or [], risk_pct=config.get("risk_pct"),
+            positions=positions, pending_orders=pending_entries,
+            risk_pct=config.get("risk_pct"),
             max_risk_pct=float(config.get("max_risk_pct") or 1.0))
+        if orphaned_exposure:
+            blockers.insert(0, "paper exposure has no active owning session; explicitly resume, repair, or close it")
         control = paper.get("entry_control") or {}
         if control.get("readiness_recheck_required"):
             blockers.append(control.get("entry_pause_reason") or
@@ -1785,6 +1812,12 @@ class PriceActionLabRuntime:
             realized_r_values=[row["outcome"].get("net_r") for row in paper_rows
                                if row.get("outcome", {}).get("net_r") is not None])
         activity = paper.get("activity") or []
+        execution_armed = session.get("operating_mode") == "automatic"
+        operator_state = (
+            "ERROR" if orphaned_exposure else
+            "BLOCKED" if not session or blockers else
+            "RUNNING_ARMED" if execution_armed else "RUNNING_UNARMED"
+        )
         return {
             "lab": "PRICE_ACTION", "account_scope": paper["account_scope"],
             "scope_label": "Price Action session · isolated paper ledger",
@@ -1793,15 +1826,17 @@ class PriceActionLabRuntime:
                          "version": PRICE_ACTION_STRATEGY_VERSION},
             "symbol": session.get("symbol"), "timeframe": session.get("timeframe"),
             "mode": session.get("operating_mode"), "saved_configuration": config,
+            "session_state": operator_state,
+            "execution_armed": execution_armed,
             "feed": connection,
             "decision_state": lifecycle_state(
                 connection_state=connection.get("state", "DISCONNECTED"),
                 reliable=bool(connection.get("reliable")),
                 has_position=bool(paper.get("positions")), has_order=bool(pending),
                 last_decision_state=(latest or {}).get("state")),
-            "execution_state": "ELIGIBLE_ON_CONFIRMED_CLOSED_CANDLE" if not blockers else "BLOCKED",
+            "execution_state": operator_state,
             "blockers": blockers,
-            "account": paper.get("account"), "open_positions": len(paper.get("positions") or []),
+            "account": paper.get("account"), "open_positions": len(positions),
             "pending_orders": len(pending), "positions": paper.get("positions") or [],
             "latest_closed_candle_decision": latest,
             # A signal remains evidence after its lifecycle advances to an

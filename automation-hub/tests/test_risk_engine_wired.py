@@ -159,29 +159,19 @@ def test_the_pipeline_still_sizes_the_trade_not_the_engine(pipeline):
         "were bypassed")
 
 
-def test_an_unimportable_engine_announces_itself(capsys, monkeypatch):
-    """The guarded import degrades quietly, and for one release that was the
-    problem rather than the safety net: `tradexa` was missing from the installed
-    package list, so production ran with no veto and nothing said so. Silence is
-    the failure mode."""
+def test_an_unimportable_engine_prevents_pipeline_construction(monkeypatch):
+    """Execution authority must not start without its mandatory risk veto."""
     monkeypatch.setattr(sp, "_RiskEngine", None)
     led = SqliteLedger(":memory:")
-    pipe = sp.SignalPipeline(led, PaperExecutionEngine(led), TradingControl())
-    assert pipe.risk_engine is None
-    out = capsys.readouterr().out
-    assert "NOT being applied" in out
-    assert "pyproject" in out, "the warning must say how to fix it"
+    with pytest.raises(RuntimeError, match="mandatory risk veto"):
+        sp.SignalPipeline(led, PaperExecutionEngine(led), TradingControl())
 
 
-def test_a_missing_engine_does_not_break_trading(pipeline):
-    """A deployment shipping only automation-hub has no tradexa package. It must
-    still trade, and the trail must SAY the veto was absent rather than looking
-    identical to one where it ran and passed."""
+def test_a_missing_engine_fails_closed_before_execution(pipeline):
     pipeline.risk_engine = None
-    result = pipeline.process(_alert())
-    assert result.accepted
-    note = [s.detail for s in result.steps if s.rule == "risk_engine"]
-    assert note and "unavailable" in note[0]
+    with pytest.raises(RuntimeError, match="failed closed"):
+        pipeline.process(_alert())
+    assert pipeline.paper.positions() == []
 
 
 # ── no way round it ─────────────────────────────────────────────────────────

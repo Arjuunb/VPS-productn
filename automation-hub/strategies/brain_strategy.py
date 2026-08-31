@@ -17,7 +17,9 @@ which reads agreed, so every decision is explainable.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
+
+import pandas as pd
 
 from bot.data.indicators import atr, ema, rsi
 from bot.types import Bar, Signal, SignalType
@@ -42,17 +44,44 @@ def _clip(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
 
 
-def _htf_trend_vote(closes: list[float], mult: int) -> Optional[float]:
-    """TRUE higher-timeframe trend read. Samples every ``mult``-th close
-    (bucket closes anchored to the newest bar — e.g. 12 × 5m ≈ 1h) and compares
-    fast/slow EMAs on that aggregated series. Unlike the same-timeframe EMA50
-    filter, this sees the structure a bigger-timeframe trader sees.
+def _htf_trend_vote(bars: Sequence[Bar], mult: int) -> Optional[float]:
+    """Closed higher-timeframe trend on UTC epoch-aligned buckets.
+
+    Buckets are left-closed/right-open and incomplete buckets are excluded.
+    Appending another base candle therefore cannot repaint a previously closed
+    HTF candle or move the timeframe origin.
 
     Returns +1 (HTF up), -1 (HTF down), or None when there isn't enough
     history for an honest read (needs ≥ 24 HTF buckets)."""
-    if mult <= 1 or len(closes) < mult * 24:
+    if mult <= 1 or len(bars) < mult * 24 or len(bars) < 2:
         return None
-    htf = [closes[i] for i in range(len(closes) - 1, -1, -mult)][::-1]
+    index = pd.DatetimeIndex([pd.Timestamp(bar.timestamp) for bar in bars])
+    index = index.tz_localize("UTC") if index.tz is None else index.tz_convert("UTC")
+    if not index.is_monotonic_increasing or not index.is_unique:
+        raise ValueError("HTF input candles must be strictly increasing and unique")
+    deltas = index.to_series().diff().dropna()
+    source_delta = deltas.median()
+    if source_delta <= pd.Timedelta(0) or not (deltas == source_delta).all():
+        raise ValueError("HTF input candles are missing or have an irregular interval")
+
+    htf_rule = source_delta * mult
+    frame = pd.DataFrame(
+        {"close": [float(bar.close) for bar in bars]}, index=index,
+    )
+    aggregated = frame.resample(
+        htf_rule, origin="epoch", closed="left", label="left",
+    ).agg(close=("close", "last"), source_count=("close", "size"))
+
+    # The newest source candle is already closed when this function is called,
+    # so decision time is its close (open timestamp + one source interval).
+    # The target bucket containing that instant is still forming and must never
+    # vote. This is the explicit anti-lookahead boundary.
+    current_time = index[-1] + source_delta
+    forming_bucket = current_time.floor(htf_rule)
+    aggregated = aggregated.loc[aggregated.index < forming_bucket]
+    htf = aggregated.loc[aggregated["source_count"] == mult, "close"].tolist()
+    if len(htf) < 24:
+        return None
     hf = ema(htf, 10)[-1]
     hs = ema(htf, 21)[-1]
     if hf == hs:
@@ -85,8 +114,8 @@ class DecisionBrain(HubStrategy):
         # volume_conf: volume-surge conviction multiplier in [0.9, 1.1]
         self.er_mode = er_mode
         self.volume_conf = bool(volume_conf)
-        # True multi-timeframe confirmation: aggregate own bars ``htf_mult``:1
-        # (12 × 5m ≈ 1h) and damp conviction ×``htf_damp`` when the HTF trend
+        # Multi-timeframe confirmation: aggregate closed bars ``htf_mult``:1 on
+        # UTC epoch boundaries and damp conviction ×``htf_damp`` when HTF trend
         # disagrees with the trade direction. Measured on the seeded synthetic
         # regime grid (drift × vol × seeds, pessimistic fills, tune + holdout)
         # before defaulting ON:
@@ -162,7 +191,7 @@ class DecisionBrain(HubStrategy):
         # True multi-timeframe confirmation: when the aggregated HTF trend
         # disagrees with the trade direction, damp conviction so only
         # exceptionally strong counter-HTF setups survive the threshold.
-        v_htf = _htf_trend_vote(closes, self.htf_mult) if self.htf_mode != "off" else None
+        v_htf = _htf_trend_vote(self.bars, self.htf_mult) if self.htf_mode != "off" else None
         if v_htf is not None and v_htf * side < 0:
             conviction *= self.htf_damp
 

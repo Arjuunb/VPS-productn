@@ -1,6 +1,9 @@
 """Smoke tests for the DecisionBrain backtest / walk-forward harness."""
+from datetime import datetime, timedelta, timezone
+
 from backtest import Metrics, performance_report, resample, run, walk_forward, _metrics
 from data.market_data import get_bars
+from bot.types import Bar
 
 
 def test_performance_report_keys_and_sanity():
@@ -33,6 +36,17 @@ def test_resample_aggregates_bars():
     # OHLC of an aggregated candle must be internally consistent
     assert r[0].high >= r[0].open and r[0].high >= r[0].close
     assert r[0].low <= r[0].open and r[0].low <= r[0].close
+
+
+def test_resample_uses_epoch_boundary_and_drops_edge_fragments():
+    start = datetime(2025, 1, 1, 0, 15, tzinfo=timezone.utc)
+    bars = [Bar(start + timedelta(minutes=15 * i), i, i + 2, i - 1, i + 1, 10)
+            for i in range(11)]
+    hourly = resample(bars, 4)
+    assert [row.timestamp.minute for row in hourly] == [0, 0]
+    assert [row.timestamp.hour for row in hourly] == [1, 2]
+    # 00:15..00:45 and the final 03:00 fragment are incomplete and excluded.
+    assert len(hourly) == 2
 
 
 def test_metrics_math():

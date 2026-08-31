@@ -41,7 +41,7 @@ function LabCard({ title, page, status, error }: {
 }) {
   const app = useApp();
   const feedState = String(status?.feed?.state ?? "DISCONNECTED");
-  const ready = status?.execution_state !== "BLOCKED";
+  const ready = status?.execution_state === "RUNNING_ARMED";
   const account = status?.account ?? {};
   const decision = status?.latest_closed_candle_decision;
   const latestOrder = status?.latest_order;

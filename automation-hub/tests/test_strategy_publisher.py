@@ -310,7 +310,7 @@ def client(tmp_path, monkeypatch):
 
 def _secret():
     from config import settings
-    return {"X-Webhook-Secret": settings.webhook_secret}
+    return {"X-Webhook-Secret": settings.admin_key}
 
 
 def test_publish_endpoint_runs_the_backtest_itself(client):

@@ -144,14 +144,14 @@ def test_min_quality_score_is_runtime_settable():
     app = FastAPI(); app.include_router(webhook_api.router)
     client = TestClient(app)
     r = client.post("/settings", json={"min_quality_score": 70},
-                    headers={"X-Webhook-Secret": "dev-webhook-secret"})
+                    headers={"X-Webhook-Secret": "dev-control-key"})
     assert r.status_code == 200
     assert webhook_api.engine.min_quality_score == 70
     assert client.get("/settings").json()["editable"]["min_quality_score"] == 70
     assert client.post("/settings", json={"min_quality_score": 150},
-                       headers={"X-Webhook-Secret": "dev-webhook-secret"}).status_code == 400
+                       headers={"X-Webhook-Secret": "dev-control-key"}).status_code == 400
     client.post("/settings", json={"min_quality_score": 60},
-                headers={"X-Webhook-Secret": "dev-webhook-secret"})
+                headers={"X-Webhook-Secret": "dev-control-key"})
 
 
 # ─────────────────────────── ttl cache ───────────────────────────

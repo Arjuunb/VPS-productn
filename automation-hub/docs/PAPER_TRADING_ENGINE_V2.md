@@ -87,7 +87,9 @@ they receive an unavailable result rather than any legacy synthetic fallback.
 
 ## Security and operations
 
-All V2 state-changing routes require `X-Webhook-Secret` under the existing
-authentication policy. Use a distinct high-entropy `HUB_API_KEY` and enable
-`HUB_SCOPE_WEBHOOK=1` in production. Do not commit `HUB_DATA_DIR` contents:
-it includes trading/account data.
+All V2 state-changing routes require an operator or owner session, or a distinct
+high-entropy `HUB_CONTROL_KEY`. `HUB_WEBHOOK_SECRET` is accepted only by the
+TradingView ingestion route, and exchange access uses the separate
+`HUB_EXCHANGE_API_KEY` / `HUB_EXCHANGE_API_SECRET` pair. Startup rejects reused
+credentials. Do not commit `HUB_DATA_DIR` contents: it includes trading/account
+data.

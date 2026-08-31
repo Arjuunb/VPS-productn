@@ -44,7 +44,7 @@ def test_retune_gate_and_run_endpoints():
     import webhook_api
     app = FastAPI(); app.include_router(webhook_api.router)
     client = TestClient(app)
-    sec = {"X-Webhook-Secret": webhook_api.settings.webhook_secret}
+    sec = {"X-Webhook-Secret": webhook_api.settings.admin_key}
 
     g = client.get("/retune/gate").json()
     assert g["stage"] == "insufficient-sample" and g["allowed"] is False

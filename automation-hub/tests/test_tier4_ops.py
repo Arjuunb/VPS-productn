@@ -104,5 +104,5 @@ def test_tier4_endpoints():
     assert client.post("/ops/drill").status_code == 401
     assert "backups" in client.get("/ops/backups").json()
     drill = client.post("/ops/drill",
-                        headers={"X-Webhook-Secret": "dev-webhook-secret"}).json()
+                        headers={"X-Webhook-Secret": "dev-control-key"}).json()
     assert drill["total"] == 4 and drill["ok"] is True

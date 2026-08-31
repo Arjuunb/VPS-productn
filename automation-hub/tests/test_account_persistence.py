@@ -90,7 +90,7 @@ def test_account_endpoint_shape_and_no_reset():
     assert "starting_balance" in a and "balance" in a
 
     # changing initial capital needs confirm + secret
-    sec = {"X-Webhook-Secret": webhook_api.settings.webhook_secret}
+    sec = {"X-Webhook-Secret": webhook_api.settings.admin_key}
     assert client.post("/paper/initial-capital", json={"amount": 5}).status_code == 401
     assert client.post("/paper/initial-capital", headers=sec, json={"amount": 5}).status_code == 400
     ok = client.post("/paper/initial-capital", headers=sec,
@@ -138,9 +138,8 @@ def test_supabase_persistence_is_based_on_real_connection(monkeypatch):
     assert c["persistent"] is True and c["storage"] == "supabase" and c["warning"] is None
 
 
-def test_broken_supabase_falls_back_to_sqlite_instead_of_crashing(monkeypatch):
-    """The failed-deploy fix: a Supabase that raises must never crash boot —
-    get_ledger() falls back to SQLite and records the error."""
+def test_configured_supabase_failure_is_fail_closed(monkeypatch):
+    """A configured primary must never split writes into a local fallback."""
     from data import ledger as ledger_mod
 
     class ExplodingLedger:
@@ -154,22 +153,41 @@ def test_broken_supabase_falls_back_to_sqlite_instead_of_crashing(monkeypatch):
     for k, v in list(ledger_mod.SUPABASE_STATUS.items()):
         monkeypatch.setitem(ledger_mod.SUPABASE_STATUS, k, v)
 
-    led = ledger_mod.get_ledger(":memory:")
-    assert type(led).__name__ == "SqliteLedger"          # fell back, no crash
+    degraded = ledger_mod.get_ledger(":memory:")
+    assert type(degraded).__name__ == "ReadOnlyDegradedLedger"
+    with pytest.raises(RuntimeError, match="read-only/degraded"):
+        degraded.open_position(symbol="BTCUSDT", side="long", size=1,
+                               entry=100, stop=90)
     assert ledger_mod.SUPABASE_STATUS["configured"] is True
     assert ledger_mod.SUPABASE_STATUS["connected"] is False
     assert "bad key" in ledger_mod.SUPABASE_STATUS["error"]
 
-    # probe failure (client builds, first query raises) also falls back
+    # Probe failure (client builds, first query raises) also fails closed.
     class ProbeFailLedger:
         def __init__(self, url, key): ...
         def get_paper_trades(self):
             raise RuntimeError('relation "paper_trades" does not exist')
 
     monkeypatch.setattr(ledger_mod, "SupabaseLedger", ProbeFailLedger)
-    led2 = ledger_mod.get_ledger(":memory:")
-    assert type(led2).__name__ == "SqliteLedger"
+    degraded_probe = ledger_mod.get_ledger(":memory:")
+    assert type(degraded_probe).__name__ == "ReadOnlyDegradedLedger"
+    with pytest.raises(RuntimeError, match="new entries are disabled"):
+        degraded_probe.insert_webhook_event(
+            alert_id="blocked", symbol="BTCUSDT", side="BUY",
+            entry=100, stop=90, payload={}, status="accepted")
     assert "does not exist" in ledger_mod.SUPABASE_STATUS["error"]
+    from services.trading_instances import TradingInstanceManager
+    manager = TradingInstanceManager(
+        degraded_probe, strategy_factory=lambda _key, _symbol: object(),
+        live=False, live_poll_s=60,
+    )
+    assert manager.store.available is False
+    with pytest.raises(RuntimeError, match="read-only/degraded"):
+        manager.create(
+            symbol="BTCUSDT", strategy_key="brain", strategy_label="Brain",
+            strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+            capital_allocation=1_000,
+        )
 
     # healthy Supabase is used and reported connected
     class HealthyLedger:

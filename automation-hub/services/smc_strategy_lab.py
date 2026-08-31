@@ -12,7 +12,7 @@ import sqlite3
 import threading
 import uuid
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -53,7 +53,7 @@ def _configured_r(config: dict, target_key: str) -> float | None:
 
 @dataclass(frozen=True)
 class SMCPaperConfig:
-    operating_mode: Literal["signals_only", "manual_approval", "automatic"] = "signals_only"
+    operating_mode: Literal["signals_only", "manual_approval", "automatic"] = "automatic"
     model_id: str = "SMC_M1_SWEEP_REVERSAL"
     risk_pct: float = 0.5
     max_risk_pct: float = 1.0
@@ -89,7 +89,7 @@ class SMCPaperAccount:
                 starting_balance REAL NOT NULL, status TEXT NOT NULL, end_reason TEXT,
                 mode TEXT NOT NULL DEFAULT 'LIVE_PAPER', symbol TEXT NOT NULL DEFAULT 'BTCUSDT',
                 timeframe TEXT NOT NULL DEFAULT '5m', replay_cursor INTEGER NOT NULL DEFAULT 0,
-                operating_mode TEXT NOT NULL DEFAULT 'signals_only', model_id TEXT NOT NULL DEFAULT 'SMC_M1_SWEEP_REVERSAL',
+                operating_mode TEXT NOT NULL DEFAULT 'automatic', model_id TEXT NOT NULL DEFAULT 'SMC_M1_SWEEP_REVERSAL',
                 risk_pct REAL NOT NULL DEFAULT .5, state_json TEXT NOT NULL DEFAULT '{}',
                 metrics_json TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL);
               CREATE TABLE IF NOT EXISTS smc_settings(
@@ -133,12 +133,17 @@ class SMCPaperAccount:
                 note TEXT NOT NULL, created_at TEXT NOT NULL);
             """)
             self._db.execute("INSERT OR IGNORE INTO smc_settings(id,leverage) VALUES (1,1)")
-            if not self._db.execute("SELECT 1 FROM smc_sessions WHERE status='active'").fetchone():
+            active_session = self._db.execute(
+                "SELECT 1 FROM smc_sessions WHERE status='active' LIMIT 1").fetchone()
+            broker_exposure = bool(self.broker.positions()) or any(
+                row.get("status") in OPEN_STATUSES for row in self.broker.orders())
+            if not active_session and not broker_exposure:
                 self._insert_session(starting_balance=self.starting_balance)
             self.broker.leverage = float(self._db.execute(
                 "SELECT leverage FROM smc_settings WHERE id=1").fetchone()[0])
             self._snapshot()
-        self.reconcile_orders()
+        if self.session():
+            self.reconcile_orders()
 
     def _insert_session(self, *, starting_balance: float, mode: str = "LIVE_PAPER",
                         symbol: str = "BTCUSDT", timeframe: str = "5m",
@@ -425,7 +430,7 @@ class SMCPaperAccount:
         if confirmation != "RESET SMC PAPER":
             raise ValueError("confirmation must exactly match RESET SMC PAPER")
         current = self.session()
-        config = SMCPaperConfig(operating_mode=current.get("operating_mode", "signals_only"),
+        config = SMCPaperConfig(operating_mode=current.get("operating_mode", "automatic"),
                                 model_id=current.get("model_id", "SMC_M1_SWEEP_REVERSAL"),
                                 risk_pct=float(current.get("risk_pct", 0.5)))
         previous_id = current.get("id")
@@ -618,6 +623,12 @@ class SMCPaperAccount:
             # original entry order is (correctly) still filled in the broker.
             if meta["status"] == "COMPLETED" and order["status"] == "filled":
                 mapped = "COMPLETED"
+            # Preserve the strategy-level reason for a broker cancellation;
+            # reconciliation must not erase whether it expired, was paused by
+            # data health, or was cancelled by the adverse-first policy.
+            if meta["status"] in {"EXPIRED", "DATA_PAUSED", "CANCELLED_AMBIGUOUS"} and \
+                    order["status"] == "cancelled":
+                mapped = meta["status"]
             if mapped != meta["status"]:
                 self._db.execute("UPDATE smc_order_meta SET status=?,reason=?,updated_at=? WHERE order_id=?",
                                  (mapped, f"reconciled from broker status {order['status']}", _iso(), meta["order_id"]))
@@ -712,6 +723,70 @@ class SMCPaperAccount:
                 "records_deleted": 0,
                 "real_execution_allowed": False}
 
+    @staticmethod
+    def _candle_datetime(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    def _cancel_stale_staged_entries(self, candle_time: str, *, feed_reliable: bool) -> list[dict]:
+        """Cancel unfilled strategy entries before they can fill from stale evidence."""
+        current = self.session()
+        observed = self._candle_datetime(candle_time)
+        if not current:
+            return []
+        actions: list[dict] = []
+        rows = self._db.execute(
+            "SELECT * FROM smc_order_meta WHERE session_id=? AND ownership='strategy' "
+            "AND status='ORDER_PENDING' ORDER BY created_at",
+            (current["id"],),
+        ).fetchall()
+        for row in rows:
+            try:
+                order = self.broker.order(row["order_id"])
+            except KeyError:
+                continue
+            if order.get("status") not in OPEN_STATUSES or float(order.get("filled") or 0) > 0:
+                continue
+            expiry = self._candle_datetime(row["expiry_candle"])
+            expired = bool(observed and expiry and observed > expiry)
+            if feed_reliable and not expired:
+                continue
+            status = "EXPIRED" if expired else "DATA_PAUSED"
+            reason = (
+                "staged SMC entry expired before the next verified closed candle"
+                if expired else
+                "market data became unreliable before the staged SMC entry could activate"
+            )
+            try:
+                self.broker.cancel(row["order_id"])
+            except ValueError:
+                continue
+            now = _iso()
+            self._db.execute(
+                "UPDATE smc_order_meta SET status=?,reason=?,updated_at=? WHERE order_id=?",
+                (status, reason, now, row["order_id"]),
+            )
+            self._db.execute(
+                "UPDATE smc_candidates SET status=?,reason=?,updated_at=? "
+                "WHERE session_id=? AND proposal_id=?",
+                (status, reason, now, current["id"], row["proposal_id"]),
+            )
+            config = json.loads(row["config_json"] or "{}")
+            self._advance_evaluation(config.get("correlation_id"), "RISK_REJECTED", reason,
+                                     order_id=row["order_id"])
+            action = {"order_id": row["order_id"], "to": status, "reason": reason,
+                      "observed_candle": candle_time, "expiry_candle": row["expiry_candle"]}
+            actions.append(action)
+            self._audit("paper_order_reconciled", object_id=row["order_id"], payload=action)
+        if actions:
+            self._snapshot()
+        return actions
+
     def process_candle(self, symbol: str, candle) -> dict:
         current = self.session()
         if not current:
@@ -722,6 +797,7 @@ class SMCPaperAccount:
         candle_time = timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp or "")
         if not candle_time:
             raise ValueError("a timestamped closed candle is required")
+        expired_entries = self._cancel_stale_staged_entries(candle_time, feed_reliable=True)
         key = (current["id"], normalize_symbol(symbol), candle_time)
         if self._db.execute("SELECT 1 FROM smc_processed_candles WHERE session_id=? AND symbol=? AND candle_time=?", key).fetchone():
             return {"duplicate": True, "events": [], "real_execution_allowed": False}
@@ -852,7 +928,8 @@ class SMCPaperAccount:
                         payload={**event, "candle_time": candle_time,
                                  "correlation_id": event_config.get("correlation_id")})
         self._snapshot()
-        return {**result, "duplicate": False, "paper_only": True, "real_execution_allowed": False}
+        return {**result, "duplicate": False, "expired_entries": expired_entries,
+                "paper_only": True, "real_execution_allowed": False}
 
     def synchronize_candidate(self, evaluation: dict, *, rules: dict,
                               reference_price: float, feed_reliable: bool,
@@ -877,6 +954,7 @@ class SMCPaperAccount:
         candle_time = str(
             closed_candle_time or identity.get("selected_candle") or
             (proposal or {}).get("signal_timestamp") or "")
+        self._cancel_stale_staged_entries(candle_time, feed_reliable=feed_reliable)
         decision = self.record_evaluation(
             evaluation, candle_time=candle_time,
             feed_status=feed_status or {
@@ -956,6 +1034,12 @@ class SMCPaperAccount:
             raise ValueError("no active SMC paper session")
         tick = float(payload["rules"]["tick_size"])
         normalized = lambda value: round(round(float(value) / tick) * tick, 12) if tick > 0 else float(value)
+        creation_candle = str(proposal.get("signal_timestamp") or "")
+        creation_time = self._candle_datetime(creation_candle)
+        expiry_candle = (
+            creation_time + timedelta(milliseconds=TF_MS[current["timeframe"]])
+            if creation_time is not None else None
+        )
         result = self.submit_order(
             symbol=proposal["symbol"], side=proposal["direction"], order_type="market",
             rules=payload["rules"], reference_price=float(payload["reference_price"]),
@@ -966,7 +1050,8 @@ class SMCPaperAccount:
             poi_id=next((object_id for object_id in evaluation.get("native_object_ids", [])
                          if object_id.startswith(("ob-", "fvg-"))), None),
             model_id=evaluation["model"]["id"],
-            creation_candle=str(proposal.get("signal_timestamp") or ""),
+            creation_candle=creation_candle,
+            expiry_candle=expiry_candle.isoformat() if expiry_candle else None,
             correlation_id=payload.get("correlation_id"),
         )
         self._db.execute("UPDATE smc_candidates SET status='ORDER_CREATED',reason=?,updated_at=? WHERE proposal_id=?",
@@ -1168,8 +1253,25 @@ class SMCStrategyLabRuntime:
             self.last_market_health = dict(reconciled.get("live_display") or self.last_market_health)
             return reconciled, rest_quote
         identity = (normalize_symbol(symbol), timeframe)
-        if self._stream_identity != identity:
-            self.stream.start(*identity)
+        if self._stream_identity != identity or not self.stream.running:
+            started = self.stream.start(*identity)
+            if not started:
+                # Do not cache a failed identity.  The supervisor's next tick
+                # must retry the bootstrap instead of leaving a dead stream
+                # permanently associated with the active session.
+                self._stream_identity = None
+                self.last_market_health = {
+                    **self.last_market_health,
+                    "state": "ERROR", "transport_state": "ERROR",
+                    "health_reason": "SMC market-data stream failed to start",
+                    "reliable": False, "new_entries_paused": True,
+                    "failing_dependency": "BINANCE_USDM_PUBLIC_STREAMS",
+                    "retry_state": {
+                        "automatic_retry": True,
+                        "retry_after_seconds": self.poll_seconds,
+                    },
+                }
+                raise RuntimeError("SMC market-data stream failed to start")
             self._stream_identity = identity
         snapshot = self.stream.snapshot()
         status = snapshot["connection"]
@@ -1279,17 +1381,29 @@ class SMCStrategyLabRuntime:
         evaluations = paper.get("evaluations") or []
         latest = evaluations[0] if evaluations else None
         pending = [row for row in paper.get("orders", []) if row.get("status") in OPEN_STATUSES]
+        pending_entries = [row for row in pending if not row.get("reduce_only")]
+        positions = paper.get("positions") or []
+        orphaned_exposure = not session and bool(positions or pending_entries)
         blockers = lifecycle_blockers(
-            connection=connection, operating_mode=session.get("operating_mode", "signals_only"),
+            connection=connection, operating_mode=session.get("operating_mode", "automatic"),
             account=paper.get("account") or {},
             strategy_valid=(session.get("model_id") in ACTIVE_MODEL_IDS),
-            positions=paper.get("positions") or [], risk_pct=session.get("risk_pct"),
+            positions=positions, pending_orders=pending_entries,
+            risk_pct=session.get("risk_pct"),
             max_risk_pct=1.0)
+        if orphaned_exposure:
+            blockers.insert(0, "paper exposure has no active owning session; explicitly resume, repair, or close it")
         fills = paper.get("trades") or []
         live_performance = paper_performance(
             fills=fills, account=paper.get("account") or {}, realized_r_values=[],
             orders=paper.get("orders") or [])
         activity = paper.get("activity") or []
+        execution_armed = session.get("operating_mode") == "automatic"
+        operator_state = (
+            "ERROR" if orphaned_exposure else
+            "BLOCKED" if not session or blockers else
+            "RUNNING_ARMED" if execution_armed else "RUNNING_UNARMED"
+        )
         return {
             "lab": "SMC", "account_scope": paper["account_scope"],
             "scope_label": "SMC Strategy Lab session · isolated paper ledger",
@@ -1298,6 +1412,8 @@ class SMCStrategyLabRuntime:
                          "version": STRATEGY_VERSION},
             "symbol": session.get("symbol"), "timeframe": session.get("timeframe"),
             "mode": session.get("operating_mode"),
+            "session_state": operator_state,
+            "execution_armed": execution_armed,
             "saved_configuration": {
                 "operating_mode": session.get("operating_mode"),
                 "model_id": session.get("model_id"), "risk_pct": session.get("risk_pct")},
@@ -1307,9 +1423,9 @@ class SMCStrategyLabRuntime:
                 reliable=bool(connection.get("reliable")),
                 has_position=bool(paper.get("positions")), has_order=bool(pending),
                 last_decision_state=(latest or {}).get("state")),
-            "execution_state": "ELIGIBLE_ON_CONFIRMED_CLOSED_CANDLE" if not blockers else "BLOCKED",
+            "execution_state": operator_state,
             "blockers": blockers,
-            "account": paper.get("account"), "open_positions": len(paper.get("positions") or []),
+            "account": paper.get("account"), "open_positions": len(positions),
             "pending_orders": len(pending), "positions": paper.get("positions") or [],
             "latest_closed_candle_decision": latest,
             "latest_signal": next((row for row in evaluations

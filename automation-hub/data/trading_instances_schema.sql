@@ -20,6 +20,129 @@ ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DE
 ALTER TABLE bot_logs ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT '';
 
+CREATE TABLE IF NOT EXISTS paper_executions (
+ execution_id TEXT PRIMARY KEY,
+ action TEXT NOT NULL CHECK (action IN ('OPEN','REDUCE','CLOSE')),
+ position_id TEXT NOT NULL,
+ trade_id TEXT NOT NULL,
+ instance_id TEXT NOT NULL DEFAULT '',
+ created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_paper_executions_instance
+ ON paper_executions(instance_id, created_at DESC);
+
+-- Position and accounting-trade rows are one logical unit. PostgREST calls are
+-- individually transactional, so expose one RPC for each compound mutation.
+CREATE OR REPLACE FUNCTION public.paper_open_atomic(p_payload JSONB)
+RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+ p JSONB := p_payload->'position'; t JSONB := p_payload->'trade';
+ v_pid TEXT := p->>'id'; v_tid TEXT := t->>'id'; v_now TIMESTAMPTZ := NOW();
+BEGIN
+ INSERT INTO positions
+  (id,symbol,side,size,entry,stop,target,management_json,status,pnl,opened_at,instance_id,simulation_session_id)
+ VALUES
+  (v_pid,p->>'symbol',p->>'side',(p->>'size')::DOUBLE PRECISION,
+   (p->>'entry')::DOUBLE PRECISION,(p->>'stop')::DOUBLE PRECISION,
+   (p->>'target')::DOUBLE PRECISION,COALESCE(p->'management','{}'::JSONB),
+   'open',0,v_now,COALESCE(p->>'instance_id',''),COALESCE(p->>'simulation_session_id',''));
+ INSERT INTO paper_trades
+  (id,alert_id,symbol,side,size,entry,stop,target,status,opened_at,strategy_id,
+   instance_id,simulation_session_id,sizing_mode,sizing_engine_version,
+   risk_basis_at_entry,risk_pct_at_entry,risk_amount_at_entry,equity_before_trade,fees)
+ VALUES
+ (v_tid,t->>'alert_id',t->>'symbol',t->>'side',(t->>'size')::DOUBLE PRECISION,
+   (t->>'entry')::DOUBLE PRECISION,(t->>'stop')::DOUBLE PRECISION,
+   (t->>'target')::DOUBLE PRECISION,'open',v_now,COALESCE(t->>'strategy_id',''),
+   COALESCE(t->>'instance_id',p->>'instance_id',''),
+   COALESCE(t->>'simulation_session_id',p->>'simulation_session_id',''),
+   t->>'sizing_mode',t->>'sizing_engine_version',(t->>'risk_basis_at_entry')::DOUBLE PRECISION,
+   (t->>'risk_pct_at_entry')::DOUBLE PRECISION,(t->>'risk_amount_at_entry')::DOUBLE PRECISION,
+   (t->>'equity_before_trade')::DOUBLE PRECISION,0);
+ INSERT INTO paper_executions(execution_id,action,position_id,trade_id,instance_id,created_at)
+ VALUES (p_payload->>'execution_id','OPEN',v_pid,v_tid,
+         COALESCE(t->>'instance_id',p->>'instance_id',''),v_now);
+ RETURN jsonb_build_object('position_id',v_pid,'trade_id',v_tid);
+END $$;
+
+CREATE OR REPLACE FUNCTION public.paper_close_atomic(p_payload JSONB)
+RETURNS VOID LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE p_count INTEGER; t_count INTEGER; v_now TIMESTAMPTZ := NOW();
+BEGIN
+ UPDATE positions SET status='closed',pnl=(p_payload->>'pnl')::DOUBLE PRECISION,closed_at=v_now
+  WHERE id=p_payload->>'position_id' AND status='open'
+    AND (COALESCE(p_payload->>'instance_id','')='' OR instance_id=p_payload->>'instance_id');
+ GET DIAGNOSTICS p_count = ROW_COUNT;
+ UPDATE paper_trades SET status='closed',exit=(p_payload->>'exit_price')::DOUBLE PRECISION,
+  pnl=(p_payload->>'pnl')::DOUBLE PRECISION,rr=(p_payload->>'rr')::DOUBLE PRECISION,
+  fees=COALESCE((p_payload->>'fees')::DOUBLE PRECISION,0),
+  realized_pnl=COALESCE((p_payload->>'realized_pnl')::DOUBLE PRECISION,(p_payload->>'pnl')::DOUBLE PRECISION),
+  equity_after_close=(p_payload->>'equity_after_close')::DOUBLE PRECISION,closed_at=v_now
+  WHERE id=p_payload->>'trade_id' AND status='open'
+    AND (COALESCE(p_payload->>'instance_id','')='' OR instance_id=p_payload->>'instance_id');
+ GET DIAGNOSTICS t_count = ROW_COUNT;
+ IF p_count <> 1 OR t_count <> 1 THEN
+  RAISE EXCEPTION 'paper close invariant failed: position %, trade %', p_count, t_count;
+ END IF;
+ INSERT INTO paper_executions(execution_id,action,position_id,trade_id,instance_id,created_at)
+ VALUES (p_payload->>'execution_id','CLOSE',p_payload->>'position_id',p_payload->>'trade_id',
+         COALESCE(p_payload->>'instance_id',''),v_now);
+END $$;
+
+CREATE OR REPLACE FUNCTION public.paper_reduce_atomic(p_payload JSONB)
+RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+ p JSONB := p_payload->'position'; rp JSONB := p_payload->'remainder_position';
+ rt JSONB := p_payload->'remainder_trade'; p_count INTEGER; t_count INTEGER;
+ v_now TIMESTAMPTZ := NOW();
+BEGIN
+ UPDATE positions SET status='closed',pnl=(p_payload->>'pnl')::DOUBLE PRECISION,closed_at=v_now
+  WHERE id=p->>'id' AND status='open'
+    AND (COALESCE(p_payload->>'instance_id','')='' OR instance_id=p_payload->>'instance_id');
+ GET DIAGNOSTICS p_count = ROW_COUNT;
+ UPDATE paper_trades SET status='closed',exit=(p_payload->>'exit_price')::DOUBLE PRECISION,
+  pnl=(p_payload->>'pnl')::DOUBLE PRECISION,rr=(p_payload->>'rr')::DOUBLE PRECISION,
+  size=(p_payload->>'closed_size')::DOUBLE PRECISION,
+  fees=(p_payload->>'fees')::DOUBLE PRECISION,realized_pnl=(p_payload->>'pnl')::DOUBLE PRECISION,
+  equity_after_close=(p_payload->>'equity_after_close')::DOUBLE PRECISION,closed_at=v_now
+  WHERE id=p_payload->>'trade_id' AND status='open'
+    AND (COALESCE(p_payload->>'instance_id','')='' OR instance_id=p_payload->>'instance_id');
+ GET DIAGNOSTICS t_count = ROW_COUNT;
+ IF p_count <> 1 OR t_count <> 1 THEN
+  RAISE EXCEPTION 'paper reduce invariant failed: position %, trade %', p_count, t_count;
+ END IF;
+ INSERT INTO positions
+  (id,symbol,side,size,entry,stop,target,management_json,status,pnl,opened_at,instance_id,simulation_session_id)
+ VALUES
+  (rp->>'id',rp->>'symbol',rp->>'side',(rp->>'size')::DOUBLE PRECISION,
+   (rp->>'entry')::DOUBLE PRECISION,(rp->>'stop')::DOUBLE PRECISION,
+   (rp->>'target')::DOUBLE PRECISION,COALESCE(rp->'management','{}'::JSONB),
+   'open',0,v_now,COALESCE(rp->>'instance_id',''),COALESCE(rp->>'simulation_session_id',''));
+ INSERT INTO paper_trades
+  (id,alert_id,symbol,side,size,entry,stop,target,status,opened_at,strategy_id,
+   instance_id,simulation_session_id,sizing_mode,sizing_engine_version,
+   risk_basis_at_entry,risk_pct_at_entry,risk_amount_at_entry,equity_before_trade,fees)
+ VALUES
+ (rt->>'id',rt->>'alert_id',rt->>'symbol',rt->>'side',(rt->>'size')::DOUBLE PRECISION,
+   (rt->>'entry')::DOUBLE PRECISION,(rt->>'stop')::DOUBLE PRECISION,
+   (rt->>'target')::DOUBLE PRECISION,'open',v_now,COALESCE(rt->>'strategy_id',''),
+   COALESCE(rt->>'instance_id',''),COALESCE(rt->>'simulation_session_id',''),
+   rt->>'sizing_mode',rt->>'sizing_engine_version',(rt->>'risk_basis_at_entry')::DOUBLE PRECISION,
+   (rt->>'risk_pct_at_entry')::DOUBLE PRECISION,(rt->>'risk_amount_at_entry')::DOUBLE PRECISION,
+   (rt->>'equity_before_trade')::DOUBLE PRECISION,0);
+ INSERT INTO paper_executions(execution_id,action,position_id,trade_id,instance_id,created_at)
+ VALUES (p_payload->>'execution_id','REDUCE',rp->>'id',rt->>'id',
+         COALESCE(p_payload->>'instance_id',rp->>'instance_id',''),v_now);
+ RETURN jsonb_build_object('position_id',rp->>'id','trade_id',rt->>'id');
+END $$;
+
+REVOKE ALL ON FUNCTION public.paper_open_atomic(JSONB) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.paper_close_atomic(JSONB) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.paper_reduce_atomic(JSONB) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.paper_open_atomic(JSONB) TO service_role;
+GRANT EXECUTE ON FUNCTION public.paper_close_atomic(JSONB) TO service_role;
+GRANT EXECUTE ON FUNCTION public.paper_reduce_atomic(JSONB) TO service_role;
+
 CREATE TABLE IF NOT EXISTS trading_instances (
  id TEXT PRIMARY KEY, symbol TEXT NOT NULL, strategy_key TEXT NOT NULL,
  strategy_label TEXT NOT NULL, strategy_version TEXT NOT NULL, timeframe TEXT NOT NULL,
@@ -114,6 +237,8 @@ CREATE TABLE IF NOT EXISTS instance_market_state (
  duplicate_candles INTEGER NOT NULL DEFAULT 0,
  missing_candles INTEGER NOT NULL DEFAULT 0,
  out_of_order_candles INTEGER NOT NULL DEFAULT 0,
+ last_blocker TEXT,
+ last_blocker_timestamp TIMESTAMPTZ,
  pending_orders_json JSONB NOT NULL DEFAULT '{}'::jsonb,
  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -126,6 +251,8 @@ ALTER TABLE instance_market_state ADD COLUMN IF NOT EXISTS warmup_bars INTEGER N
 ALTER TABLE instance_market_state ADD COLUMN IF NOT EXISTS duplicate_candles INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE instance_market_state ADD COLUMN IF NOT EXISTS missing_candles INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE instance_market_state ADD COLUMN IF NOT EXISTS out_of_order_candles INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE instance_market_state ADD COLUMN IF NOT EXISTS last_blocker TEXT;
+ALTER TABLE instance_market_state ADD COLUMN IF NOT EXISTS last_blocker_timestamp TIMESTAMPTZ;
 ALTER TABLE instance_market_state ADD COLUMN IF NOT EXISTS pending_orders_json JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE instance_market_state ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 DO $$

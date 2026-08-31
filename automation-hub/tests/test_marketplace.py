@@ -60,7 +60,7 @@ def client(tmp_path):
     return TestClient(app)
 
 
-SECRET = "dev-webhook-secret"
+SECRET = "dev-control-key"
 H = {"X-Webhook-Secret": SECRET}
 
 

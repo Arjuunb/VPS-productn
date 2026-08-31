@@ -1,11 +1,13 @@
 """Read-only observability surface for the native SMC research model."""
+from __future__ import annotations
+
 import hashlib
 import csv
 import io
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field
@@ -33,14 +35,14 @@ class VisualReviewInput(BaseModel):
     object_id: str = Field(min_length=1, max_length=160)
     component: str = Field(min_length=1, max_length=80)
     classification: Literal["CORRECT", "INCORRECT", "AMBIGUOUS"]
-    expected_structure: str | None = Field(default=None, max_length=2000)
-    actual_structure: str | None = Field(default=None, max_length=2000)
-    reason: str | None = Field(default=None, max_length=4000)
-    notes: str | None = Field(default=None, max_length=4000)
-    screenshot_timestamp: str | None = Field(default=None, max_length=80)
-    visible_range_start: str | None = Field(default=None, max_length=80)
-    visible_range_end: str | None = Field(default=None, max_length=80)
-    selected_candle_timestamp: str | None = Field(default=None, max_length=80)
+    expected_structure: Optional[str] = Field(default=None, max_length=2000)
+    actual_structure: Optional[str] = Field(default=None, max_length=2000)
+    reason: Optional[str] = Field(default=None, max_length=4000)
+    notes: Optional[str] = Field(default=None, max_length=4000)
+    screenshot_timestamp: Optional[str] = Field(default=None, max_length=80)
+    visible_range_start: Optional[str] = Field(default=None, max_length=80)
+    visible_range_end: Optional[str] = Field(default=None, max_length=80)
+    selected_candle_timestamp: Optional[str] = Field(default=None, max_length=80)
 
 
 class SMCSessionBody(BaseModel):
@@ -48,17 +50,17 @@ class SMCSessionBody(BaseModel):
     symbol: str = "BTCUSDT"
     timeframe: str = "5m"
     starting_balance: float = Field(default=10_000, gt=0)
-    operating_mode: str = "signals_only"
+    operating_mode: str = "automatic"
     model_id: str = "SMC_M1_SWEEP_REVERSAL"
     risk_pct: float = Field(default=0.5, gt=0, le=1)
 
 
 class SMCSessionConfigBody(BaseModel):
-    mode: str | None = None
-    symbol: str | None = None
-    timeframe: str | None = None
-    replay_cursor: int | None = Field(default=None, ge=0)
-    operating_mode: str = "signals_only"
+    mode: Optional[str] = None
+    symbol: Optional[str] = None
+    timeframe: Optional[str] = None
+    replay_cursor: Optional[int] = Field(default=None, ge=0)
+    operating_mode: str = "automatic"
     model_id: str = "SMC_M1_SWEEP_REVERSAL"
     risk_pct: float = Field(default=0.5, gt=0, le=1)
 
@@ -68,13 +70,13 @@ class SMCPaperOrderBody(BaseModel):
     symbol: str
     side: str
     order_type: str = Field(alias="type")
-    quantity: float | None = Field(default=None, gt=0)
-    risk_pct: float | None = Field(default=None, gt=0, le=1)
-    limit_price: float | None = Field(default=None, gt=0)
-    trigger_price: float | None = Field(default=None, gt=0)
-    stop_loss: float | None = Field(default=None, gt=0)
-    target_1: float | None = Field(default=None, gt=0)
-    target_2: float | None = Field(default=None, gt=0)
+    quantity: Optional[float] = Field(default=None, gt=0)
+    risk_pct: Optional[float] = Field(default=None, gt=0, le=1)
+    limit_price: Optional[float] = Field(default=None, gt=0)
+    trigger_price: Optional[float] = Field(default=None, gt=0)
+    stop_loss: Optional[float] = Field(default=None, gt=0)
+    target_1: Optional[float] = Field(default=None, gt=0)
+    target_2: Optional[float] = Field(default=None, gt=0)
 
 
 class SMCPaperResetBody(BaseModel):
@@ -86,8 +88,8 @@ class SMCLeverageBody(BaseModel):
 
 
 class SMCProtectionBody(BaseModel):
-    stop_loss: float | None = Field(default=None, gt=0)
-    take_profit: float | None = Field(default=None, gt=0)
+    stop_loss: Optional[float] = Field(default=None, gt=0)
+    take_profit: Optional[float] = Field(default=None, gt=0)
 
 
 class SMCReplayStepBody(BaseModel):
@@ -103,7 +105,7 @@ def _smc_runtime():
     return runtime
 
 
-def _smc_auth(secret: str | None) -> None:
+def _smc_auth(secret: Optional[str]) -> None:
     _smc_runtime()._check_secret(secret)
 
 
@@ -111,7 +113,7 @@ def _smc_bad(exc: Exception, status: int = 400):
     raise HTTPException(status, str(exc)) from exc
 
 
-def _at_timestamp(value: str | None) -> datetime | None:
+def _at_timestamp(value: Optional[str]) -> Optional[datetime]:
     if value is None:
         return None
     try:
@@ -131,7 +133,7 @@ def _strategy_engine(symbol: str, timeframe: str):
 
 
 @router.get("/state")
-def state(symbol: str = "BTCUSDT", timeframe: str = "5m", at: str | None = None,
+def state(symbol: str = "BTCUSDT", timeframe: str = "5m", at: Optional[str] = None,
           window: int = 400, model_id: str = "SMC_M1_SWEEP_REVERSAL"):
     selected_at = _at_timestamp(at)
     engine = _strategy_engine(symbol, timeframe)
@@ -145,7 +147,7 @@ def state(symbol: str = "BTCUSDT", timeframe: str = "5m", at: str | None = None,
 
 
 @router.get("/chart")
-def chart(symbol: str = "BTCUSDT", timeframe: str = "5m", at: str | None = None,
+def chart(symbol: str = "BTCUSDT", timeframe: str = "5m", at: Optional[str] = None,
           window: int = 400, model_id: str = "SMC_M1_SWEEP_REVERSAL"):
     """Chart contract made only from native engine objects and raw candles."""
     selected_at = _at_timestamp(at)
@@ -160,7 +162,7 @@ def chart(symbol: str = "BTCUSDT", timeframe: str = "5m", at: str | None = None,
 
 
 @router.get("/strategy-ladder")
-def strategy_ladder(symbol: str = "BTCUSDT", timeframe: str = "5m", at: str | None = None):
+def strategy_ladder(symbol: str = "BTCUSDT", timeframe: str = "5m", at: Optional[str] = None):
     """Frozen SMC research traces; it has no order or execution authority."""
     engine = research_engine(symbol, timeframe)
     return {
@@ -185,7 +187,7 @@ def strategy_models():
 
 @router.get("/strategy-v1/evaluate")
 def strategy_v1_evaluate(symbol: str = "BTCUSDT", timeframe: str = "5m",
-                         model_id: str = "SMC_M1_SWEEP_REVERSAL", at: str | None = None):
+                         model_id: str = "SMC_M1_SWEEP_REVERSAL", at: Optional[str] = None):
     engine = _strategy_engine(symbol, timeframe)
     try:
         return evaluate_source_strategy(engine, model_id, candle_at=_at_timestamp(at))
@@ -227,7 +229,7 @@ def smc_sessions():
 
 
 @router.post("/sessions")
-def smc_session_start(body: SMCSessionBody, x_webhook_secret: str | None = Header(default=None)):
+def smc_session_start(body: SMCSessionBody, x_webhook_secret: Optional[str] = Header(default=None)):
     _smc_auth(x_webhook_secret)
     try:
         return _smc_runtime().smc_paper.start(
@@ -241,7 +243,7 @@ def smc_session_start(body: SMCSessionBody, x_webhook_secret: str | None = Heade
 
 @router.post("/sessions/current/configuration")
 def smc_session_configure(body: SMCSessionConfigBody,
-                          x_webhook_secret: str | None = Header(default=None)):
+                          x_webhook_secret: Optional[str] = Header(default=None)):
     _smc_auth(x_webhook_secret)
     try:
         return _smc_runtime().smc_paper.configure(
@@ -254,7 +256,7 @@ def smc_session_configure(body: SMCSessionConfigBody,
 
 
 @router.post("/sessions/current/end")
-def smc_session_end(x_webhook_secret: str | None = Header(default=None)):
+def smc_session_end(x_webhook_secret: Optional[str] = Header(default=None)):
     _smc_auth(x_webhook_secret)
     try:
         return _smc_runtime().smc_paper.end()
@@ -264,7 +266,7 @@ def smc_session_end(x_webhook_secret: str | None = Header(default=None)):
 
 @router.post("/sessions/current/replay/step")
 def smc_session_replay_step(body: SMCReplayStepBody,
-                            x_webhook_secret: str | None = Header(default=None)):
+                            x_webhook_secret: Optional[str] = Header(default=None)):
     _smc_auth(x_webhook_secret)
     try:
         return _smc_runtime().smc_runtime.replay_step(steps=body.steps)
@@ -275,7 +277,7 @@ def smc_session_replay_step(body: SMCReplayStepBody,
 
 
 @router.post("/sessions/{session_id}/resume")
-def smc_session_resume(session_id: str, x_webhook_secret: str | None = Header(default=None)):
+def smc_session_resume(session_id: str, x_webhook_secret: Optional[str] = Header(default=None)):
     _smc_auth(x_webhook_secret)
     try:
         return _smc_runtime().smc_paper.resume(session_id)
@@ -286,7 +288,7 @@ def smc_session_resume(session_id: str, x_webhook_secret: str | None = Header(de
 
 
 @router.post("/sessions/{session_id}/duplicate")
-def smc_session_duplicate(session_id: str, x_webhook_secret: str | None = Header(default=None)):
+def smc_session_duplicate(session_id: str, x_webhook_secret: Optional[str] = Header(default=None)):
     _smc_auth(x_webhook_secret)
     try:
         return _smc_runtime().smc_paper.duplicate(session_id)
@@ -306,7 +308,7 @@ def smc_session_export(session_id: str):
 
 @router.post("/paper/reset")
 def smc_paper_reset(body: SMCPaperResetBody,
-                    x_webhook_secret: str | None = Header(default=None)):
+                    x_webhook_secret: Optional[str] = Header(default=None)):
     _smc_auth(x_webhook_secret)
     try:
         return _smc_runtime().smc_paper.reset(body.confirmation)
@@ -316,7 +318,7 @@ def smc_paper_reset(body: SMCPaperResetBody,
 
 @router.post("/paper/leverage")
 def smc_paper_leverage(body: SMCLeverageBody,
-                       x_webhook_secret: str | None = Header(default=None)):
+                       x_webhook_secret: Optional[str] = Header(default=None)):
     _smc_auth(x_webhook_secret)
     try:
         return _smc_runtime().smc_paper.set_leverage(body.leverage)
@@ -326,8 +328,8 @@ def smc_paper_leverage(body: SMCLeverageBody,
 
 @router.post("/paper/orders")
 def smc_paper_order(body: SMCPaperOrderBody,
-                    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-                    x_webhook_secret: str | None = Header(default=None)):
+                    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+                    x_webhook_secret: Optional[str] = Header(default=None)):
     _smc_auth(x_webhook_secret)
     if body.order_type == "market" and (body.limit_price is not None or body.trigger_price is not None):
         raise HTTPException(422, "market paper orders cannot include a limit or trigger price")
@@ -355,7 +357,7 @@ def smc_paper_order(body: SMCPaperOrderBody,
 
 
 @router.post("/paper/orders/{order_id}/cancel")
-def smc_paper_cancel(order_id: str, x_webhook_secret: str | None = Header(default=None)):
+def smc_paper_cancel(order_id: str, x_webhook_secret: Optional[str] = Header(default=None)):
     _smc_auth(x_webhook_secret)
     try:
         return _smc_runtime().smc_paper.cancel_order(order_id)
@@ -366,7 +368,7 @@ def smc_paper_cancel(order_id: str, x_webhook_secret: str | None = Header(defaul
 
 
 @router.post("/paper/orders/reconcile")
-def smc_paper_reconcile(x_webhook_secret: str | None = Header(default=None)):
+def smc_paper_reconcile(x_webhook_secret: Optional[str] = Header(default=None)):
     _smc_auth(x_webhook_secret)
     runtime = _smc_runtime()
     try:
@@ -380,7 +382,7 @@ def smc_paper_reconcile(x_webhook_secret: str | None = Header(default=None)):
 
 @router.post("/paper/candidates/{proposal_id}/approve")
 def smc_paper_candidate_approve(proposal_id: str,
-                                x_webhook_secret: str | None = Header(default=None)):
+                                x_webhook_secret: Optional[str] = Header(default=None)):
     _smc_auth(x_webhook_secret)
     try:
         return _smc_runtime().smc_paper.approve_candidate(proposal_id)
@@ -392,7 +394,7 @@ def smc_paper_candidate_approve(proposal_id: str,
 
 @router.post("/paper/positions/{symbol}/protection")
 def smc_paper_protection(symbol: str, body: SMCProtectionBody,
-                         x_webhook_secret: str | None = Header(default=None)):
+                         x_webhook_secret: Optional[str] = Header(default=None)):
     _smc_auth(x_webhook_secret)
     try:
         return _smc_runtime().smc_paper.set_protection(
@@ -402,11 +404,11 @@ def smc_paper_protection(symbol: str, body: SMCProtectionBody,
 
 
 @router.get("/journal")
-def smc_journal(symbol: str | None = None, timeframe: str | None = None,
-                model_id: str | None = None, status: str | None = None,
-                session_id: str | None = None, direction: str | None = None,
-                rule_compliance: str | None = None, result: str | None = None,
-                date_from: str | None = None, date_to: str | None = None):
+def smc_journal(symbol: Optional[str] = None, timeframe: Optional[str] = None,
+                model_id: Optional[str] = None, status: Optional[str] = None,
+                session_id: Optional[str] = None, direction: Optional[str] = None,
+                rule_compliance: Optional[str] = None, result: Optional[str] = None,
+                date_from: Optional[str] = None, date_to: Optional[str] = None):
     payload = _smc_runtime().smc_paper.journal(session_id)
     rows = payload["journal"]
     filters = {"symbol": symbol, "timeframe": timeframe, "model_id": model_id,
@@ -455,7 +457,7 @@ def smc_journal_item(journal_id: str):
 
 @router.post("/journal/{journal_id}/notes")
 def smc_journal_note(journal_id: str, body: SMCJournalNoteBody,
-                     x_webhook_secret: str | None = Header(default=None)):
+                     x_webhook_secret: Optional[str] = Header(default=None)):
     _smc_auth(x_webhook_secret)
     try:
         return {"revision": _smc_runtime().smc_paper.add_journal_note(journal_id, body.note),
@@ -495,7 +497,7 @@ def live_chart(symbol: str = "BTCUSDT", timeframe: str = "5m", venue: str = "bin
 
 @router.get("/live-history")
 def live_history(symbol: str = "BTCUSDT", timeframe: str = "5m", venue: str = "binance_usdm",
-                 before: str | None = None, limit: int = 400):
+                 before: Optional[str] = None, limit: int = 400):
     """One paginated, closed-candle exchange page for Visual Lab browsing."""
     if before is None:
         raise HTTPException(422, "'before' is required for historical paging")

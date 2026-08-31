@@ -160,9 +160,9 @@ def test_tier3_endpoints():
     assert client.post("/shadow/start").status_code == 401       # secret required
     assert client.get("/shadow/report").json()["active"] in (True, False)
     ok = client.post("/shadow/start", params={"strategy": "Decision Brain"},
-                     headers={"X-Webhook-Secret": "dev-webhook-secret"}).json()
+                     headers={"X-Webhook-Secret": "dev-control-key"}).json()
     assert ok["started"] is True
     rep2 = client.get("/shadow/report").json()
     assert rep2["active"] is True and rep2["verdict"] == "collecting"
-    assert client.post("/shadow/stop", headers={"X-Webhook-Secret": "dev-webhook-secret"}
+    assert client.post("/shadow/stop", headers={"X-Webhook-Secret": "dev-control-key"}
                        ).json()["stopped"] is True

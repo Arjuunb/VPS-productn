@@ -68,7 +68,8 @@ def test_smc_restart_repairs_strategy_protection_and_blocks_stacking(tmp_path):
                                   reference_price=evaluation["trade_plan"]["entry"],
                                   feed_reliable=True)
     entry = evaluation["trade_plan"]["entry"]
-    account.process_candle("BTCUSDT", Bar(datetime(2026, 8, 24, 12, tzinfo=timezone.utc),
+    signal_time = evaluation["proposal"]["signal_timestamp"]
+    account.process_candle("BTCUSDT", Bar(signal_time + timedelta(minutes=5),
                                             entry, entry + 1, entry - 1, entry, 10_000))
     original = account.state()["positions"][0]
     account.broker._c.execute(
@@ -167,12 +168,42 @@ def test_session_lifecycle_and_exact_reset_confirmation(tmp_path):
     assert resumed["session"]["status"] == "active"
 
 
-def test_signals_only_is_default_and_live_execution_is_impossible(tmp_path):
-    state = SMCPaperAccount(tmp_path / "smc.db").state()
-    assert state["session"]["operating_mode"] == "signals_only"
+def test_restart_does_not_create_new_session_over_ended_session_exposure(tmp_path):
+    path = tmp_path / "orphaned-exposure.db"
+    account = SMCPaperAccount(path)
+    old = account.session()["id"]
+    account.submit_order(symbol="BTCUSDT", side="buy", order_type="market", rules=RULES,
+                         reference_price=100, quantity=.1, stop_loss=90,
+                         target_1=110, target_2=120,
+                         idempotency_key="restart-exposure")
+    account.process_candle(
+        "BTCUSDT", Bar(datetime(2026, 8, 24, tzinfo=timezone.utc), 100, 101, 99, 100, 100))
+    account.end()
+
+    reopened = SMCPaperAccount(path)
+
+    assert reopened.session() == {}
+    assert len(reopened.sessions()) == 1
+    assert reopened.state()["positions"][0]["symbol"] == "BTCUSDT"
+    resumed = reopened.resume(old)
+    assert resumed["session"]["id"] == old
+    assert resumed["positions"][0]["symbol"] == "BTCUSDT"
+
+
+def test_automatic_paper_is_default_and_live_execution_is_impossible(tmp_path):
+    account = SMCPaperAccount(tmp_path / "smc.db")
+    state = account.state()
+    assert state["session"]["operating_mode"] == "automatic"
     assert state["execution_mode"] == "PAPER"
     assert state["real_execution_allowed"] is False
     assert not hasattr(SMCPaperAccount, "enable_live")
+    evaluation = evaluate(seeded_engine())
+    result = account.synchronize_candidate(
+        evaluation, rules=RULES,
+        reference_price=evaluation["trade_plan"]["entry"], feed_reliable=True,
+    )
+    assert result["candidate_status"] == "APPROVED_AUTOMATIC"
+    assert account.broker.orders()
 
 
 @pytest.mark.parametrize("mode,expected,orders", [
@@ -259,6 +290,47 @@ def test_unreliable_feed_cannot_create_strategy_order(tmp_path):
     assert account.broker.orders() == []
 
 
+def test_staged_smc_entry_is_cancelled_on_feed_failure_before_activation(tmp_path):
+    account = SMCPaperAccount(tmp_path / "staged-data-pause.db")
+    account.configure(config=SMCPaperConfig(operating_mode="automatic"))
+    evaluation = evaluate(seeded_engine())
+    signal_time = evaluation["proposal"]["signal_timestamp"]
+    account.synchronize_candidate(
+        evaluation, rules=RULES, reference_price=evaluation["trade_plan"]["entry"],
+        feed_reliable=True, closed_candle_time=signal_time)
+
+    account.synchronize_candidate(
+        evaluation, rules=RULES, reference_price=evaluation["trade_plan"]["entry"],
+        feed_reliable=False, closed_candle_time=signal_time)
+
+    state = account.state()
+    assert state["orders"][0]["status"] == "cancelled"
+    assert state["order_metadata"][0]["status"] == "DATA_PAUSED"
+    assert state["positions"] == []
+
+
+def test_staged_smc_entry_expires_instead_of_filling_after_missed_candles(tmp_path):
+    account = SMCPaperAccount(tmp_path / "staged-expiry.db")
+    account.configure(config=SMCPaperConfig(operating_mode="automatic"))
+    evaluation = evaluate(seeded_engine())
+    signal_time = evaluation["proposal"]["signal_timestamp"]
+    result = account.synchronize_candidate(
+        evaluation, rules=RULES, reference_price=evaluation["trade_plan"]["entry"],
+        feed_reliable=True, closed_candle_time=signal_time.isoformat())
+    metadata = account.state()["order_metadata"][0]
+    assert datetime.fromisoformat(metadata["expiry_candle"]) == signal_time + timedelta(minutes=5)
+
+    entry = float(evaluation["trade_plan"]["entry"])
+    recovery = Bar(signal_time + timedelta(minutes=15), entry, entry + 1,
+                   entry - 1, entry, 1_000)
+    processed = account.process_candle("BTCUSDT", recovery)
+
+    assert processed["events"] == []
+    assert processed["expired_entries"][0]["order_id"] == result["order"]["order"]["id"]
+    assert account.state()["order_metadata"][0]["status"] == "EXPIRED"
+    assert account.state()["positions"] == []
+
+
 def test_strategy_fill_creates_half_size_t1_and_uses_stop_first_on_ambiguous_bar(tmp_path):
     account = SMCPaperAccount(tmp_path / "scale-out.db")
     account.configure(config=SMCPaperConfig(operating_mode="automatic"))
@@ -267,7 +339,8 @@ def test_strategy_fill_creates_half_size_t1_and_uses_stop_first_on_ambiguous_bar
                                   reference_price=evaluation["trade_plan"]["entry"],
                                   feed_reliable=True)
     entry = evaluation["trade_plan"]["entry"]
-    first = Bar(datetime(2026, 8, 24, 12, tzinfo=timezone.utc), entry, entry + 1,
+    signal_time = evaluation["proposal"]["signal_timestamp"]
+    first = Bar(signal_time + timedelta(minutes=5), entry, entry + 1,
                 entry - 1, entry, 10_000)
     account.process_candle("BTCUSDT", first)
     position = account.broker.positions()[0]
@@ -313,6 +386,62 @@ def test_runtime_reprocessing_same_closed_bar_cannot_duplicate_strategy_order(tm
     strategy_orders = [row for row in account.state()["order_metadata"] if row["ownership"] == "strategy"]
     assert len(strategy_orders) == 1
     assert len(account.state()["funding_events"]) == 1
+
+
+def test_smc_runtime_retries_failed_or_dead_market_stream(tmp_path):
+    account = SMCPaperAccount(tmp_path / "stream-retry.db")
+    closed = Bar(datetime(2026, 8, 24, 12, tzinfo=timezone.utc), 100, 102, 98, 101, 1_000)
+
+    class Market:
+        def public_usdm_window(self, *_args, **_kwargs):
+            return [closed]
+
+        def public_usdm_quote(self, _symbol):
+            return {"bid": 100, "ask": 101, "mark": 100.5}
+
+    class RetryStream:
+        def __init__(self):
+            self.attempts = 0
+            self._running = False
+
+        @property
+        def running(self):
+            return self._running
+
+        def start(self, _symbol, _timeframe):
+            self.attempts += 1
+            self._running = self.attempts > 1
+            return self._running
+
+        def snapshot(self):
+            return {
+                "connection": {"state": "SYNCHRONIZED", "reliable": True,
+                               "health_reason": "test stream synchronized"},
+                "quote": {"bid": 100, "ask": 101, "mark": 100.5},
+                "closed_bars": [closed],
+            }
+
+        def stop(self):
+            self._running = False
+
+    runtime = SMCStrategyLabRuntime(Market(), account, autostart=False)
+    runtime.stream = RetryStream()
+    visual = {
+        "live_display": {},
+        "data_provenance": {"last_closed_candle": closed.timestamp.isoformat()},
+    }
+
+    with pytest.raises(RuntimeError, match="failed to start"):
+        runtime.reconcile_visual(visual, symbol="BTCUSDT", timeframe="5m")
+    assert runtime._stream_identity is None
+
+    runtime.reconcile_visual(visual, symbol="BTCUSDT", timeframe="5m")
+    assert runtime.stream.attempts == 2
+    assert runtime._stream_identity == ("BTCUSDT", "5m")
+
+    runtime.stream._running = False
+    runtime.reconcile_visual(visual, symbol="BTCUSDT", timeframe="5m")
+    assert runtime.stream.attempts == 3
 
 
 def test_market_reconciliation_fails_closed_and_accepts_fresh_matching_quote():

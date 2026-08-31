@@ -26,7 +26,7 @@ def client(tmp_path, monkeypatch):
     webhook_api.engine.stop()                          # never leak a running thread
 
 
-SECRET = "dev-webhook-secret"
+SECRET = "dev-control-key"
 
 
 def test_timeframe_endpoint_switches_restarts_and_persists(client, tmp_path):

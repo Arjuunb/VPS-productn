@@ -30,7 +30,7 @@ from fastapi.responses import (  # noqa: E402
     HTMLResponse, RedirectResponse, StreamingResponse,
 )
 
-from config import settings  # noqa: E402
+from config import settings, validate_credential_separation  # noqa: E402
 from bots.manager import BotManager  # noqa: E402
 from bots.registry import EXCHANGES, STRATEGIES, exchange_label, strategy_label  # noqa: E402
 from dashboard import widgets as w  # noqa: E402
@@ -97,6 +97,7 @@ import os as _sec_os  # noqa: E402
 _ON_CLOUD = bool(_sec_os.environ.get("RENDER") or _sec_os.environ.get("DYNO")
                  or _sec_os.environ.get("HUB_ENV", "").lower() == "production")
 _UNDER_TEST = "PYTEST_CURRENT_TEST" in _sec_os.environ or bool(_sec_os.environ.get("HUB_DEV"))
+validate_credential_separation(production=_ON_CLOUD and not _UNDER_TEST)
 if _ON_CLOUD and not _UNDER_TEST:
     if settings.auth_mode != "supabase" and not settings.emergency_admin_enabled:
         raise RuntimeError(
@@ -118,20 +119,7 @@ if _ON_CLOUD and not _UNDER_TEST:
         print("\n" + "=" * 68 + "\n  SECURITY WARNING: HUB_PASSWORD is the default 'admin'.\n"
               "  Set a strong HUB_PASSWORD before real use.\n" + "=" * 68 + "\n",
               file=_sec_sys.stderr, flush=True)
-    if settings.webhook_secret == "dev-webhook-secret":
-        # not a hard-fail (would lock a running deploy out of its own control
-        # endpoints); a loud warning is the safe hardening here.
-        print("\n" + "=" * 68 + "\n  SECURITY WARNING: HUB_WEBHOOK_SECRET is the default value.\n"
-              "  Set HUB_WEBHOOK_SECRET (and HUB_API_KEY + HUB_SCOPE_WEBHOOK=1 to\n"
-              "  decouple control from the TradingView secret) before real use.\n" + "=" * 68 + "\n",
-              file=_sec_sys.stderr, flush=True)
-
-# M-5: report the control-credential posture. Scoped = the webhook secret (shared
-# with TradingView) can post alerts but not control the account.
-if settings.scope_webhook_secret and settings.admin_key != settings.webhook_secret:
-    print("[auth] webhook secret is SCOPED to /webhook — control requires the admin key.", flush=True)
-elif settings.admin_key == settings.webhook_secret:
-    print("[auth] admin key = webhook secret (set HUB_API_KEY + HUB_SCOPE_WEBHOOK=1 to decouple).", flush=True)
+print("[auth] webhook, control and exchange credentials are independently scoped.", flush=True)
 
 # Kyros Phase 1: TradingView webhook -> paper-execution -> ledger API.
 # `webhook_api` also owns the process-wide paper account / ledger / control
@@ -284,6 +272,17 @@ async def _require_auth(request: Request, call_next):
             if urlparse(origin).netloc != request.headers.get("host", ""):
                 from fastapi.responses import JSONResponse
                 return JSONResponse({"error": "Cross-site request rejected."}, status_code=403)
+    # Trading Instance mutations are execution-control operations, not ordinary
+    # authenticated account writes. Viewers can inspect state but never start,
+    # pause, stop, restart, configure, create or delete a worker.
+    if (path == "/instances" or path.startswith("/instances/")) \
+            and request.method in {"POST", "PUT", "PATCH", "DELETE"} \
+            and _user(request) and not _has_role(request, "operator"):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            {"error": "Operator role required for Trading Instance control."},
+            status_code=403,
+        )
     # --- rate limiting (brute-force protection) — before auth so failed attempts
     # count. The under-test check is evaluated per-REQUEST (PYTEST_CURRENT_TEST is
     # set during a test's execution, not necessarily at import), so the limiter is
@@ -332,8 +331,7 @@ async def _require_auth(request: Request, call_next):
             or (_LANDING_READY and path in _LANDING_PAGE_PATHS)
             or any(path.startswith(p) for p in exempt)
             or _user(request)
-            or hdr == settings.admin_key
-            or (not settings.scope_webhook_secret and hdr == settings.webhook_secret)):
+            or hdr == settings.admin_key):
         # A browser session is an authenticated operator.  Supply the internal
         # control credential only to downstream endpoint handlers; it is never
         # rendered into React configuration or sent over the network by clients.
@@ -342,10 +340,7 @@ async def _require_auth(request: Request, call_next):
         # it is never exposed to JavaScript or transmitted by the browser.
         # A regular Supabase customer never receives this bridge, preserving the
         # fail-closed boundary around the deployment-wide legacy engine.
-        is_control_operator = (
-            (_user(request) and settings.auth_mode == "legacy")
-            or (settings.auth_mode == "supabase" and principal is not None and principal.is_admin)
-        )
+        is_control_operator = _has_role(request, "operator")
         if is_control_operator and not hdr:
             request.scope["headers"] = list(request.scope["headers"]) + [
                 (b"x-webhook-secret", settings.admin_key.encode("utf-8"))]
@@ -487,6 +482,11 @@ def _start_auto_engine() -> None:
     backend = type(webhook_api.ledger).__name__
     print(f"[startup] ledger backend = {backend} "
           f"(Supabase active: {backend == 'SupabaseLedger'})", flush=True)
+    from data.ledger import SUPABASE_STATUS
+    if SUPABASE_STATUS.get("configured") and not SUPABASE_STATUS.get("connected"):
+        print("[startup] all primary-ledger execution remains disabled: "
+              f"{SUPABASE_STATUS.get('error')}", flush=True)
+        return
     # Instance workers own their own strategy state, execution ledger scope and
     # desired lifecycle. Restore them first; when at least one is intentionally
     # active, do not also start the legacy multi-pair worker (which would create
@@ -509,10 +509,30 @@ def _start_auto_engine() -> None:
 
 
 @app.on_event("shutdown")
-def _stop_price_action_stream() -> None:
-    """Close the public Price Action WebSocket and its worker thread cleanly."""
-    webhook_api.price_action_runtime.stop()
-    webhook_api.smc_runtime.stop()
+def _shutdown_all_runtimes() -> None:
+    """One process-wide shutdown boundary for every execution authority."""
+    errors = []
+
+    def run(name, operation):
+        try:
+            result = operation()
+            if isinstance(result, dict) and result.get("errors"):
+                errors.extend(f"{name}: {item}" for item in result["errors"])
+        except Exception as exc:  # shutdown continues so no sibling is leaked
+            errors.append(f"{name}: {type(exc).__name__}: {exc}")
+
+    # Close all entry gates before waiting on any worker. Protective closes are
+    # still classified as exposure-reducing and bypass these controls.
+    webhook_api.controls.stop_all()
+    run("trading_instances", webhook_api.instance_manager.shutdown)
+    run("autonomous_engine_checkpoint", webhook_api.engine.flush_runtime_state)
+    run("autonomous_engine", lambda: webhook_api.engine.stop("Process shutdown"))
+    run("legacy_bot_runners", manager.emergency_stop_all)
+    run("price_action_lab", webhook_api.price_action_runtime.stop)
+    run("smc_lab", webhook_api.smc_runtime.stop)
+    if errors:
+        print("[shutdown] completed with degraded acknowledgements: " + " | ".join(errors),
+              flush=True)
 
 # Phase 8: process-wide event hub for the live (SSE) dashboard.
 from dashboard.stream import HubEventHub, sse_format  # noqa: E402
@@ -653,11 +673,10 @@ def _request_role(request: Request):
         rec = store.get_user(u)
         if rec is not None:
             return rec.role
-    # control-secret callers (admin key, or the webhook secret when it is NOT
-    # scoped) act with full authority — mirror the auth wall's control check.
+    # A caller presenting the dedicated control key acts with full authority.
+    # Webhook and exchange keys are never accepted here.
     hdr = request.headers.get("x-webhook-secret")
-    if hdr and (hdr == settings.admin_key
-                or (not settings.scope_webhook_secret and hdr == settings.webhook_secret)):
+    if hdr and hdr == settings.admin_key:
         return "owner"
     return None
 
@@ -1782,6 +1801,8 @@ def backtest_bot(bot_id: str, request: Request):
 def _bot_action(request: Request, action):
     if not _user(request):
         return RedirectResponse("/login", status_code=303)
+    if not _has_role(request, "operator"):
+        return RedirectResponse("/?error=Operator+role+required", status_code=303)
     try:
         action()
     except Exception as e:  # noqa: BLE001 — M-8: surface, don't swallow
@@ -1803,6 +1824,8 @@ def go_live_bot(bot_id: str, request: Request):
     # Phase 8: forward the runner's events to the hub for the live dashboard.
     if not _user(request):
         return RedirectResponse("/login", status_code=303)
+    if not _has_role(request, "operator"):
+        return RedirectResponse("/?error=Operator+role+required", status_code=303)
     bot = manager.get(bot_id)
     if bot is None:
         return RedirectResponse("/", status_code=303)

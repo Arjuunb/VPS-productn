@@ -286,7 +286,7 @@ def test_the_paper_account_and_a_live_broker_aggregate_together(paper):
 
 def _auth() -> dict:
     import app as hub_app
-    return {"X-Webhook-Secret": hub_app.settings.webhook_secret}
+    return {"X-Webhook-Secret": hub_app.settings.admin_key}
 
 
 def test_the_snapshot_endpoint_answers(client):

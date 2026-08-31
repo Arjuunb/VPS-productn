@@ -171,6 +171,15 @@ class InstanceLedger:
             **kw, instance_id=self.instance_id,
             simulation_session_id=self.simulation_session_id)
 
+    def open_position_and_trade(self, *, position, trade, execution_id):
+        p, t = dict(position), dict(trade)
+        p.update(instance_id=self.instance_id,
+                 simulation_session_id=self.simulation_session_id)
+        t.update(instance_id=self.instance_id,
+                 simulation_session_id=self.simulation_session_id)
+        return self._ledger.open_position_and_trade(
+            position=p, trade=t, execution_id=execution_id)
+
     def get_positions(self, status=None):
         return self._ledger.get_positions(
             status, instance_id=self.instance_id,
@@ -200,6 +209,21 @@ class InstanceLedger:
 
     def close_paper_trade(self, trade_id, **kw):
         return self._ledger.close_paper_trade(trade_id, **kw, instance_id=self.instance_id)
+
+    def close_position_and_trade(self, **kw):
+        return self._ledger.close_position_and_trade(**kw, instance_id=self.instance_id)
+
+    def reduce_position_and_trade(self, *, position, remainder_position,
+                                  remainder_trade, **kw):
+        p, rp, rt = dict(position), dict(remainder_position), dict(remainder_trade)
+        p["instance_id"] = self.instance_id
+        rp.update(instance_id=self.instance_id,
+                  simulation_session_id=self.simulation_session_id)
+        rt.update(instance_id=self.instance_id,
+                  simulation_session_id=self.simulation_session_id)
+        return self._ledger.reduce_position_and_trade(
+            position=p, remainder_position=rp, remainder_trade=rt,
+            **kw, instance_id=self.instance_id)
 
     def log(self, *, level, stage, message, symbol=""):
         return self._ledger.log(level=level, stage=stage, message=message, symbol=symbol,
@@ -257,6 +281,7 @@ CREATE TABLE IF NOT EXISTS instance_market_state (
  last_market_data_timestamp TEXT, data_source TEXT, warmup_bars INTEGER NOT NULL DEFAULT 0,
  duplicate_candles INTEGER NOT NULL DEFAULT 0, missing_candles INTEGER NOT NULL DEFAULT 0,
  out_of_order_candles INTEGER NOT NULL DEFAULT 0,
+ last_blocker TEXT, last_blocker_timestamp TEXT,
  pending_orders_json TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS simulation_sessions (
@@ -316,7 +341,8 @@ class InstanceStore:
             "instance_id", "last_processed_candle_timestamp", "market_data_mode",
             "market_data_status", "last_market_data_timestamp", "data_source",
             "warmup_bars", "duplicate_candles", "missing_candles",
-            "out_of_order_candles", "pending_orders_json", "updated_at",
+            "out_of_order_candles", "last_blocker", "last_blocker_timestamp",
+            "pending_orders_json", "updated_at",
         ),
         "instance_metrics": ("instance_id", "data_json", "updated_at"),
         "instance_engine_logs": ("id", "instance_id", "ts", "level", "message"),
@@ -398,7 +424,15 @@ class InstanceStore:
                     ensure_column(ledger._c, "trading_instance_platform_settings", name, definition)
                 ensure_column(ledger._c, "instance_market_state",
                               "pending_orders_json", "TEXT NOT NULL DEFAULT '{}'")
+                ensure_column(ledger._c, "instance_market_state", "last_blocker", "TEXT")
+                ensure_column(ledger._c, "instance_market_state", "last_blocker_timestamp", "TEXT")
                 ledger._c.commit()
+        if getattr(ledger, "read_only_degraded", False):
+            self.available = False
+            self.error = (
+                "Primary ledger unavailable; Trading Instances are read-only/degraded "
+                "and all mutations are disabled"
+            )
 
     def _table(self, name):
         return self.ledger._db.table(name)
@@ -679,7 +713,8 @@ class InstanceStore:
                     "market_data_mode": "paper_forward", "market_data_status": "stopped",
                     "last_market_data_timestamp": None, "data_source": None,
                     "warmup_bars": 0, "duplicate_candles": 0, "missing_candles": 0,
-                    "out_of_order_candles": 0, "pending_orders_json": {}}
+                    "out_of_order_candles": 0, "last_blocker": None,
+                    "last_blocker_timestamp": None, "pending_orders_json": {}}
         try:
             if self.remote:
                 rows = remote_call_with_retry(lambda: self._table("instance_market_state")
@@ -705,7 +740,8 @@ class InstanceStore:
             "market_data_mode": "paper_forward", "market_data_status": "stopped",
             "last_market_data_timestamp": None, "data_source": None,
             "warmup_bars": 0, "duplicate_candles": 0, "missing_candles": 0,
-            "out_of_order_candles": 0, "pending_orders_json": {},
+            "out_of_order_candles": 0, "last_blocker": None,
+            "last_blocker_timestamp": None, "pending_orders_json": {},
         }
         try:
             if self.remote:
@@ -736,14 +772,15 @@ class InstanceStore:
                "market_data_mode": "paper_forward", "market_data_status": "warming_up",
                "last_market_data_timestamp": None, "data_source": None,
                "warmup_bars": 0, "duplicate_candles": 0, "missing_candles": 0,
-               "out_of_order_candles": 0, "updated_at": _now(), **values}
+               "out_of_order_candles": 0, "last_blocker": None,
+               "last_blocker_timestamp": None, "updated_at": _now(), **values}
         if self.remote:
             remote_call_with_retry(lambda: self._table("instance_market_state").upsert(row).execute())
         else:
             with self.ledger._lock:
                 self.ledger._c.execute("""INSERT INTO instance_market_state
-                (instance_id,last_processed_candle_timestamp,market_data_mode,market_data_status,last_market_data_timestamp,data_source,warmup_bars,duplicate_candles,missing_candles,out_of_order_candles,updated_at)
-                VALUES (:instance_id,:last_processed_candle_timestamp,:market_data_mode,:market_data_status,:last_market_data_timestamp,:data_source,:warmup_bars,:duplicate_candles,:missing_candles,:out_of_order_candles,:updated_at)
+                (instance_id,last_processed_candle_timestamp,market_data_mode,market_data_status,last_market_data_timestamp,data_source,warmup_bars,duplicate_candles,missing_candles,out_of_order_candles,last_blocker,last_blocker_timestamp,updated_at)
+                VALUES (:instance_id,:last_processed_candle_timestamp,:market_data_mode,:market_data_status,:last_market_data_timestamp,:data_source,:warmup_bars,:duplicate_candles,:missing_candles,:out_of_order_candles,:last_blocker,:last_blocker_timestamp,:updated_at)
                 ON CONFLICT(instance_id) DO UPDATE SET
                   last_processed_candle_timestamp=excluded.last_processed_candle_timestamp,
                   market_data_mode=excluded.market_data_mode,
@@ -754,6 +791,8 @@ class InstanceStore:
                   duplicate_candles=excluded.duplicate_candles,
                   missing_candles=excluded.missing_candles,
                   out_of_order_candles=excluded.out_of_order_candles,
+                  last_blocker=excluded.last_blocker,
+                  last_blocker_timestamp=excluded.last_blocker_timestamp,
                   updated_at=excluded.updated_at""", row)
                 self.ledger._c.commit()
 
@@ -1240,7 +1279,9 @@ class TradingInstanceManager:
                     data_source=market.get("data_source"), warmup_bars=int(market.get("warmup_bars") or 0),
                     duplicate_candles=int(market.get("duplicate_candles") or 0),
                     missing_candles=int(market.get("missing_candles") or 0),
-                    out_of_order_candles=int(market.get("out_of_order_candles") or 0))
+                    out_of_order_candles=int(market.get("out_of_order_candles") or 0),
+                    last_blocker="GATE_REJECTED: WARMUP",
+                    last_blocker_timestamp=market.get("last_blocker_timestamp"))
             def checkpoint(timestamp: str) -> None:
                 runtime_status = engine_ref["engine"].status() if "engine" in engine_ref else {}
                 self.store.save_market_state(instance_id,
@@ -1252,7 +1293,9 @@ class TradingInstanceManager:
                     warmup_bars=int(runtime_status.get("warmup_bars") or 0),
                     duplicate_candles=int(runtime_status.get("duplicate_candles_ignored") or 0),
                     missing_candles=int(runtime_status.get("missing_candles") or 0),
-                    out_of_order_candles=int(runtime_status.get("out_of_order_candles") or 0))
+                    out_of_order_candles=int(runtime_status.get("out_of_order_candles") or 0),
+                    last_blocker=runtime_status.get("last_blocker"),
+                    last_blocker_timestamp=runtime_status.get("last_blocker_timestamp"))
             def lifecycle(event: dict) -> None:
                 state = str(event["state"])
                 with self._lock:
@@ -1289,6 +1332,8 @@ class TradingInstanceManager:
                         duplicate_candles=int(runtime_status.get("duplicate_candles_ignored") or 0),
                         missing_candles=int(runtime_status.get("missing_candles") or 0),
                         out_of_order_candles=int(runtime_status.get("out_of_order_candles") or 0),
+                        last_blocker=runtime_status.get("last_blocker"),
+                        last_blocker_timestamp=runtime_status.get("last_blocker_timestamp"),
                     )
                 level = "error" if state == "error" else "warning" if state in ("data_stale", "recovering") else "info"
                 self.store.append_engine_log(
@@ -1324,6 +1369,7 @@ class TradingInstanceManager:
                     f"the {required_decision_timeframe} decision timeframe")
             engine.ws_feed = ws_feed
             engine.strategy_label = f"{inst.strategy_label} {inst.strategy_version}"
+            engine.strategy_key = inst.strategy_key
             engine.strategy_version = inst.strategy_version
             engine.decisions = self.decision_store
             engine.reports = self.cycle_store
@@ -1349,6 +1395,50 @@ class TradingInstanceManager:
             if ws_feed is not None:
                 ws_feed.stop()
         inst.state, inst.desired_running, inst.stopped_at = "stopped", False, _now(); self.store.save(inst); return inst
+
+    def shutdown(self, timeout_s: float = 15.0) -> dict:
+        """Quiesce every worker without erasing durable restart intent.
+
+        Entry gates close first, then each in-flight candle must acknowledge and
+        checkpoint. Worker/feed threads are joined only after that boundary.
+        """
+        deadline = time.monotonic() + max(1.0, float(timeout_s))
+        with self._lock:
+            runtimes = list(self._runtime.items())
+            reboot_threads = list(self._reboot_threads.values())
+        report = {"requested": len(runtimes), "acknowledged": 0, "errors": []}
+        for instance_id, (engine, _paper, _pipeline, controls) in runtimes:
+            controls.pause_all()
+            try:
+                remaining = max(0.01, deadline - time.monotonic())
+                checkpoint = engine.acknowledge_entry_pause(remaining)
+                report["acknowledged"] += 1
+                self.store.append_engine_log(
+                    instance_id, level="info",
+                    message=f"shutdown_checkpoint={checkpoint}")
+            except Exception as exc:
+                report["errors"].append(
+                    f"{instance_id}: checkpoint {type(exc).__name__}: {exc}")
+            # A process shutdown must not rewrite desired_running=False through
+            # the ordinary stopped lifecycle callback. Startup owns restoration.
+            engine._lifecycle_callback = None
+            try:
+                engine.stop("Process shutdown after entry-gate checkpoint")
+            except Exception as exc:
+                report["errors"].append(
+                    f"{instance_id}: engine stop {type(exc).__name__}: {exc}")
+            feed = getattr(engine, "ws_feed", None)
+            if feed is not None:
+                try:
+                    feed.stop()
+                except Exception as exc:
+                    report["errors"].append(
+                        f"{instance_id}: feed stop {type(exc).__name__}: {exc}")
+        for thread in reboot_threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
+                report["errors"].append("full reboot worker did not stop before shutdown timeout")
+        return report
 
     def restart(self, instance_id: str) -> TradingInstance:
         """Begin a genuine staged Full Bot Reboot and return immediately."""
@@ -1683,8 +1773,21 @@ class TradingInstanceManager:
         with self._lock:
             self._assert_reboot_idle(instance_id)
             inst = self._instances[instance_id]; runtime = self._runtime.get(instance_id)
-        if runtime: runtime[3].pause_all()
-        inst.state, inst.desired_running = "paused", False; self.store.save(inst); return inst
+        if runtime:
+            runtime[3].pause_all()
+            try:
+                acknowledgement = runtime[0].acknowledge_entry_pause()
+                self.store.append_engine_log(
+                    instance_id, level="info",
+                    message=f"pause_acknowledged checkpoint={acknowledgement}")
+            except Exception as exc:
+                inst.state, inst.desired_running = "degraded", False
+                inst.last_error = f"Pause acknowledgement failed: {type(exc).__name__}: {exc}"
+                self.store.save(inst)
+                raise RuntimeError(inst.last_error) from exc
+        inst.state, inst.desired_running = "paused", False
+        self.store.save(inst)
+        return inst
 
     def resume(self, instance_id: str) -> TradingInstance:
         with self._lock:
@@ -2159,7 +2262,9 @@ class TradingInstanceManager:
                           "warmup_bars": engine.get("warmup_bars", market.get("warmup_bars", 0)),
                           "duplicate_candles": engine.get("duplicate_candles_ignored", market.get("duplicate_candles", 0)),
                           "missing_candles": engine.get("missing_candles", market.get("missing_candles", 0)),
-                          "out_of_order_candles": engine.get("out_of_order_candles", market.get("out_of_order_candles", 0))}
+                          "out_of_order_candles": engine.get("out_of_order_candles", market.get("out_of_order_candles", 0)),
+                          "last_blocker": engine.get("last_blocker"),
+                          "last_blocker_timestamp": engine.get("last_blocker_timestamp")}
         reboot = dict(self._reboots.get(instance_id, {})) or None
         if reboot and reboot.get("status") == _REBOOT_RUNNING:
             state = "rebooting"
@@ -2290,6 +2395,26 @@ class TradingInstanceManager:
                 last_decision = rows[0] if rows else None
             except Exception:  # noqa: BLE001 -- observability must not stop a worker
                 last_decision = None
+        strategy_health = metrics.get("strategy_health") or {}
+        health_status = str(strategy_health.get("status") or "").lower()
+        market_status = str(market.get("market_data_status") or "").lower()
+        last_blocker = ((engine or {}).get("last_blocker") or market.get("last_blocker"))
+        worker_strategy = str((engine or {}).get("strategy") or "")
+        worker_strategy_key = str((engine or {}).get("strategy_key") or "")
+        strategy_matches = not worker_strategy_key or worker_strategy_key == inst.strategy_key
+        controls_armed = bool(runtime and runtime[3].trading_allowed())
+        if state in ("error", "degraded") or not strategy_matches:
+            ui_status = "ERROR"
+        elif (state in ("paused", "stopped", "created", "data_stale", "recovering", "rebooting")
+              or market_status in ("stale", "disconnected", "error")
+              or health_status == "unhealthy"):
+            ui_status = "BLOCKED"
+        elif state in ("starting", "bootstrapping", "warming", "syncing", "ready"):
+            ui_status = "RUNNING_UNARMED"
+        elif state == "running" and controls_armed:
+            ui_status = "RUNNING_ARMED"
+        else:
+            ui_status = "RUNNING_UNARMED"
         configuration = {
             "symbol": inst.symbol, "strategy": inst.strategy_label,
             "strategy_key": inst.strategy_key, "strategy_version": inst.strategy_version,
@@ -2322,8 +2447,25 @@ class TradingInstanceManager:
                 },
                 "performance": {**metrics, "net_pnl": execution.get("realized_pnl"),
                                 "return_pct": execution.get("return_pct")},
-                "strategy_health": metrics.get("strategy_health"),
-                "last_decision": last_decision, "metrics": metrics,
+                "strategy_health": strategy_health,
+                "last_decision": last_decision,
+                "last_blocker": last_blocker,
+                "last_blocker_timestamp": ((engine or {}).get("last_blocker_timestamp")
+                                           or market.get("last_blocker_timestamp")),
+                "ui_status": ui_status,
+                "worker_counts": {
+                    "signals": int((engine or {}).get("signals") or 0),
+                    "accepted": int((engine or {}).get("accepted_signals") or 0),
+                    "rejections": int((engine or {}).get("rejections") or 0),
+                },
+                "strategy_identity": {
+                    "configured_id": inst.strategy_key,
+                    "configured_label": inst.strategy_label,
+                    "worker_id": worker_strategy_key or None,
+                    "worker_label": worker_strategy or None,
+                    "matches": strategy_matches,
+                },
+                "metrics": metrics,
                 "reboot": reboot}
 
     def snapshot(self) -> tuple[list[dict], list[dict], list[dict]]:

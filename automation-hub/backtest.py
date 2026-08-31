@@ -24,6 +24,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+import pandas as pd
+
 from bot.types import Bar, SignalType
 from strategies.brain_strategy import DecisionBrain
 from strategies.donchian_strategy import DonchianStrategy
@@ -66,15 +68,52 @@ def load_csv(path: str) -> list[Bar]:
 
 
 def resample(bars: list[Bar], group: int) -> list[Bar]:
-    """Aggregate every ``group`` bars into one (e.g. 16 x 15m -> 4h)."""
+    """Aggregate on UTC epoch boundaries (left-closed, right-open).
+
+    Incomplete or discontinuous buckets are discarded; input row zero never
+    becomes an accidental timeframe origin.
+    """
     if group <= 1:
         return bars
-    out: list[Bar] = []
-    for i in range(0, len(bars) - group + 1, group):
-        s = bars[i:i + group]
-        out.append(Bar(s[-1].timestamp, s[0].open, max(b.high for b in s),
-                       min(b.low for b in s), s[-1].close, sum(b.volume for b in s)))
-    return out
+    if len(bars) < 2:
+        return []
+    index = pd.DatetimeIndex([pd.Timestamp(bar.timestamp) for bar in bars])
+    index = index.tz_localize("UTC") if index.tz is None else index.tz_convert("UTC")
+    if not index.is_monotonic_increasing or not index.is_unique:
+        raise ValueError("Resample input candles must be strictly increasing and unique")
+    deltas = index.to_series().diff().dropna()
+    source_delta = deltas.median()
+    if source_delta <= pd.Timedelta(0) or not (deltas == source_delta).all():
+        raise ValueError("Resample input candles are missing or have an irregular interval")
+
+    htf_rule = source_delta * group
+    frame = pd.DataFrame(
+        {
+            "open": [float(bar.open) for bar in bars],
+            "high": [float(bar.high) for bar in bars],
+            "low": [float(bar.low) for bar in bars],
+            "close": [float(bar.close) for bar in bars],
+            "volume": [float(bar.volume) for bar in bars],
+        },
+        index=index,
+    )
+    aggregated = frame.resample(
+        htf_rule, origin="epoch", closed="left", label="left",
+    ).agg(
+        open=("open", "first"), high=("high", "max"),
+        low=("low", "min"), close=("close", "last"),
+        volume=("volume", "sum"), source_count=("close", "size"),
+    )
+
+    current_time = index[-1] + source_delta
+    forming_bucket = current_time.floor(htf_rule)
+    complete = aggregated.loc[
+        (aggregated.index < forming_bucket) & (aggregated["source_count"] == group)
+    ]
+    return [
+        Bar(stamp.to_pydatetime(), row.open, row.high, row.low, row.close, row.volume)
+        for stamp, row in complete.iterrows()
+    ]
 
 
 @dataclass
@@ -116,11 +155,30 @@ def run(bars: list[Bar], *, strategy: str = "brain", threshold: float = 0.5,
     Each trade's R is reward/risk: +rr on a target hit, -1 on a stop, minus
     round-trip costs (``fee`` + ``slippage`` per side, as a fraction of price).
     """
+    return _run_window(
+        bars, start=0, end=len(bars), strategy=strategy, threshold=threshold,
+        rr=rr, fee=fee, slippage=slippage, with_index=with_index,
+        warmup_start=0,
+    )
+
+
+def _run_window(bars: list[Bar], *, start: int, end: int,
+                strategy: str, threshold: float, rr: float, fee: float,
+                slippage: float, with_index: bool,
+                warmup_start: int) -> list:
+    """Run one isolated causal window.
+
+    Pre-window bars warm indicators only. Positions and management state always
+    start empty, and an open trade is never allowed to realize outside ``end``.
+    """
     cost = fee + slippage
     brain = make_strategy(strategy, threshold, rr)
+    for bar in bars[max(0, warmup_start):max(0, start)]:
+        brain.on_bar(bar)
     pos = None
     out: list = []
-    for i, b in enumerate(bars):
+    for i in range(max(0, start), min(len(bars), end)):
+        b = bars[i]
         if pos is not None:
             exited = False
             if pos["side"] == "long":
@@ -156,16 +214,24 @@ def walk_forward(bars: list[Bar], *, strategy: str = "brain", train: int = 1500,
     """Optimise (threshold, rr) on each train window, trade the next unseen test
     window, roll forward. Returns aggregate out-of-sample metrics + per-fold rows."""
     grid = [(t, rr) for t in (0.4, 0.5, 0.6) for rr in (1.5, 2.0, 2.5, 3.0)]
-    runs = {p: run(bars, strategy=strategy, threshold=p[0], rr=p[1], fee=fee,
-                   slippage=slippage, with_index=True) for p in grid}
     oos: list[float] = []
     folds = []
     start = 0
     n = len(bars)
     while start + train + test <= n:
         a, b, c = start, start + train, start + train + test
-        best = max(grid, key=lambda p: sum(r for idx, r in runs[p] if a <= idx < b))
-        tt = [r for idx, r in runs[best] if b <= idx < c]
+        train_runs = {
+            p: _run_window(
+                bars, start=a, end=b, strategy=strategy, threshold=p[0], rr=p[1],
+                fee=fee, slippage=slippage, with_index=True, warmup_start=a,
+            ) for p in grid
+        }
+        best = max(grid, key=lambda p: sum(r for _, r in train_runs[p]))
+        tt_rows = _run_window(
+            bars, start=b, end=c, strategy=strategy, threshold=best[0], rr=best[1],
+            fee=fee, slippage=slippage, with_index=True, warmup_start=a,
+        )
+        tt = [r for _, r in tt_rows]
         oos += tt
         folds.append((bars[b].timestamp.date(), bars[c - 1].timestamp.date(), best, _metrics(tt)))
         start += test
@@ -176,14 +242,22 @@ def oos_trades(bars: list[Bar], *, strategy: str = "brain", train: int = 1500,
                test: int = 750, fee: float = TAKER_FEE, slippage: float = 0.0):
     """Ordered (timestamp, R) of every out-of-sample trade in the walk-forward."""
     grid = [(t, rr) for t in (0.4, 0.5, 0.6) for rr in (1.5, 2.0, 2.5, 3.0)]
-    runs = {p: run(bars, strategy=strategy, threshold=p[0], rr=p[1], fee=fee,
-                   slippage=slippage, with_index=True) for p in grid}
     out = []
     start, n = 0, len(bars)
     while start + train + test <= n:
         a, b, c = start, start + train, start + train + test
-        best = max(grid, key=lambda p: sum(r for idx, r in runs[p] if a <= idx < b))
-        out += [(bars[idx].timestamp, r) for idx, r in runs[best] if b <= idx < c]
+        train_runs = {
+            p: _run_window(
+                bars, start=a, end=b, strategy=strategy, threshold=p[0], rr=p[1],
+                fee=fee, slippage=slippage, with_index=True, warmup_start=a,
+            ) for p in grid
+        }
+        best = max(grid, key=lambda p: sum(r for _, r in train_runs[p]))
+        test_rows = _run_window(
+            bars, start=b, end=c, strategy=strategy, threshold=best[0], rr=best[1],
+            fee=fee, slippage=slippage, with_index=True, warmup_start=a,
+        )
+        out += [(bars[idx].timestamp, r) for idx, r in test_rows]
         start += test
     out.sort(key=lambda x: x[0])
     return out

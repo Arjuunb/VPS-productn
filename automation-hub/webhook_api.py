@@ -187,57 +187,19 @@ bot_os.bus.publish("system", "boot", {"msg": "Bot OS initialised"})
 # the simple EMA crossover instead.
 def _make_strategy(symbol: str):
     s = settings.auto_strategy
+    from services.strategy_factory import make_builtin_strategy
     if s == "adaptive":
         # multi-strategy allocation: per-symbol pick from market memory
         from services.allocator import adaptive_factory
-        return adaptive_factory(memory_store, settings.auto_timeframe)(symbol)
-    if s == "ema":
-        from strategies.ema_strategy import EMAStrategy
-        return EMAStrategy(symbol)
-    if s == "supertrend":
-        from strategies.supertrend_strategy import SupertrendStrategy
-        return SupertrendStrategy(symbol)
-    if s == "donchian":
-        from strategies.donchian_strategy import DonchianStrategy
-        return DonchianStrategy(symbol)
-    if s == "ensemble":
-        from strategies.ensemble_strategy import ConfirmationEnsemble
-        return ConfirmationEnsemble(symbol)
-    if s == "liquidity_sweep":
-        from strategies.liquidity_sweep_strategy import LiquiditySweepStrategy
-        return LiquiditySweepStrategy(symbol)
-    if s == "adaptive_trend_pullback":
-        from strategies.adaptive_trend_pullback import AdaptiveTrendPullbackConfig, AdaptiveTrendPullbackStrategy
-        return AdaptiveTrendPullbackStrategy(symbol, config=AdaptiveTrendPullbackConfig.from_env())
-    from strategies.brain_strategy import DecisionBrain
-    return DecisionBrain(symbol)
+        allocator = adaptive_factory(memory_store, settings.auto_timeframe)
+        return make_builtin_strategy(s, symbol, adaptive=allocator)
+    return make_builtin_strategy(s, symbol)
 
 
 def _make_instance_strategy(key: str, symbol: str):
     """Factory without mutable global settings — one instance, one strategy."""
-    if key == "ema":
-        from strategies.ema_strategy import EMAStrategy
-        return EMAStrategy(symbol)
-    if key == "supertrend":
-        from strategies.supertrend_strategy import SupertrendStrategy
-        return SupertrendStrategy(symbol)
-    if key == "donchian":
-        from strategies.donchian_strategy import DonchianStrategy
-        return DonchianStrategy(symbol)
-    if key == "ensemble":
-        from strategies.ensemble_strategy import ConfirmationEnsemble
-        return ConfirmationEnsemble(symbol)
-    if key == "smc":
-        from strategies.smc_strategy import SMCStrategy
-        return SMCStrategy(symbol)
-    if key == "liquidity_sweep":
-        from strategies.liquidity_sweep_strategy import LiquiditySweepStrategy
-        return LiquiditySweepStrategy(symbol)
-    if key == "adaptive_trend_pullback":
-        from strategies.adaptive_trend_pullback import AdaptiveTrendPullbackConfig, AdaptiveTrendPullbackStrategy
-        return AdaptiveTrendPullbackStrategy(symbol, config=AdaptiveTrendPullbackConfig.from_env())
-    from strategies.brain_strategy import DecisionBrain
-    return DecisionBrain(symbol)
+    from services.strategy_factory import make_builtin_strategy
+    return make_builtin_strategy(key, symbol)
 
 
 # WebSocket feed (live mode): push candles with REST fallback. Starts only if
@@ -572,14 +534,12 @@ def _check_webhook_secret(secret: Optional[str]) -> None:
 
 
 def _check_secret(secret: Optional[str]) -> None:
-    """Validate the admin/control credential for a control action. Accepts the
-    admin key always; accepts the webhook secret too UNLESS it has been scoped
-    off non-webhook endpoints (M-5). Defaults to the webhook secret, so nothing
-    changes until an operator sets HUB_API_KEY."""
+    """Validate the dedicated admin/control credential for a control action.
+
+    Webhook and exchange credentials are never aliases and are never accepted
+    on control/configuration endpoints.
+    """
     if secret and hmac.compare_digest(secret, settings.admin_key):
-        return
-    if (not settings.scope_webhook_secret and secret
-            and hmac.compare_digest(secret, settings.webhook_secret)):
         return
     raise HTTPException(status_code=401, detail="Invalid or missing credential")
 

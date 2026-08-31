@@ -56,6 +56,6 @@ def test_endpoint_serves_growth():
     import app as app_module
     c = TestClient(app_module.app)
     r = c.get("/trade-memory/growth",
-              headers={"X-Webhook-Secret": _wa.settings.webhook_secret})
+              headers={"X-Webhook-Secret": _wa.settings.admin_key})
     assert r.status_code == 200
     assert "available" in r.json()
