@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -11,8 +12,10 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
 from data.market_data_v2 import TIMEFRAMES
+from data.sqlite_runtime import is_sqlite_busy
 from services.native_price_action import RESEARCH_ID, STRATEGIES, STRATEGY_VERSION, PriceActionConfig
 from services.price_action_lab import PaperExecutionConfig, replay_state
+from services.price_action_governance import PersistenceBlocked
 from services.price_action_research import controlled_pa_smc_report
 from services.price_action_reference_study import run_reference_study
 from services.research_funding import HistoricalFundingSeries
@@ -23,6 +26,16 @@ router = APIRouter(prefix="/research/price-action", tags=["research-price-action
 
 def _bad(exc: Exception, status: int = 400):
     raise HTTPException(status, str(exc)) from exc
+
+
+def _persistence_blocked(exc: Exception):
+    if isinstance(exc, PersistenceBlocked) or is_sqlite_busy(exc):
+        raise HTTPException(status_code=503, detail={
+            "state": "PERSISTENCE_BLOCKED", "code": "PERSISTENCE_BLOCKED",
+            "retryable": True, "message": str(exc),
+            "real_execution_allowed": False,
+        }) from exc
+    raise exc
 
 
 def _utc_ms(value: str) -> int:
@@ -148,13 +161,19 @@ def _paper_state() -> dict:
 
 @router.get("/paper")
 def paper_account():
-    return _paper_state()
+    try:
+        return _paper_state()
+    except (PersistenceBlocked, sqlite3.OperationalError) as exc:
+        _persistence_blocked(exc)
 
 
 @router.get("/bot-status")
 def bot_status():
     """Dashboard-safe status for the isolated Price Action paper system."""
-    return _wa.price_action_runtime.bot_status()
+    try:
+        return _wa.price_action_runtime.bot_status()
+    except (PersistenceBlocked, sqlite3.OperationalError) as exc:
+        _persistence_blocked(exc)
 
 
 @router.get("/paper/export")
@@ -166,7 +185,10 @@ def export_paper_account():
 
 @router.get("/sessions")
 def list_sessions():
-    return {"sessions": _wa.price_action_paper.sessions(), "real_execution_allowed": False}
+    try:
+        return {"sessions": _wa.price_action_paper.sessions(), "real_execution_allowed": False}
+    except (PersistenceBlocked, sqlite3.OperationalError) as exc:
+        _persistence_blocked(exc)
 
 
 class SessionStartBody(BaseModel):

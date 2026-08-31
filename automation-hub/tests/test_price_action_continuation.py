@@ -286,6 +286,35 @@ def test_public_stream_dedupes_closed_candles_and_marks_gaps_unreliable():
     assert status["duplicate_events"] >= 1
 
 
+def test_journal_persistence_block_does_not_disconnect_stream_worker():
+    class Blocked(RuntimeError):
+        code = "PERSISTENCE_BLOCKED"
+
+    events = []
+    history = [bar(0), bar(1)]
+    stream = PriceActionPublicStream(
+        lambda *_args, **_kwargs: history,
+        event_sink=events.append,
+        bar_sink=lambda _bar: (_ for _ in ()).throw(Blocked("journal locked")),
+    )
+    stream.bootstrap("BTCUSDT", "5m")
+    stream.reconciliation_complete = True
+    connect_stream_channels(stream)
+    closed = {"e": "kline", "k": {
+        "t": int(bar(2).timestamp.timestamp() * 1000),
+        "o": "100", "h": "102", "l": "98", "c": "101", "v": "1000", "x": True,
+    }}
+
+    result = stream.ingest_event({"data": closed})
+
+    assert result["accepted"] is True
+    assert result["sink_persisted"] is False
+    assert result["persistence_state"] == "PERSISTENCE_BLOCKED"
+    assert stream.state == "CONNECTED"
+    assert stream.status()["persistence_blocked_events"] == 1
+    assert any(event.get("state") == "PERSISTENCE_BLOCKED" for event in events)
+
+
 def test_public_stream_rest_reconciles_a_missing_closed_candle_once():
     history = [bar(0), bar(1), bar(2)]
     clock = lambda: bar(3).timestamp + timedelta(minutes=5)

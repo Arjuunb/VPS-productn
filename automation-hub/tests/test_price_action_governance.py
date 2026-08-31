@@ -1,9 +1,11 @@
+import copy
 import sqlite3
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from services.price_action_governance import PriceActionJournalStore
+from services.price_action_governance import PersistenceBlocked, PriceActionJournalStore
 from bot.types import Bar
 from services.native_price_action import NativePriceActionEngine, PriceActionConfig
 from services.price_action_lab import PriceActionLabRuntime, PriceActionPaperAccount
@@ -58,6 +60,160 @@ def capture(store, **changes):
     return ids[0]
 
 
+def revision_count(store, journal_id):
+    return store._db.execute(
+        "SELECT COUNT(*) FROM pa_journal_revisions WHERE journal_id=?", (journal_id,)
+    ).fetchone()[0]
+
+
+def test_capture_material_projection_deduplicates_refresh_and_transient_state(tmp_path):
+    store = PriceActionJournalStore(tmp_path / "pa.db")
+    state, session, paper, feed, partition = evidence(status="WATCHING_LOCATION", net_r=None)
+    state["trades"] = []
+    state["candles"] = [{"timestamp": "2026-08-24T09:55:00+00:00", "close": 100}]
+    state["live_display"] = {"bid": 100, "ask": 101, "heartbeat": "first"}
+    journal_id = store.capture(
+        visual_state=state, session=session, paper_state=paper,
+        feed_status=feed, partition_label=partition)[0]
+
+    for index in range(100):
+        refreshed = copy.deepcopy(state)
+        refreshed["live_display"] = {
+            "bid": 200 + index, "ask": 201 + index, "heartbeat": f"tick-{index}",
+        }
+        refreshed["candles"].append({
+            "timestamp": f"2026-08-24T11:{index % 60:02d}:00+00:00",
+            "close": 200 + index,
+        })
+        assert store.capture(
+            visual_state=refreshed, session=session, paper_state=paper,
+            feed_status={"state": "SYNCHRONIZED", "health_reason": f"heartbeat {index}"},
+            partition_label=partition) == []
+        store.list(session_id=session["id"])
+
+    assert revision_count(store, journal_id) == 1
+    payload = store.get(journal_id)["latest"]
+    assert "candles" not in payload
+    assert payload["identity"]["dataset_fingerprint"].startswith("decision-evidence-")
+
+
+def test_legacy_full_payload_hash_does_not_force_migration_revision(tmp_path):
+    store = PriceActionJournalStore(tmp_path / "legacy-hash.db")
+    journal_id = capture(store)
+    # Production revisions predate material hashes. Simulate one without
+    # changing its immutable payload evidence.
+    store._db.execute("DROP TRIGGER pa_journal_revisions_no_update")
+    store._db.execute(
+        "UPDATE pa_journal_revisions SET payload_hash=? WHERE journal_id=?",
+        ("revision-legacy-full-payload", journal_id))
+    store._create_immutability_triggers()
+    state, session, paper, feed, partition = evidence()
+
+    assert store.capture(visual_state=state, session=session, paper_state=paper,
+                         feed_status=feed, partition_label=partition) == []
+    assert revision_count(store, journal_id) == 1
+
+
+def test_one_hundred_dashboard_status_reads_create_no_revision(tmp_path):
+    class Market:
+        @staticmethod
+        def public_usdm_window(*_args, **_kwargs):
+            return []
+
+    account = PriceActionPaperAccount(tmp_path / "dashboard.db")
+    state, session, paper, feed, partition = evidence()
+    journal_id = account.journal.capture(
+        visual_state=state, session=session, paper_state=paper,
+        feed_status=feed, partition_label=partition)[0]
+    runtime = PriceActionLabRuntime(Market(), account, autostart=False)
+
+    for _ in range(100):
+        status = runtime.bot_status()
+        assert status["persistence"]["state"] == "AVAILABLE"
+
+    assert revision_count(account.journal, journal_id) == 1
+
+
+def test_material_lifecycle_fill_and_close_each_create_one_revision(tmp_path):
+    store = PriceActionJournalStore(tmp_path / "pa.db")
+    state, session, paper, feed, partition = evidence(status="WATCHING_LOCATION", net_r=None)
+    state["trades"] = []
+    journal_id = store.capture(
+        visual_state=state, session=session, paper_state=paper,
+        feed_status=feed, partition_label=partition)[0]
+
+    state["setups"][0]["phase"] = "ORDER_PENDING"
+    state["setups"][0]["transitions"].append({
+        "from_phase": "WATCHING_LOCATION", "to_phase": "ORDER_PENDING",
+    })
+    assert store.capture(visual_state=state, session=session, paper_state=paper,
+                         feed_status=feed, partition_label=partition) == [journal_id]
+    assert store.capture(visual_state=state, session=session, paper_state=paper,
+                         feed_status=feed, partition_label=partition) == []
+
+    paper.update({
+        "order_metadata": [{"order_id": "order-1", "config": {
+            "proposal": {"setup_id": "setup-1"}, "entry": 101, "stop": 99,
+            "target": 106, "risk_amount": 20, "quantity": 1,
+        }}],
+        "orders": [{"id": "order-1", "average_price": 101, "quantity": 1,
+                    "symbol": "BTCUSDT"}],
+        "trades": [{"order_id": "order-1", "fee": .04, "price": 101,
+                    "timestamp": "2026-08-24T10:05:00+00:00"}],
+        "activity": [], "funding_events": [],
+    })
+    assert store.capture(visual_state=state, session=session, paper_state=paper,
+                         feed_status=feed, partition_label=partition) == [journal_id]
+    assert store.capture(visual_state=state, session=session, paper_state=paper,
+                         feed_status=feed, partition_label=partition) == []
+
+    state["setups"][0]["phase"] = "TARGET_HIT"
+    state["setups"][0]["transitions"].append({
+        "from_phase": "ORDER_PENDING", "to_phase": "TARGET_HIT",
+    })
+    state["trades"] = [{
+        "id": "research-1", "setup_id": "setup-1", "status": "TARGET_HIT",
+        "net_r": 2.4, "gross_r": 2.5, "costs_r": .1,
+        "closed_at": "2026-08-24T10:20:00+00:00", "reason": "target",
+    }]
+    assert store.capture(visual_state=state, session=session, paper_state=paper,
+                         feed_status=feed, partition_label=partition) == [journal_id]
+    assert store.capture(visual_state=state, session=session, paper_state=paper,
+                         feed_status=feed, partition_label=partition) == []
+    assert revision_count(store, journal_id) == 4
+
+
+def test_wal_allows_read_during_write_and_capture_retries_after_lock(tmp_path):
+    path = tmp_path / "pa.db"
+    store = PriceActionJournalStore(path, busy_timeout_ms=20)
+    journal_id = capture(store)
+    writer = sqlite3.connect(path, timeout=.02, isolation_level=None)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute("INSERT INTO pa_candidate_events VALUES (?,?,?,?,?,?,?)", (
+        "lock-holder", "candidate", "A", "B", "test", "test", "now"))
+
+    read_result = []
+    reader = threading.Thread(
+        target=lambda: read_result.append(store.list(session_id="session-1")))
+    reader.start()
+    reader.join(timeout=1)
+    assert not reader.is_alive()
+    assert read_result[0]["entries"]
+
+    state, session, paper, feed, partition = evidence(status="WON", net_r=2.4)
+    with pytest.raises(PersistenceBlocked) as blocked:
+        store.capture(visual_state=state, session=session, paper_state=paper,
+                      feed_status=feed, partition_label=partition)
+    assert blocked.value.code == "PERSISTENCE_BLOCKED"
+    writer.execute("ROLLBACK")
+    writer.close()
+
+    assert store.capture(visual_state=state, session=session, paper_state=paper,
+                         feed_status=feed, partition_label=partition) == [journal_id]
+    assert revision_count(store, journal_id) == 2
+
+
 def test_journal_is_immutable_filterable_and_revisioned(tmp_path):
     store = PriceActionJournalStore(tmp_path / "pa.db")
     journal_id = capture(store)
@@ -82,6 +238,11 @@ def test_journal_is_immutable_filterable_and_revisioned(tmp_path):
     assert revised["latest"]["review"]["researcher_notes"] == "reviewed"
     assert revised["latest"]["review"]["tags"] == ["loss"]
     assert len(revised["revisions"]) == 2
+    state, session, paper, feed, partition = evidence()
+    assert store.capture(visual_state=state, session=session, paper_state=paper,
+                         feed_status=feed, partition_label=partition) == []
+    assert store.get(journal_id)["latest"]["review"]["researcher_notes"] == "reviewed"
+    assert len(store.get(journal_id)["revisions"]) == 2
     with pytest.raises(sqlite3.IntegrityError, match="immutable"):
         store._db.execute("UPDATE pa_journal_entries SET symbol='ETHUSDT'")
     with pytest.raises(sqlite3.IntegrityError, match="immutable"):

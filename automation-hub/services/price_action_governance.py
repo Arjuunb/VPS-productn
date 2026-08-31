@@ -17,6 +17,8 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+from data.sqlite_runtime import is_sqlite_busy, runtime_connection
+
 
 STRATEGY_FAMILY = "PURE_PRICE_ACTION"
 STRATEGY_VERSION = "1.1.0"
@@ -30,6 +32,17 @@ LEARNING_CLASSES = {
     "DATA_QUALITY_FAILURE", "MODEL_SPECIFICATION_WEAKNESS",
     "RANDOM_OR_INCONCLUSIVE", "VALID_NON_LOSS",
 }
+
+
+class PersistenceBlocked(RuntimeError):
+    """A retryable journal lock that must not be reported as feed failure."""
+
+    code = "PERSISTENCE_BLOCKED"
+
+    def __init__(self, operation: str, exc: BaseException):
+        super().__init__(f"Price Action journal {operation} is blocked: {exc}")
+        self.operation = operation
+        self.retryable = True
 
 
 def _validate_rule_value(rule_key: str, value: object) -> None:
@@ -71,13 +84,18 @@ def _latest_by(rows: list[dict], key: str, value: str) -> dict | None:
 class PriceActionJournalStore:
     """SQLite-backed append-only PA evidence, revisions and research governance."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, busy_timeout_ms: int = 10_000):
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._db = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
-        self._db.row_factory = sqlite3.Row
-        self._schema()
+        try:
+            self._db = runtime_connection(
+                self.path, autocommit=True, busy_timeout_ms=busy_timeout_ms)
+            self._schema()
+        except sqlite3.OperationalError as exc:
+            if is_sqlite_busy(exc):
+                raise PersistenceBlocked("startup", exc) from exc
+            raise
 
     def _schema(self) -> None:
         with self._lock:
@@ -221,7 +239,6 @@ class PriceActionJournalStore:
         config_fingerprint = (visual_state.get("metrics_scope", {}).get("configuration_id") or
                               _fingerprint(config, "config"))
         engine_fingerprint = str(visual_state.get("metrics_scope", {}).get("engine_fingerprint") or "UNVERIFIED")
-        dataset_fingerprint = str(visual_state.get("metrics_scope", {}).get("dataset_fingerprint") or "UNVERIFIED")
         trigger_patterns = setup.get("pattern_metadata") or []
         requested = float((proposal or {}).get("entry") or execution.get("entry") or 0) or None
         stop = float((proposal or {}).get("stop") or execution.get("stop") or 0) or None
@@ -261,11 +278,27 @@ class PriceActionJournalStore:
             "coverage": "NO_ORDER_SCOPED_FUNDING_EVIDENCE",
         })
         transitions = list(setup.get("transitions", []))
-        decision_candles = [
-            row for row in visual_state.get("candles", [])
-            if str(row.get("timestamp")) <= str(setup.get("created_at"))
-        ]
-        dataset_fingerprint = _fingerprint(decision_candles, "decision-dataset")
+        # This fingerprint is setup-scoped evidence captured at decision time.
+        # Never fingerprint the runtime rolling candle window: its membership
+        # changes on every closed candle even when this setup does not.
+        decision_evidence = {
+            "setup_id": setup_id,
+            "created_at": setup.get("created_at"),
+            "strategy_id": setup.get("strategy_id"),
+            "direction": setup.get("direction"),
+            "zone_id": setup.get("zone_id"),
+            "trigger_event_id": setup.get("trigger_event_id"),
+            "context_snapshot": frozen_context,
+            "pattern_metadata": setup.get("pattern_metadata") or [],
+            "proposal": ({
+                "id": proposal.get("id"), "entry": proposal.get("entry"),
+                "stop": proposal.get("stop"), "target": proposal.get("target"),
+                "signal_at": proposal.get("signal_at"),
+                "entry_model": proposal.get("entry_model"),
+                "valid_until_index": proposal.get("valid_until_index"),
+            } if proposal else None),
+        }
+        dataset_fingerprint = _fingerprint(decision_evidence, "decision-evidence")
         if paper_candidate and candidate_status in {"REJECTED", "DATA_PAUSED"}:
             payload = paper_candidate.get("payload") or {}
             transitions.append({
@@ -396,68 +429,121 @@ class PriceActionJournalStore:
             "DATA_QUALITY_FAILURE", "RULE_VIOLATION"}
         return record
 
+    @staticmethod
+    def _material_projection(record: dict) -> dict:
+        """Return immutable lifecycle/evidence fields that justify a revision.
+
+        Quotes shown by the UI and current feed explanations are useful in a
+        response, but are not new evidence about an already-created setup.
+        """
+        material = _canonical(record)
+        material.get("market_context", {}).pop("data_health_reason", None)
+        order_risk = material.get("order_risk", {})
+        order_risk.pop("bid_ask_decision", None)
+        order_risk.pop("spread", None)
+        return material
+
+    @classmethod
+    def _material_hash(cls, record: dict) -> str:
+        return _fingerprint(cls._material_projection(record), "material-revision")
+
+    @staticmethod
+    def _reason_code(prior: dict | None, record: dict) -> str:
+        if prior is None:
+            return "SETUP_CREATED"
+        if (prior.get("outcome") or {}).get("status") != record["outcome"].get("status"):
+            if record["outcome"].get("exit_timestamp") or record["outcome"].get("result") not in {None, "open"}:
+                return "OUTCOME_CLOSED"
+            return "LIFECYCLE_TRANSITION"
+        prior_risk, current_risk = prior.get("order_risk", {}), record.get("order_risk", {})
+        if (prior_risk.get("actual_simulated_fill"), prior_risk.get("order_id")) != (
+                current_risk.get("actual_simulated_fill"), current_risk.get("order_id")):
+            return "EXECUTION_FILL"
+        return "MATERIAL_EVIDENCE_CHANGED"
+
     def capture(self, *, visual_state: dict, session: dict, paper_state: dict,
                 feed_status: dict, partition_label: str) -> list[str]:
         """Capture changed setup snapshots as append-only revisions."""
         if partition_label not in {"development", "validation", "untouched_oos", "paper_forward"}:
             raise ValueError("invalid research partition label")
         captured: list[str] = []
-        with self._lock:
-            for setup in visual_state.get("setups", []):
-                record = self._record(visual_state=visual_state, session=session,
-                                      paper_state=paper_state, feed_status=feed_status,
-                                      setup=setup, partition_label=partition_label)
-                record = _canonical(record)
-                identity = record["identity"]
-                journal_id = identity["journal_entry_id"]
-                existing = self._db.execute(
-                    "SELECT id FROM pa_journal_entries WHERE id=?", (journal_id,)).fetchone()
-                latest = self._db.execute(
-                    "SELECT revision_no,payload_hash,payload_json FROM pa_journal_revisions "
-                    "WHERE journal_id=? ORDER BY revision_no DESC LIMIT 1", (journal_id,)).fetchone()
-                if latest:
-                    # Decision-time identity/context are evidence, not mutable
-                    # projections of the zone or rolling data window.  Outcome,
-                    # execution, and lifecycle fields may advance by revision.
-                    prior = json.loads(latest["payload_json"])
-                    prior_identity = prior["identity"]
-                    closed_at = record["identity"].get("closed_at")
-                    record["identity"] = prior_identity
-                    record["identity"]["closed_at"] = closed_at or prior_identity.get("closed_at")
-                    record["market_context"] = prior["market_context"]
-                    for key in (
+        try:
+            with self._lock:
+                for setup in visual_state.get("setups", []):
+                    record = self._record(
+                        visual_state=visual_state, session=session,
+                        paper_state=paper_state, feed_status=feed_status,
+                        setup=setup, partition_label=partition_label)
+                    record = _canonical(record)
+                    identity = record["identity"]
+                    journal_id = identity["journal_entry_id"]
+                    existing = self._db.execute(
+                        "SELECT id FROM pa_journal_entries WHERE id=?", (journal_id,)).fetchone()
+                    latest = self._db.execute(
+                        "SELECT revision_no,payload_hash,payload_json FROM pa_journal_revisions "
+                        "WHERE journal_id=? ORDER BY revision_no DESC LIMIT 1", (journal_id,)).fetchone()
+                    prior = None
+                    if latest:
+                        # Decision-time identity/context are evidence, not
+                        # mutable projections of the rolling runtime window.
+                        prior = json.loads(latest["payload_json"])
+                        prior_identity = prior["identity"]
+                        closed_at = record["identity"].get("closed_at")
+                        record["identity"] = prior_identity
+                        record["identity"]["closed_at"] = closed_at or prior_identity.get("closed_at")
+                        record["market_context"] = prior["market_context"]
+                        for key in (
                             "location_reached_candle", "rejection_reclaim_candle",
                             "trigger_classification", "pattern_metadata",
                             "confusion_candle_count", "confirmation_boundary",
                             "confirmation_candle", "invalidation_price",
                             "acceptance_reasons", "rejection_reasons"):
-                        record["setup"][key] = prior["setup"].get(key)
-                    record["chart_state"] = prior["chart_state"]
-                    classification, explanation = self._classification(record)
-                    record["review"]["learning_classification"] = classification
-                    record["review"]["classification_explanation"] = explanation
-                    record["review"]["include_in_research_statistics"] = classification not in {
-                        "DATA_QUALITY_FAILURE", "RULE_VIOLATION"}
-                if not existing:
-                    self._db.execute(
-                        "INSERT INTO pa_journal_entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (journal_id, identity["session_id"], identity["experiment_id"],
-                         setup["id"], identity["strategy_id"], identity["strategy_version"],
-                         identity["configuration_fingerprint"], identity["engine_fingerprint"],
-                         identity["dataset_fingerprint"], identity["symbol"], identity["timeframe"],
-                         identity["direction"], identity["origin"], identity["research_partition"],
-                         record["outcome"]["status"], record["outcome"]["result"],
-                         str(setup.get("created_at")), record["outcome"].get("exit_timestamp"),
-                         json.dumps(record, sort_keys=True), _now(),))
-                payload_hash = _fingerprint(record, "revision")
-                if latest and latest["payload_hash"] == payload_hash:
-                    continue
-                revision_no = int(latest["revision_no"] if latest else 0) + 1
-                self._db.execute(
-                    "INSERT OR IGNORE INTO pa_journal_revisions VALUES (?,?,?,?,?,?,?,?)",
-                    (uuid.uuid4().hex, journal_id, revision_no, "ENGINE_STATE_CAPTURE", _now(),
-                     "price_action_runtime", payload_hash, json.dumps(record, sort_keys=True)))
-                captured.append(journal_id)
+                            record["setup"][key] = prior["setup"].get(key)
+                        record["chart_state"] = prior["chart_state"]
+                        # Runtime capture may append lifecycle evidence but may
+                        # never erase an immutable researcher annotation.
+                        record["review"]["researcher_notes"] = prior["review"].get(
+                            "researcher_notes", "")
+                        record["review"]["tags"] = prior["review"].get("tags", [])
+                        classification, explanation = self._classification(record)
+                        record["review"]["learning_classification"] = classification
+                        record["review"]["classification_explanation"] = explanation
+                        record["review"]["include_in_research_statistics"] = classification not in {
+                            "DATA_QUALITY_FAILURE", "RULE_VIOLATION"}
+                    payload_hash = self._material_hash(record)
+                    # Historical rows used a full-payload hash. Comparing the
+                    # projection avoids a one-time migration revision storm.
+                    if prior is not None and self._material_hash(prior) == payload_hash:
+                        continue
+                    revision_no = int(latest["revision_no"] if latest else 0) + 1
+                    self._db.execute("BEGIN IMMEDIATE")
+                    try:
+                        if not existing:
+                            self._db.execute(
+                                "INSERT INTO pa_journal_entries VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                                (journal_id, identity["session_id"], identity["experiment_id"],
+                                 setup["id"], identity["strategy_id"], identity["strategy_version"],
+                                 identity["configuration_fingerprint"], identity["engine_fingerprint"],
+                                 identity["dataset_fingerprint"], identity["symbol"], identity["timeframe"],
+                                 identity["direction"], identity["origin"], identity["research_partition"],
+                                 record["outcome"]["status"], record["outcome"]["result"],
+                                 str(setup.get("created_at")), record["outcome"].get("exit_timestamp"),
+                                 json.dumps(record, sort_keys=True), _now(),))
+                        self._db.execute(
+                            "INSERT OR IGNORE INTO pa_journal_revisions VALUES (?,?,?,?,?,?,?,?)",
+                            (uuid.uuid4().hex, journal_id, revision_no,
+                             self._reason_code(prior, record), _now(),
+                             "price_action_runtime", payload_hash,
+                             json.dumps(record, sort_keys=True)))
+                        self._db.execute("COMMIT")
+                    except Exception:
+                        self._db.execute("ROLLBACK")
+                        raise
+                    captured.append(journal_id)
+        except sqlite3.OperationalError as exc:
+            if is_sqlite_busy(exc):
+                raise PersistenceBlocked("capture", exc) from exc
+            raise
         return captured
 
     def record_legacy_remediation(

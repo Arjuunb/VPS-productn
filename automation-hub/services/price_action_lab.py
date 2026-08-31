@@ -21,7 +21,8 @@ from services.native_price_action import (
     NativePriceActionEngine,
     PriceActionConfig,
 )
-from services.price_action_governance import PriceActionJournalStore
+from data.sqlite_runtime import is_sqlite_busy, runtime_connection
+from services.price_action_governance import PersistenceBlocked, PriceActionJournalStore
 from services.price_action_stream import PriceActionPublicStream
 from services.lab_lifecycle import (
     blockers as lifecycle_blockers,
@@ -82,8 +83,8 @@ class PriceActionPaperAccount:
         # Metadata and the broker share one SQLite file but use separate
         # connections. Autocommit prevents a metadata write lock from being
         # held while the broker performs its own atomic ledger transaction.
-        self._db = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
-        self._db.row_factory = sqlite3.Row
+        self._db = runtime_connection(self.path, autocommit=True)
+        self._persistence_blocker: dict | None = None
         with self._db:
             self._db.executescript("""
               CREATE TABLE IF NOT EXISTS pa_sessions(
@@ -195,6 +196,27 @@ class PriceActionPaperAccount:
         with self._lock:
             rows = self._db.execute("SELECT * FROM pa_sessions ORDER BY started_at DESC").fetchall()
         return [self._decode_session(dict(row)) for row in rows]
+
+    def persistence_status(self) -> dict:
+        with self._lock:
+            return dict(self._persistence_blocker or {
+                "state": "AVAILABLE", "retryable": False, "last_error": None,
+            })
+
+    def _mark_persistence_blocked(self, exc: PersistenceBlocked) -> dict:
+        value = {
+            "state": "PERSISTENCE_BLOCKED", "code": exc.code,
+            "operation": exc.operation, "retryable": True,
+            "last_error": str(exc), "observed_at": _iso(),
+        }
+        with self._lock:
+            self._persistence_blocker = value
+        return dict(value)
+
+    def _clear_persistence_blocker(self) -> dict:
+        with self._lock:
+            self._persistence_blocker = None
+        return self.persistence_status()
 
     @staticmethod
     def _decode_session(row: dict) -> dict:
@@ -332,7 +354,9 @@ class PriceActionPaperAccount:
             remediation_id=remediation_id, initiated_by=initiated_by,
         )
         now = _iso()
-        with self._lock, self._db:
+        # This connection is autocommit. Never retain a metadata transaction
+        # while the broker advances its separate durable ledger connection.
+        with self._lock:
             self._db.execute(
                 "INSERT INTO pa_position_remediations VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (remediation_id, session["id"], symbol,
@@ -725,6 +749,7 @@ class PriceActionPaperAccount:
             "evaluations": evaluations,
             "position_remediations": remediations,
             "entry_control": self._runtime_control(),
+            "persistence": self.persistence_status(),
             "order_audit": self.audit_pending_orders(),
         }
 
@@ -1213,7 +1238,10 @@ class PriceActionPaperAccount:
         setups = {row["id"]: row for row in visual_state.get("setups", [])}
         reconciliation = self.reconcile_pending_orders(
             visual_state, candle, feed_reliable=feed_reliable)
-        with self._lock, self._db:
+        # The account connection is autocommit. Broker processing and order
+        # submission use a separate connection, so no metadata transaction may
+        # span either operation.
+        with self._lock:
             open_meta = [dict(row) for row in self._db.execute(
                 "SELECT * FROM pa_order_meta WHERE session_id=? AND status IN ('ORDER_PENDING','PARTIALLY_FILLED','ENTERED')",
                 (current["id"],))]
@@ -1303,6 +1331,13 @@ class PriceActionPaperAccount:
                     self._advance_evaluation(correlation, "RISK_REJECTED", attestation_error)
                     rejected.append({"proposal_id": proposal["id"],
                                      "reason": attestation_error})
+                elif self.persistence_status().get("state") == "PERSISTENCE_BLOCKED":
+                    reason = "PERSISTENCE_BLOCKED: immutable Price Action evidence is not durable"
+                    self._candidate(proposal, setup, contract_rules, "DATA_PAUSED",
+                                    reason, config, correlation_id=correlation,
+                                    idempotency_key=idempotency)
+                    self._advance_evaluation(correlation, "RISK_REJECTED", reason)
+                    rejected.append({"proposal_id": proposal["id"], "reason": reason})
                 elif not feed_reliable:
                     self._candidate(proposal, setup, contract_rules, "DATA_PAUSED",
                                     "new entry paused because market feed is unreliable", config,
@@ -1336,14 +1371,29 @@ class PriceActionPaperAccount:
                     self._advance_evaluation(correlation, "RISK_REJECTED", reason)
                     rejected.append({"proposal_id": proposal["id"], "reason": reason})
             self._snapshot_current(metrics=visual_state.get("metrics", {}))
-        captured = self.journal.capture(
-            visual_state=visual_state, session=self._decode_session(dict(current)),
-            paper_state=self.state(), feed_status=observed_health,
-            partition_label="paper_forward" if current.get("mode") == "LIVE_PAPER" else "development",
-        )
+        try:
+            captured = self.journal.capture(
+                visual_state=visual_state, session=self._decode_session(dict(current)),
+                paper_state=self.state(), feed_status=observed_health,
+                partition_label="paper_forward" if current.get("mode") == "LIVE_PAPER" else "development",
+            )
+            persistence = self._clear_persistence_blocker()
+        except PersistenceBlocked as exc:
+            # Journal evidence persistence is operationally blocked, but this
+            # is not a websocket failure. Preserve the stream and fail closed
+            # for entries until a later closed candle retries successfully.
+            captured = []
+            persistence = self._mark_persistence_blocked(exc)
+        except sqlite3.OperationalError as exc:
+            if not is_sqlite_busy(exc):
+                raise
+            captured = []
+            persistence = self._mark_persistence_blocked(
+                PersistenceBlocked("journal evidence snapshot", exc))
         return {"broker": result, "created": created, "rejected": rejected,
                 "reconciliation": reconciliation,
                 "journal_entries_captured": captured,
+                "journal_persistence": persistence,
                 "operating_mode": config.operating_mode, "feed_reliable": feed_reliable,
                 "real_execution_allowed": False}
 
@@ -1648,10 +1698,20 @@ class PriceActionLabRuntime:
                 (session.get("symbol"), session.get("timeframe")) == self.identity
             )
             if session_matches:
-                self.account.synchronize_strategy(state, contract_rules=rules, candle=bar,
-                                                  feed_reliable=bool(status["reliable"]),
-                                                  feed_status=status,
-                                                  execution_quote=quote)
+                try:
+                    self.account.synchronize_strategy(
+                        state, contract_rules=rules, candle=bar,
+                        feed_reliable=bool(status["reliable"]),
+                        feed_status=status, execution_quote=quote)
+                except PersistenceBlocked as exc:
+                    self.account._mark_persistence_blocked(exc)
+                    return
+                except sqlite3.OperationalError as exc:
+                    if not is_sqlite_busy(exc):
+                        raise
+                    self.account._mark_persistence_blocked(
+                        PersistenceBlocked("closed-candle persistence", exc))
+                    return
             else:
                 self.account.record_external_event({
                     "kind": "view_only_market_update", "symbol": self.identity[0],
@@ -1801,6 +1861,9 @@ class PriceActionLabRuntime:
         if control.get("readiness_recheck_required"):
             blockers.append(control.get("entry_pause_reason") or
                             "Price Action readiness recheck is required")
+        persistence = self.account.persistence_status()
+        if persistence.get("state") == "PERSISTENCE_BLOCKED":
+            blockers.insert(0, "PERSISTENCE_BLOCKED: immutable journal write is waiting for SQLite")
         blockers = list(dict.fromkeys(blockers))
         paper_rows = self.account.journal.list(
             session_id=session.get("id"), partition="paper_forward").get("entries", [])
@@ -1849,6 +1912,7 @@ class PriceActionLabRuntime:
             "last_heartbeat": connection.get("last_update") or session.get("updated_at"),
             "latest_activity": activity[0] if activity else None,
             "entry_control": control,
+            "persistence": persistence,
             "performance": {
                 "backtest": journal_performance("BACKTEST", development),
                 "forward_validation": journal_performance("FORWARD_VALIDATION", validation),
