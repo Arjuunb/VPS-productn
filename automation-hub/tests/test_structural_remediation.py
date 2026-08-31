@@ -52,6 +52,17 @@ def test_pipeline_rejection_has_stable_blocker_code():
     assert result.to_dict()["blocker"] == result.blocker
 
 
+def test_missing_mandatory_risk_engine_refuses_to_construct_pipeline(monkeypatch):
+    import services.signal_pipeline as module
+
+    ledger = SqliteLedger(":memory:")
+    paper = PaperExecutionEngine(ledger, 10_000)
+    monkeypatch.setattr(module, "_RiskEngine", None)
+
+    with pytest.raises(RuntimeError, match="mandatory risk veto"):
+        module.SignalPipeline(ledger, paper, TradingControl())
+
+
 def test_closed_candle_without_trade_returns_and_exposes_no_setup_blocker():
     ledger = SqliteLedger(":memory:")
     paper = PaperExecutionEngine(ledger, 10_000)

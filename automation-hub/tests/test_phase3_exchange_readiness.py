@@ -372,6 +372,19 @@ def test_readiness_reports_not_ready_without_keys(monkeypatch):
     assert names["testnet mode"]["blocking"] is False
 
 
+def test_readiness_never_serializes_exchange_secrets(monkeypatch):
+    import json
+
+    monkeypatch.setenv("HUB_EXCHANGE_API_KEY", "EXCHANGE_KEY_MUST_NOT_LEAK")
+    monkeypatch.setenv("HUB_EXCHANGE_API_SECRET", "EXCHANGE_SECRET_MUST_NOT_LEAK")
+    monkeypatch.setenv("HUB_ENABLE_EXTERNAL_LIVE", "0")
+
+    encoded = json.dumps(live_readiness(), sort_keys=True)
+
+    assert "EXCHANGE_KEY_MUST_NOT_LEAK" not in encoded
+    assert "EXCHANGE_SECRET_MUST_NOT_LEAK" not in encoded
+
+
 def test_readiness_endpoint(monkeypatch):
     pytest.importorskip("fastapi")
     from fastapi import FastAPI
