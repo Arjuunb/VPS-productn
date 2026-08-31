@@ -272,6 +272,17 @@ async def _require_auth(request: Request, call_next):
             if urlparse(origin).netloc != request.headers.get("host", ""):
                 from fastapi.responses import JSONResponse
                 return JSONResponse({"error": "Cross-site request rejected."}, status_code=403)
+    # Trading Instance mutations are execution-control operations, not ordinary
+    # authenticated account writes. Viewers can inspect state but never start,
+    # pause, stop, restart, configure, create or delete a worker.
+    if (path == "/instances" or path.startswith("/instances/")) \
+            and request.method in {"POST", "PUT", "PATCH", "DELETE"} \
+            and _user(request) and not _has_role(request, "operator"):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            {"error": "Operator role required for Trading Instance control."},
+            status_code=403,
+        )
     # --- rate limiting (brute-force protection) — before auth so failed attempts
     # count. The under-test check is evaluated per-REQUEST (PYTEST_CURRENT_TEST is
     # set during a test's execution, not necessarily at import), so the limiter is
