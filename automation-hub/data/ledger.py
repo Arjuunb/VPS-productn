@@ -794,17 +794,55 @@ class SupabaseLedger:
         }).execute()
 
 
+class ReadOnlyDegradedLedger(SqliteLedger):
+    """Non-authoritative diagnostic view used while the primary is unavailable.
+
+    The in-memory schema exists only so dashboard reads can return empty,
+    typed collections. Every mutation is rejected, making this categorically
+    different from the former silent writable SQLite fallback.
+    """
+    read_only_degraded = True
+
+    def __init__(self, reason: str):
+        self.degraded_reason = str(reason)
+        super().__init__(":memory:")
+
+    def _deny(self, *_args, **_kwargs):
+        raise RuntimeError(
+            "Primary ledger is unavailable; service is read-only/degraded and "
+            f"new entries are disabled. Cause: {self.degraded_reason}"
+        )
+
+    insert_webhook_event = _deny
+    open_position = _deny
+    open_position_and_trade = _deny
+    close_position = _deny
+    close_position_and_trade = _deny
+    reduce_position_and_trade = _deny
+    update_position_stop = _deny
+    update_position_management = _deny
+    record_paper_trade = _deny
+    close_paper_trade = _deny
+    log = _deny
+    add_alert = _deny
+    begin_factory_reset_audit = _deny
+    finish_factory_reset_audit = _deny
+    factory_reset_application_data = _deny
+
+
 # Honest Supabase health: get_ledger() records whether Supabase was configured
 # and whether it actually ANSWERED, so the UI reports real persistence instead
 # of trusting env vars alone — and a broken config never crashes the boot.
-SUPABASE_STATUS: dict = {"configured": False, "connected": False, "error": None}
+SUPABASE_STATUS: dict = {"configured": False, "connected": False, "error": None,
+                         "mode": "local"}
 
 
 def get_ledger(sqlite_path: str = ":memory:") -> Ledger:
     """Use the configured primary ledger; never silently create a second truth."""
     url, key = os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY")
     SUPABASE_STATUS.update({"configured": bool(url and key),
-                            "connected": False, "error": None})
+                            "connected": False, "error": None,
+                            "mode": "primary_connecting" if url and key else "local"})
     if bool(url) != bool(key):
         SUPABASE_STATUS["error"] = "SUPABASE_URL and SUPABASE_KEY must be configured together"
         raise RuntimeError(SUPABASE_STATUS["error"])
@@ -813,13 +851,10 @@ def get_ledger(sqlite_path: str = ":memory:") -> Ledger:
             led = SupabaseLedger(url, key)
             led.get_paper_trades()   # probe: fails fast on bad creds / missing schema
             SUPABASE_STATUS["connected"] = True
+            SUPABASE_STATUS["mode"] = "primary"
             return led
         except Exception as e:  # noqa: BLE001 — configured primary must fail closed
             SUPABASE_STATUS["error"] = f"{type(e).__name__}: {e}"
-            raise RuntimeError(
-                "Configured Supabase ledger is unavailable; execution is fail-closed. "
-                "Run automation-hub/data/ledger_schema.sql and "
-                "automation-hub/data/trading_instances_schema.sql, verify "
-                f"SUPABASE_URL/SUPABASE_KEY, then restart. Cause: {e}"
-            ) from e
+            SUPABASE_STATUS["mode"] = "read_only_degraded"
+            return ReadOnlyDegradedLedger(SUPABASE_STATUS["error"])
     return SqliteLedger(sqlite_path)

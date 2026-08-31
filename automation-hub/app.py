@@ -482,6 +482,11 @@ def _start_auto_engine() -> None:
     backend = type(webhook_api.ledger).__name__
     print(f"[startup] ledger backend = {backend} "
           f"(Supabase active: {backend == 'SupabaseLedger'})", flush=True)
+    from data.ledger import SUPABASE_STATUS
+    if SUPABASE_STATUS.get("configured") and not SUPABASE_STATUS.get("connected"):
+        print("[startup] all primary-ledger execution remains disabled: "
+              f"{SUPABASE_STATUS.get('error')}", flush=True)
+        return
     # Instance workers own their own strategy state, execution ledger scope and
     # desired lifecycle. Restore them first; when at least one is intentionally
     # active, do not also start the legacy multi-pair worker (which would create

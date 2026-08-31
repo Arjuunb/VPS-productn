@@ -427,6 +427,12 @@ class InstanceStore:
                 ensure_column(ledger._c, "instance_market_state", "last_blocker", "TEXT")
                 ensure_column(ledger._c, "instance_market_state", "last_blocker_timestamp", "TEXT")
                 ledger._c.commit()
+        if getattr(ledger, "read_only_degraded", False):
+            self.available = False
+            self.error = (
+                "Primary ledger unavailable; Trading Instances are read-only/degraded "
+                "and all mutations are disabled"
+            )
 
     def _table(self, name):
         return self.ledger._db.table(name)

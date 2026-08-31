@@ -153,8 +153,11 @@ def test_configured_supabase_failure_is_fail_closed(monkeypatch):
     for k, v in list(ledger_mod.SUPABASE_STATUS.items()):
         monkeypatch.setitem(ledger_mod.SUPABASE_STATUS, k, v)
 
-    with pytest.raises(RuntimeError, match="fail-closed"):
-        ledger_mod.get_ledger(":memory:")
+    degraded = ledger_mod.get_ledger(":memory:")
+    assert type(degraded).__name__ == "ReadOnlyDegradedLedger"
+    with pytest.raises(RuntimeError, match="read-only/degraded"):
+        degraded.open_position(symbol="BTCUSDT", side="long", size=1,
+                               entry=100, stop=90)
     assert ledger_mod.SUPABASE_STATUS["configured"] is True
     assert ledger_mod.SUPABASE_STATUS["connected"] is False
     assert "bad key" in ledger_mod.SUPABASE_STATUS["error"]
@@ -166,9 +169,25 @@ def test_configured_supabase_failure_is_fail_closed(monkeypatch):
             raise RuntimeError('relation "paper_trades" does not exist')
 
     monkeypatch.setattr(ledger_mod, "SupabaseLedger", ProbeFailLedger)
-    with pytest.raises(RuntimeError, match="fail-closed"):
-        ledger_mod.get_ledger(":memory:")
+    degraded_probe = ledger_mod.get_ledger(":memory:")
+    assert type(degraded_probe).__name__ == "ReadOnlyDegradedLedger"
+    with pytest.raises(RuntimeError, match="new entries are disabled"):
+        degraded_probe.insert_webhook_event(
+            alert_id="blocked", symbol="BTCUSDT", side="BUY",
+            entry=100, stop=90, payload={}, status="accepted")
     assert "does not exist" in ledger_mod.SUPABASE_STATUS["error"]
+    from services.trading_instances import TradingInstanceManager
+    manager = TradingInstanceManager(
+        degraded_probe, strategy_factory=lambda _key, _symbol: object(),
+        live=False, live_poll_s=60,
+    )
+    assert manager.store.available is False
+    with pytest.raises(RuntimeError, match="read-only/degraded"):
+        manager.create(
+            symbol="BTCUSDT", strategy_key="brain", strategy_label="Brain",
+            strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+            capital_allocation=1_000,
+        )
 
     # healthy Supabase is used and reported connected
     class HealthyLedger:
