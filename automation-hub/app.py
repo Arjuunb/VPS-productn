@@ -493,10 +493,30 @@ def _start_auto_engine() -> None:
 
 
 @app.on_event("shutdown")
-def _stop_price_action_stream() -> None:
-    """Close the public Price Action WebSocket and its worker thread cleanly."""
-    webhook_api.price_action_runtime.stop()
-    webhook_api.smc_runtime.stop()
+def _shutdown_all_runtimes() -> None:
+    """One process-wide shutdown boundary for every execution authority."""
+    errors = []
+
+    def run(name, operation):
+        try:
+            result = operation()
+            if isinstance(result, dict) and result.get("errors"):
+                errors.extend(f"{name}: {item}" for item in result["errors"])
+        except Exception as exc:  # shutdown continues so no sibling is leaked
+            errors.append(f"{name}: {type(exc).__name__}: {exc}")
+
+    # Close all entry gates before waiting on any worker. Protective closes are
+    # still classified as exposure-reducing and bypass these controls.
+    webhook_api.controls.stop_all()
+    run("trading_instances", webhook_api.instance_manager.shutdown)
+    run("autonomous_engine_checkpoint", webhook_api.engine.flush_runtime_state)
+    run("autonomous_engine", lambda: webhook_api.engine.stop("Process shutdown"))
+    run("legacy_bot_runners", manager.emergency_stop_all)
+    run("price_action_lab", webhook_api.price_action_runtime.stop)
+    run("smc_lab", webhook_api.smc_runtime.stop)
+    if errors:
+        print("[shutdown] completed with degraded acknowledgements: " + " | ".join(errors),
+              flush=True)
 
 # Phase 8: process-wide event hub for the live (SSE) dashboard.
 from dashboard.stream import HubEventHub, sse_format  # noqa: E402

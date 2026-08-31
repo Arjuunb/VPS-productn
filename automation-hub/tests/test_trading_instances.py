@@ -612,6 +612,39 @@ def test_pause_acknowledgement_failure_is_degraded_and_not_success(monkeypatch):
     assert instance.desired_running is False
 
 
+def test_shutdown_checkpoints_all_instances_and_preserves_restart_intent(monkeypatch):
+    from services.auto_engine import AutoStrategyEngine
+
+    ledger = SqliteLedger(":memory:")
+    manager = TradingInstanceManager(ledger, strategy_factory=_factory,
+                                     live=False, live_poll_s=60, max_slots=2,
+                                     paper_account_capital=5_000)
+    manager.max_slots = 2
+    instances = [manager.create(
+        symbol=symbol, strategy_key="brain", strategy_label="Decision Brain",
+        strategy_version="v1", timeframe="5m", risk_per_trade_pct=0.005,
+        capital_allocation=1_000,
+    ) for symbol in ("BTCUSDT", "ETHUSDT")]
+    monkeypatch.setattr(
+        AutoStrategyEngine, "start",
+        lambda self: (setattr(self, "running", True),
+                      setattr(self, "lifecycle_state", "running"), True)[-1],
+    )
+    for instance in instances:
+        manager.start(instance.id)
+        monkeypatch.setattr(
+            manager._runtime[instance.id][0], "acknowledge_entry_pause",
+            lambda timeout_s=5: {"pending_orders": 0, "acknowledged_at": "now"},
+        )
+
+    result = manager.shutdown(timeout_s=2)
+
+    assert result == {"requested": 2, "acknowledged": 2, "errors": []}
+    assert all(instance.desired_running is True for instance in instances)
+    assert all(not runtime[3].trading_allowed() for runtime in manager._runtime.values())
+    assert all(not runtime[0].running for runtime in manager._runtime.values())
+
+
 def test_resume_rebuilds_terminal_runtime_instead_of_labelling_dead_worker_running(monkeypatch):
     from services.auto_engine import AutoStrategyEngine
 

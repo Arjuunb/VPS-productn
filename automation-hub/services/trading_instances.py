@@ -1390,6 +1390,50 @@ class TradingInstanceManager:
                 ws_feed.stop()
         inst.state, inst.desired_running, inst.stopped_at = "stopped", False, _now(); self.store.save(inst); return inst
 
+    def shutdown(self, timeout_s: float = 15.0) -> dict:
+        """Quiesce every worker without erasing durable restart intent.
+
+        Entry gates close first, then each in-flight candle must acknowledge and
+        checkpoint. Worker/feed threads are joined only after that boundary.
+        """
+        deadline = time.monotonic() + max(1.0, float(timeout_s))
+        with self._lock:
+            runtimes = list(self._runtime.items())
+            reboot_threads = list(self._reboot_threads.values())
+        report = {"requested": len(runtimes), "acknowledged": 0, "errors": []}
+        for instance_id, (engine, _paper, _pipeline, controls) in runtimes:
+            controls.pause_all()
+            try:
+                remaining = max(0.01, deadline - time.monotonic())
+                checkpoint = engine.acknowledge_entry_pause(remaining)
+                report["acknowledged"] += 1
+                self.store.append_engine_log(
+                    instance_id, level="info",
+                    message=f"shutdown_checkpoint={checkpoint}")
+            except Exception as exc:
+                report["errors"].append(
+                    f"{instance_id}: checkpoint {type(exc).__name__}: {exc}")
+            # A process shutdown must not rewrite desired_running=False through
+            # the ordinary stopped lifecycle callback. Startup owns restoration.
+            engine._lifecycle_callback = None
+            try:
+                engine.stop("Process shutdown after entry-gate checkpoint")
+            except Exception as exc:
+                report["errors"].append(
+                    f"{instance_id}: engine stop {type(exc).__name__}: {exc}")
+            feed = getattr(engine, "ws_feed", None)
+            if feed is not None:
+                try:
+                    feed.stop()
+                except Exception as exc:
+                    report["errors"].append(
+                        f"{instance_id}: feed stop {type(exc).__name__}: {exc}")
+        for thread in reboot_threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
+                report["errors"].append("full reboot worker did not stop before shutdown timeout")
+        return report
+
     def restart(self, instance_id: str) -> TradingInstance:
         """Begin a genuine staged Full Bot Reboot and return immediately."""
         self.request_full_reboot(instance_id)
