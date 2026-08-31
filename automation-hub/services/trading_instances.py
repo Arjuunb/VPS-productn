@@ -2330,6 +2330,25 @@ class TradingInstanceManager:
                 last_decision = rows[0] if rows else None
             except Exception:  # noqa: BLE001 -- observability must not stop a worker
                 last_decision = None
+        strategy_health = metrics.get("strategy_health") or {}
+        health_status = str(strategy_health.get("status") or "").lower()
+        market_status = str(market.get("market_data_status") or "").lower()
+        last_blocker = ((engine or {}).get("last_blocker") or market.get("last_blocker"))
+        worker_strategy = str((engine or {}).get("strategy") or "")
+        strategy_matches = not worker_strategy or worker_strategy == inst.strategy_label
+        controls_armed = bool(runtime and runtime[3].trading_allowed())
+        if state in ("error", "degraded") or not strategy_matches:
+            ui_status = "ERROR"
+        elif (state in ("paused", "stopped", "created", "data_stale", "recovering", "rebooting")
+              or market_status in ("stale", "disconnected", "error")
+              or health_status == "unhealthy"):
+            ui_status = "BLOCKED"
+        elif state in ("starting", "bootstrapping", "warming", "syncing", "ready"):
+            ui_status = "RUNNING_UNARMED"
+        elif state == "running" and controls_armed:
+            ui_status = "RUNNING_ARMED"
+        else:
+            ui_status = "RUNNING_UNARMED"
         configuration = {
             "symbol": inst.symbol, "strategy": inst.strategy_label,
             "strategy_key": inst.strategy_key, "strategy_version": inst.strategy_version,
@@ -2362,12 +2381,23 @@ class TradingInstanceManager:
                 },
                 "performance": {**metrics, "net_pnl": execution.get("realized_pnl"),
                                 "return_pct": execution.get("return_pct")},
-                "strategy_health": metrics.get("strategy_health"),
+                "strategy_health": strategy_health,
                 "last_decision": last_decision,
-                "last_blocker": ((engine or {}).get("last_blocker")
-                                 or market.get("last_blocker")),
+                "last_blocker": last_blocker,
                 "last_blocker_timestamp": ((engine or {}).get("last_blocker_timestamp")
                                            or market.get("last_blocker_timestamp")),
+                "ui_status": ui_status,
+                "worker_counts": {
+                    "signals": int((engine or {}).get("signals") or 0),
+                    "accepted": int((engine or {}).get("accepted_signals") or 0),
+                    "rejections": int((engine or {}).get("rejections") or 0),
+                },
+                "strategy_identity": {
+                    "configured_id": inst.strategy_key,
+                    "configured_label": inst.strategy_label,
+                    "worker_label": worker_strategy or None,
+                    "matches": strategy_matches,
+                },
                 "metrics": metrics,
                 "reboot": reboot}
 

@@ -81,6 +81,23 @@ def test_decision_reason_is_saved_and_listable():
     # executed flag flips after the pipeline actually opens the trade
     st.mark_executed(did)
     assert st.get(did)["executed"] is True
+    assert st.get(did)["final_state"] == "FILLED"
+
+
+def test_qualified_decision_records_downstream_gate_rejection():
+    st = DecisionStore(":memory:")
+    did = st.record(_decision())
+    st.finalize(
+        did, final_state="GATE_REJECTED", gate_stage="correlation",
+        reason="BTC correlation cap exceeded",
+        blocker="GATE_REJECTED: CORRELATION_LIMIT",
+    )
+    saved = st.get(did)
+    assert saved["decision"] == "accepted"  # immutable strategy verdict
+    assert saved["final_state"] == "GATE_REJECTED"
+    assert saved["gate_stage"] == "correlation"
+    assert saved["blocker"] == "GATE_REJECTED: CORRELATION_LIMIT"
+    assert saved["executed"] is False
 
 
 def test_store_survives_restart(tmp_path):

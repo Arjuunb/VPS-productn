@@ -1223,6 +1223,12 @@ class AutoStrategyEngine:
             if po["ttl"] <= 0:
                 self._pending.pop(sym, None)
                 self.stats_missed_entries += 1
+                self.stats["rejections"] += 1
+                self.rejection_counts["limit"] = self.rejection_counts.get("limit", 0) + 1
+                self._finalize_decision(
+                    po.get("decision_id"), final_state="GATE_REJECTED", stage="limit",
+                    reason="Limit entry expired unfilled",
+                    blocker="GATE_REJECTED: LIMIT_EXPIRED")
                 self.ledger.log(level="info", stage="engine", symbol=sym,
                                 message=f"{sym}: limit entry expired unfilled @ {po['price']}")
                 # grade the miss: did the trade we refused to chase work out?
@@ -1246,6 +1252,7 @@ class AutoStrategyEngine:
             return False
         f = res.fill or {}
         if res.accepted and f.get("action") == "opened":
+            self.stats["accepted_signals"] += 1
             if po.get("decision_id") is not None and self.decisions is not None:
                 try:
                     self.decisions.mark_executed(po["decision_id"])
@@ -1263,6 +1270,11 @@ class AutoStrategyEngine:
             return True
         elif not res.accepted:
             self.stats["rejections"] += 1
+            stage = str(res.stage or "unknown")
+            self.rejection_counts[stage] = self.rejection_counts.get(stage, 0) + 1
+            self._finalize_decision(
+                po.get("decision_id"), final_state="GATE_REJECTED", stage=stage,
+                reason=res.reason, blocker=res.blocker or gate_blocker(res.stage, res.reason))
         return False
 
     @staticmethod
@@ -1575,6 +1587,9 @@ class AutoStrategyEngine:
             self.stats["rejections"] += 1
             self.rejection_counts["quality"] = self.rejection_counts.get("quality", 0) + 1
             why = decision["reason"]
+            self._finalize_decision(decision_id, final_state="GATE_REJECTED",
+                                    stage="brain", reason=why,
+                                    blocker=gate_blocker("brain", why))
             self.ledger.log(level="info", stage="brain", symbol=sym,
                             message=f"{sym} {side} blocked by decision gate: {why}")
             self._record_skipped_decision(
@@ -1599,6 +1614,9 @@ class AutoStrategyEngine:
         if ctx_why and pos is None:
             self.stats["rejections"] += 1
             self.rejection_counts["context"] = self.rejection_counts.get("context", 0) + 1
+            self._finalize_decision(decision_id, final_state="GATE_REJECTED",
+                                    stage="context", reason=ctx_why,
+                                    blocker=gate_blocker("context", ctx_why))
             self.ledger.log(level="info", stage="context", symbol=sym,
                             message=f"{sym} {side} blocked: {ctx_why}")
             self._record_skipped_decision(
@@ -1669,6 +1687,13 @@ class AutoStrategyEngine:
                 return {"kind": "queued", "idea": None, "duplicate": True}
             idea = self.approvals.create(payload, decision=decision, verdict=v,
                                          mode=self.trading_mode)
+            terminal = "APPROVAL_REQUIRED" if self.trading_mode == "semi" else "SIGNALS_ONLY"
+            self._finalize_decision(
+                decision_id, final_state=terminal, stage="operating_mode",
+                reason=("Waiting for explicit operator approval" if self.trading_mode == "semi"
+                        else "Signals-only mode does not create orders"),
+                blocker=("GATE_REJECTED: APPROVAL_REQUIRED" if self.trading_mode == "semi"
+                         else "GATE_REJECTED: SIGNALS_ONLY"))
             self.ledger.log(
                 level="info", stage="approval", symbol=sym,
                 message=(f"{sym} {side} setup "
@@ -1684,6 +1709,10 @@ class AutoStrategyEngine:
             # explainable, but keep both durable and in-memory order books
             # unchanged until an operator/health check reopens execution.
             result = self._route(payload)
+            self._finalize_decision(
+                decision_id, final_state="GATE_REJECTED", stage="controls",
+                reason=getattr(result, "reason", "Trading paused — entry blocked"),
+                blocker=getattr(result, "blocker", "GATE_REJECTED: PAUSED"))
             return {"kind": "rejected", "stage": "controls",
                     "reason": getattr(result, "reason", "Trading paused — entry blocked"),
                     "blocker": getattr(result, "blocker", "GATE_REJECTED: PAUSED"),
@@ -1694,10 +1723,17 @@ class AutoStrategyEngine:
                                   "ttl": self.limit_ttl_bars, "payload": payload,
                                   "decision_id": decision_id}
             self._checkpoint_pending_orders()
+            self._finalize_decision(
+                decision_id, final_state="PENDING_INTENT", stage="limit",
+                reason=f"Resting limit awaiting fill for at most {self.limit_ttl_bars} closed candles",
+                blocker="GATE_REJECTED: ORDER_PENDING")
             return {"kind": "pending", "blocker": "GATE_REJECTED: ORDER_PENDING",
                     "decision": decision, "verdict": v}
         res = self._route(payload)
         if res is None:
+            self._finalize_decision(decision_id, final_state="GATE_REJECTED",
+                                    stage="pipeline", reason="pipeline error (see engine log)",
+                                    blocker="GATE_REJECTED: PIPELINE_ERROR")
             return {"kind": "error", "reason": "pipeline error (see engine log)"}
         fill = res.fill or {}
         if res.accepted and fill.get("action") == "opened":
@@ -1727,10 +1763,26 @@ class AutoStrategyEngine:
             self.stats["rejections"] += 1
             stage = str(res.stage or "unknown")
             self.rejection_counts[stage] = self.rejection_counts.get(stage, 0) + 1
+            self._finalize_decision(
+                decision_id, final_state="GATE_REJECTED", stage=stage,
+                reason=res.reason, blocker=res.blocker or gate_blocker(res.stage, res.reason))
             return {"kind": "rejected", "stage": res.stage, "reason": res.reason,
                     "blocker": res.blocker or gate_blocker(res.stage, res.reason),
                     "decision": decision, "verdict": v}
         return {"kind": "noop", "decision": decision, "verdict": v}
+
+    def _finalize_decision(self, decision_id: int | None, *, final_state: str,
+                           stage: str, reason: str, blocker: str = "") -> None:
+        if decision_id is None or self.decisions is None:
+            return
+        try:
+            self.decisions.finalize(
+                decision_id, final_state=final_state, gate_stage=stage,
+                reason=reason, blocker=blocker)
+        except Exception as exc:  # noqa: BLE001 -- telemetry cannot change execution
+            self.ledger.log(
+                level="warning", stage="decision_store",
+                message=f"Could not finalize decision {decision_id}: {type(exc).__name__}: {exc}")
 
     def _record_skipped_decision(self, *, sym: str, side: str, signal,
                                  stage: str, reason: str,

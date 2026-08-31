@@ -42,9 +42,12 @@ class DecisionStore:
                    confidence REAL,
                    passed_json TEXT,
                    failed_json TEXT,
-                   decision TEXT NOT NULL,      -- accepted | rejected
+                   decision TEXT NOT NULL,      -- immutable strategy-quality verdict
                    reason TEXT,
                    executed INTEGER NOT NULL DEFAULT 0,
+                   final_state TEXT NOT NULL DEFAULT '',
+                   gate_stage TEXT NOT NULL DEFAULT '',
+                   blocker TEXT NOT NULL DEFAULT '',
                    components_json TEXT,
                    instance_id TEXT NOT NULL DEFAULT '',
                    decision_identity TEXT NOT NULL DEFAULT ''
@@ -53,6 +56,15 @@ class DecisionStore:
         self._c.execute("CREATE INDEX IF NOT EXISTS ix_decisions_decision ON decisions(decision)")
         ensure_column(self._c, "decisions", "instance_id", "TEXT NOT NULL DEFAULT ''")
         ensure_column(self._c, "decisions", "decision_identity", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(self._c, "decisions", "final_state", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(self._c, "decisions", "gate_stage", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(self._c, "decisions", "blocker", "TEXT NOT NULL DEFAULT ''")
+        self._c.execute(
+            "UPDATE decisions SET final_state=CASE "
+            "WHEN executed=1 THEN 'FILLED' "
+            "WHEN decision='rejected' THEN 'GATE_REJECTED' "
+            "ELSE 'QUALIFIED' END WHERE final_state=''"
+        )
         self._c.execute("CREATE INDEX IF NOT EXISTS ix_decisions_instance_ts ON decisions(instance_id, ts)")
         self._c.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS ux_decisions_identity "
@@ -67,8 +79,9 @@ class DecisionStore:
                    (ts, symbol, timeframe, strategy, side, regime, htf_bias,
                     setup_quality_score, volume_score, rr_score, confidence,
                     passed_json, failed_json, decision, reason, executed,
+                    final_state, gate_stage, blocker,
                     components_json, instance_id, decision_identity)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(decision_identity) WHERE decision_identity <> '' DO NOTHING""",
                 (d.get("ts") or _utcnow(), d["symbol"], d.get("timeframe"),
                  d.get("strategy"), d.get("side"), d.get("regime"),
@@ -79,6 +92,8 @@ class DecisionStore:
                  json.dumps(d.get("failed_rules") or []),
                  d["decision"], d.get("reason"),
                  1 if d.get("executed") else 0,
+                 d.get("final_state") or ("GATE_REJECTED" if d["decision"] == "rejected" else "QUALIFIED"),
+                 d.get("gate_stage") or "", d.get("blocker") or "",
                  json.dumps(d.get("components") or {}), d.get("instance_id") or "",
                  d.get("decision_identity") or ""))
             if cur.rowcount == 0 and d.get("decision_identity"):
@@ -93,7 +108,23 @@ class DecisionStore:
 
     def mark_executed(self, decision_id: int) -> None:
         with self._lock:
-            self._c.execute("UPDATE decisions SET executed=1 WHERE id=?", (decision_id,))
+            self._c.execute(
+                "UPDATE decisions SET executed=1, final_state='FILLED', "
+                "gate_stage='execution', blocker='' WHERE id=?", (decision_id,))
+            self._c.commit()
+
+    def finalize(self, decision_id: int, *, final_state: str, gate_stage: str,
+                 reason: str, blocker: str = "") -> None:
+        """Persist the downstream terminal state without rewriting quality."""
+        state = str(final_state or "").strip().upper()
+        if state not in {"QUALIFIED", "PENDING_INTENT", "SIGNALS_ONLY",
+                         "APPROVAL_REQUIRED", "FILLED", "GATE_REJECTED"}:
+            raise ValueError(f"unsupported decision final_state: {final_state}")
+        with self._lock:
+            self._c.execute(
+                "UPDATE decisions SET final_state=?, gate_stage=?, reason=?, blocker=? WHERE id=?",
+                (state, str(gate_stage or ""), str(reason or ""),
+                 str(blocker or ""), int(decision_id)))
             self._c.commit()
 
     def _row(self, r: sqlite3.Row) -> dict:

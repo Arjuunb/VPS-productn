@@ -12,10 +12,16 @@ function PreBuilt() {
   const app = useApp();
   const list = useLive<StrategyList>("/strategy/list", 5000);
   const perf = useLive<StrategyPerformance>("/strategy/performance", 4000);
+  const instances = useLive<any>("/instances", 4000);
   const active = list.data?.active;
+  const runningInstances = (instances.data?.instances ?? []).filter((row: any) => row.state !== "stopped" && row.state !== "created");
   const [busy, setBusy] = useState<string | null>(null);
 
   const activate = async (key: string, label: string) => {
+    if (runningInstances.length) {
+      app.toast("Strategy Studio cannot replace the global engine while Trading Instances are active. Change the selected instance strategy instead.", "error");
+      return;
+    }
     setBusy(key);
     try {
       const r = await apiPostJson<any>("/strategy/select", { strategy: key });
@@ -47,8 +53,8 @@ function PreBuilt() {
                   <td style={{ textAlign: "right" }}>
                     {s.key === active
                       ? <span className="dim" style={{ fontSize: 12 }}><Icon name="check" size={13} /> in use</span>
-                      : <button className="btn btn-soft sm" disabled={busy !== null} onClick={() => activate(s.key, s.label)}>
-                          {busy === s.key ? "Activating…" : "Activate"}
+                      : <button className="btn btn-soft sm" disabled={busy !== null || runningInstances.length > 0} onClick={() => activate(s.key, s.label)}>
+                          {runningInstances.length ? "Instance-managed" : busy === s.key ? "Activating…" : "Activate global engine"}
                         </button>}
                   </td>
                 </tr>
@@ -57,9 +63,9 @@ function PreBuilt() {
           </table>
         </div>
         <p className="dim" style={{ marginTop: 8 }}>
-          Click <b>Activate</b> to switch the live engine to that strategy (paper mode) — the choice is
-          saved and every symbol starts trading it. Validated reference (BTC/ETH 4h, walk-forward,
-          fees+slippage): trend strategies profit factor ~1.2 out-of-sample.
+          This selector controls only the legacy global paper engine. When a Trading Instance is active,
+          its strategy identity is isolated and can be changed only from that instance or the header after
+          selecting the same instance. The global selector is disabled to prevent a silent authority swap.
         </p>
       </div>
 

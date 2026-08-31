@@ -198,6 +198,10 @@ def test_instance_status_exposes_only_its_scoped_last_decision_and_real_aggregat
     decisions.record({"symbol": "ETHUSDT", "decision": "rejected", "instance_id": "other"})
     status = manager.status(instance.id)
     assert status["last_decision"]["instance_id"] == instance.id
+    assert status["last_decision"]["final_state"] == "QUALIFIED"
+    assert status["ui_status"] == "BLOCKED"
+    assert status["worker_counts"] == {"signals": 0, "accepted": 0, "rejections": 0}
+    assert status["strategy_identity"]["configured_id"] == "brain"
     assert status["configuration"]["capital_allocation"] == 1_000
     assert status["execution"]["current_equity"] == 1_000
     assert status["market_data"]["market_data_status"] == "stopped"

@@ -7,6 +7,7 @@ type StrategyOption = { key: string; label: string; versions: string[] };
 type Instance = {
   id: string; symbol: string; strategy_key: string; strategy_label: string; strategy_version: string;
   timeframe: string; state: string; mode: "trading" | "research"; last_error?: string;
+  ui_status?: "RUNNING_UNARMED" | "RUNNING_ARMED" | "BLOCKED" | "ERROR";
   risk_per_trade_pct: number; capital_allocation: number; max_open_positions?: number;
   sizing_mode?: string; entry_mode?: string; fill_model?: string;
   current_position?: unknown;
@@ -134,8 +135,8 @@ export default function HeaderControls() {
   const market = selected?.market_data?.market_data_status ?? "not available";
   const riskBlocked = Boolean(live.data?.global_risk_status && live.data.global_risk_status !== "healthy");
   const dataDegraded = ["error", "disconnected", "stale"].includes(market);
-  const engineState = !selected ? "stopped" : riskBlocked ? "risk blocked" : dataDegraded && selected.state === "running" ? "degraded" : selected.state;
-  const stateDot = engineState === "running" || engineState === "ready" ? "online" : ["paused", "starting", "bootstrapping", "warming", "syncing", "recovering", "data_stale"].includes(engineState) ? "warn" : "offline";
+  const engineState = !selected ? "BLOCKED" : riskBlocked || dataDegraded ? "BLOCKED" : selected.ui_status ?? "BLOCKED";
+  const stateDot = engineState === "RUNNING_ARMED" ? "online" : engineState === "ERROR" ? "offline" : "warn";
   const modeLabel = selected?.mode === "research" ? "RESEARCH" : "PAPER";
   const independentLabPage = /#\/(price-action-lab|smc-strategy-lab)(?:\?|$)/.test(window.location.hash);
   const strategyVersion = selected ? `${selected.strategy_label} ${selected.strategy_version}` : "Strategy";

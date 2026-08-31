@@ -14,6 +14,8 @@ type Position = {
 type Instance = {
   id: string; symbol: string; strategy_label: string; strategy_version: string;
   timeframe: string; risk_per_trade_pct: number; state: string; mode: string;
+  ui_status?: "RUNNING_UNARMED" | "RUNNING_ARMED" | "BLOCKED" | "ERROR";
+  last_blocker?: string;
   last_error?: string; current_position?: Position | null; metrics: Metrics;
   engine?: { last_heartbeat?: string | null; lifecycle_state?: string } | null;
 };
@@ -29,21 +31,16 @@ const money = (value?: number | null) => `${(value ?? 0) >= 0 ? "+" : "-"}$${Mat
 const price = (value?: number | null) => value == null ? "—" : `$${value.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
 
 function displayState(instance: Instance): string {
-  if (instance.state === "paused") return "Paused";
-  if (instance.state === "error") return "Error";
-  if (instance.state === "recovering") return "Recovering";
-  if (instance.state === "data_stale") return "Data stale";
-  if (["starting", "bootstrapping", "warming", "syncing", "ready"].includes(instance.state)) return instance.state.replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
-  if (instance.state === "stopped") return "Stopped";
-  if (instance.current_position) return "Position open";
-  return "Waiting for setup";
+  return instance.ui_status ?? "BLOCKED";
 }
 
 function health(instance: Instance): string {
-  if (instance.state === "paused") return "Paused";
+  if (instance.ui_status === "ERROR") return "Error";
+  if (instance.ui_status === "BLOCKED") return "Blocked";
+  if (instance.ui_status === "RUNNING_UNARMED") return "Unarmed";
   if ((instance.metrics?.trades ?? 0) < 8) return "Insufficient data";
   const status = instance.metrics?.strategy_health?.status;
-  return status === "Degrading" || status === "Unhealthy" ? "Degraded" : "Healthy";
+  return status === "Degrading" || status === "Unhealthy" ? "Unhealthy" : "Healthy";
 }
 
 function InstanceCard({ instance, onPause }: { instance: Instance; onPause: (id: string) => void }) {
@@ -61,7 +58,7 @@ function InstanceCard({ instance, onPause }: { instance: Instance; onPause: (id:
       onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") app.viewInstance(instance.id); }}>
       <div className="instance-summary-head">
         <div><b>{instance.symbol}</b><span>{instance.strategy_label} · {instance.strategy_version}</span></div>
-        <Badge text={status} tone={status === "Error" ? "red" : status === "Paused" || status === "Reconnecting" ? "amber" : "green"} />
+        <Badge text={status} tone={status === "ERROR" ? "red" : status === "RUNNING_ARMED" ? "green" : "amber"} />
       </div>
       <div className="instance-summary-meta">{instance.timeframe} · Risk {(instance.risk_per_trade_pct * 100).toFixed(2)}% · {instance.mode}</div>
       <div className="instance-summary-stats">
@@ -76,9 +73,9 @@ function InstanceCard({ instance, onPause }: { instance: Instance; onPause: (id:
           <span>Entry {price(pos.entry)} · P&amp;L <b className={(pos.unrealized_pnl ?? 0) >= 0 ? "pos" : "neg"}>{pos.unrealized_pnl == null ? "Awaiting mark" : money(pos.unrealized_pnl)}</b></span>
           <span>TP {price(pos.target)} · SL {price(pos.stop)}</span>
         </div>
-      ) : <div className="instance-wait">{error || "Waiting for Setup"}</div>}
+      ) : <div className="instance-wait">{error || instance.last_blocker || "Waiting for setup"}</div>}
       <div className="instance-summary-foot">
-        <span>Health <b className={h === "Healthy" ? "pos" : h === "Degraded" ? "neg" : "amber"}>{h}</b> · PF {instance.metrics?.profit_factor ?? 0} · Drift {drift}</span>
+        <span>Health <b className={h === "Healthy" ? "pos" : h === "Unhealthy" || h === "Error" ? "neg" : "amber"}>{h}</b> · PF {instance.metrics?.profit_factor ?? 0} · Drift {drift}</span>
         <span>{instance.engine?.last_heartbeat ? `Heartbeat ${new Date(instance.engine.last_heartbeat).toLocaleTimeString()}` : "No heartbeat yet"}</span>
         <div><button className="btn btn-soft btn-sm" onClick={(event) => { event.stopPropagation(); app.viewInstance(instance.id); }}>View Instance</button>{instance.state === "running" && <button className="btn btn-warn btn-sm" onClick={(event) => { event.stopPropagation(); onPause(instance.id); }}>Pause</button>}</div>
       </div>
