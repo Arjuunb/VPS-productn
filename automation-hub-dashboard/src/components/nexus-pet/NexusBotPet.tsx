@@ -9,6 +9,7 @@ import "./NexusPet.css";
 type Interaction = "idle" | "hover" | "click";
 
 const PET_STORAGE_KEY = "tradelogx:nexus-pet:v1";
+const SPRIG_SPRITE_URL = `${import.meta.env.BASE_URL}nexus-pet-concepts/sprig-production-poses-v3.png`;
 const PET_IDS = new Set<NexusPetId>(NEXUS_PETS.map((pet) => pet.id));
 const PET_SIZES = new Set<NexusPetSize>(["small", "medium", "large"]);
 const DEFAULT_APPEARANCE: NexusPetAppearance = { pet: "sprig", size: "medium" };
@@ -50,6 +51,7 @@ export default function NexusBotPet() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [interaction, setInteraction] = useState<Interaction>("idle");
   const [appearance, setAppearance] = useState<NexusPetAppearance>(loadAppearance);
+  const [spriteLoaded, setSpriteLoaded] = useState(false);
 
   const petName = NEXUS_PETS.find((pet) => pet.id === appearance.pet)?.name ?? "Sprig";
 
@@ -167,7 +169,7 @@ export default function NexusBotPet() {
   };
 
   return (
-    <div ref={rootRef} className="nexus-pet-root" data-state={model.state} data-interaction={interaction} data-pet={appearance.pet} data-size={appearance.size}>
+    <div ref={rootRef} className="nexus-pet-root" data-state={model.state} data-interaction={interaction} data-pet={appearance.pet} data-size={appearance.size} data-sprite-loaded={appearance.pet === "sprig" && spriteLoaded}>
       {open && <NexusPetPopover model={model} onClose={() => setOpen(false)} onOpenSettings={openSettings} />}
       {settingsOpen && <NexusPetSettings appearance={appearance} onChange={updateAppearance} onClose={() => setSettingsOpen(false)} />}
       <button
@@ -183,10 +185,19 @@ export default function NexusBotPet() {
         onPointerLeave={settle}
       >
         <span className="nexus-pet-stage" aria-hidden="true">
-          {appearance.pet === "sprig" ? (
-            <span className="nexus-pet-production-sprite" />
-          ) : (
-            <svg viewBox="0 0 64 74" role="presentation" focusable="false">
+          {appearance.pet === "sprig" && (
+            <span className="nexus-pet-production-sprite">
+              <img
+                className="nexus-pet-production-image"
+                src={SPRIG_SPRITE_URL}
+                alt=""
+                draggable={false}
+                onLoad={() => setSpriteLoaded(true)}
+                onError={() => setSpriteLoaded(false)}
+              />
+            </span>
+          )}
+          <svg className="nexus-pet-vector-fallback" viewBox="0 0 64 74" role="presentation" focusable="false">
             <ellipse className="nexus-pet-floor" cx="32" cy="69" rx="20" ry="3.5" />
             <g className="nexus-pet-avatar">
               <g className="nexus-pet-body">
@@ -235,8 +246,7 @@ export default function NexusBotPet() {
                 <circle cx="31" cy="58" r="2.2" />
               </g>
             </g>
-            </svg>
-          )}
+          </svg>
         </span>
       </button>
     </div>
