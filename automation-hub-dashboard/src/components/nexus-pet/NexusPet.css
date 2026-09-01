@@ -11,7 +11,7 @@
   --pet-accent: #c99a3d;
   --pet-shell: #15181e;
   --pet-face: #090b0e;
-  --pet-pose-x: 0%;
+  --pet-pose-shift: 0%;
   --pet-button-width: 48px;
   --pet-button-height: 54px;
   position: absolute;
@@ -68,6 +68,7 @@
 }
 
 .nexus-pet-stage {
+  position: relative;
   display: block;
   width: 100%;
   height: 100%;
@@ -77,14 +78,22 @@
 
 .nexus-pet-stage svg { width: 100%; height: 100%; overflow: visible; }
 .nexus-pet-production-sprite {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
   display: block;
-  width: 100%;
+  overflow: hidden;
+}
+.nexus-pet-production-image {
+  display: block;
+  width: 400%;
+  max-width: none;
   height: 100%;
-  background-image: url('/nexus-pet-concepts/sprig-production-poses-v3.png');
-  background-repeat: no-repeat;
-  background-position: var(--pet-pose-x) center;
-  background-size: 400% 100%;
-  filter: drop-shadow(0 6px 8px rgba(0, 0, 0, .62));
+  transform: translateX(var(--pet-pose-shift));
+  transform-origin: left center;
+}
+.nexus-pet-root[data-pet="sprig"][data-sprite-loaded="true"] .nexus-pet-vector-fallback {
+  visibility: hidden;
 }
 .nexus-pet-floor { fill: var(--pet-state-color); opacity: .22; filter: blur(2px); transform-box: fill-box; transform-origin: center; transform: scaleX(var(--pet-glow-scale)); transition: transform .25s ease, opacity .25s ease; animation: nexus-pet-glow 3.2s ease-in-out infinite; }
 .nexus-pet-avatar { transform-box: fill-box; transform-origin: center bottom; transform: translateX(var(--pet-body-x)) rotate(var(--pet-body-turn)); transition: transform .24s cubic-bezier(.2,.8,.2,1); }
@@ -125,11 +134,11 @@
 /* Proximity is written directly to this root by requestAnimationFrame. It
    never enters React state, so a moving cursor cannot rerender the dashboard. */
 .nexus-pet-root[data-near="true"] .nexus-pet-floor { opacity: .3; }
-.nexus-pet-root[data-pet="sprig"][data-near="true"] { --pet-pose-x: 33.333%; }
-.nexus-pet-root[data-pet="sprig"][data-hovered="true"] { --pet-pose-x: 66.667%; }
+.nexus-pet-root[data-pet="sprig"][data-near="true"] { --pet-pose-shift: -25%; }
+.nexus-pet-root[data-pet="sprig"][data-hovered="true"] { --pet-pose-shift: -50%; }
 .nexus-pet-root[data-pet="sprig"][data-state="warning"],
 .nexus-pet-root[data-pet="sprig"][data-state="trade-loss"],
-.nexus-pet-root[data-pet="sprig"][data-state="error"] { --pet-pose-x: 100%; }
+.nexus-pet-root[data-pet="sprig"][data-state="error"] { --pet-pose-shift: -75%; }
 .nexus-pet-root[data-near="true"] .nexus-pet-eyes rect { filter: drop-shadow(0 0 4px var(--pet-state-color)); }
 .nexus-pet-root[data-near="true"] .nexus-pet-laptop { opacity: .72; transform: translateX(-1px) scale(.98); }
 .nexus-pet-root[data-near="true"] .nexus-pet-typing-hands,
@@ -148,6 +157,7 @@
 .nexus-pet-root[data-state="offline"] .nexus-pet-laptop { opacity: .35; }
 .nexus-pet-root[data-state="offline"] .nexus-pet-laptop-chart,
 .nexus-pet-root[data-state="offline"] .nexus-pet-typing-hands { animation: none; opacity: .25; }
+.nexus-pet-root[data-pet="sprig"][data-state="offline"] .nexus-pet-stage { filter: saturate(.55); opacity: .9; }
 .nexus-pet-root[data-state="paused"] .nexus-pet-stage { animation-duration: 8s; }
 .nexus-pet-root[data-state="paused"] .nexus-pet-eyes { animation: none; transform: scaleY(.45); }
 .nexus-pet-root[data-state="analysing"] .nexus-pet-eyes { animation: nexus-pet-scan 1.8s ease-in-out 2; }

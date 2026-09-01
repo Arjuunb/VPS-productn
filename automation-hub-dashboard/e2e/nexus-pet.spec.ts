@@ -32,11 +32,14 @@ test("Nexus pet migrates legacy choices and exposes the premium companion roster
 
   const sprig = page.getByRole("button", { name: /Sprig, Nexus pet:/ });
   const productionSprite = sprig.locator(".nexus-pet-production-sprite");
+  const productionImage = productionSprite.locator("img");
   await expect(productionSprite).toBeVisible();
-  await expect(productionSprite).toHaveCSS(
-    "background-image",
-    /sprig-production-poses-v3\.png/,
+  await expect(productionImage).toHaveAttribute(
+    "src",
+    /nexus-pet-concepts\/sprig-production-poses-v3\.png$/,
   );
+  await expect.poll(() => productionImage.evaluate((image: HTMLImageElement) => image.complete && image.naturalWidth)).toBe(2172);
+  await expect(sprig.locator("xpath=ancestor::div[contains(@class, 'nexus-pet-root')]")).toHaveAttribute("data-sprite-loaded", "true");
   await sprig.hover();
   await expect(sprig.locator("xpath=ancestor::div[contains(@class, 'nexus-pet-root')]")).toHaveAttribute("data-hovered", "true");
 
