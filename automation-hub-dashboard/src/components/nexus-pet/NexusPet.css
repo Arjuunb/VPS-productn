@@ -11,6 +11,7 @@
   --pet-accent: #c99a3d;
   --pet-shell: #15181e;
   --pet-face: #090b0e;
+  --pet-pose-x: 0%;
   --pet-button-width: 48px;
   --pet-button-height: 54px;
   position: absolute;
@@ -25,7 +26,9 @@
 .nexus-pet-root[data-size="small"] { --pet-button-width: 39px; --pet-button-height: 44px; width: 45px; height: 48px; }
 .nexus-pet-root[data-size="large"] { --pet-button-width: 58px; --pet-button-height: 65px; width: 64px; height: 69px; }
 
-.nexus-pet-root[data-pet="sprig"] { --pet-accent: #c99a3d; --pet-shell: #15181e; --pet-face: #090b0e; }
+.nexus-pet-root[data-pet="sprig"] { --pet-accent: #c99a3d; --pet-shell: #15181e; --pet-face: #090b0e; --pet-button-width: 72px; --pet-button-height: 96px; width: 78px; height: 100px; }
+.nexus-pet-root[data-pet="sprig"][data-size="small"] { --pet-button-width: 58px; --pet-button-height: 78px; width: 64px; height: 82px; }
+.nexus-pet-root[data-pet="sprig"][data-size="large"] { --pet-button-width: 86px; --pet-button-height: 114px; width: 92px; height: 118px; }
 .nexus-pet-root[data-pet="pulse"] { --pet-accent: #4ade80; --pet-shell: #102219; --pet-face: #06100a; }
 .nexus-pet-root[data-pet="orbit"] { --pet-accent: #67e8f9; --pet-shell: #10212a; --pet-face: #061116; }
 .nexus-pet-root[data-pet="glint"] { --pet-accent: #f5e7c2; --pet-shell: #211f1a; --pet-face: #0f0e0b; }
@@ -73,6 +76,16 @@
 }
 
 .nexus-pet-stage svg { width: 100%; height: 100%; overflow: visible; }
+.nexus-pet-production-sprite {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background-image: url('/nexus-pet-concepts/sprig-production-poses-v3.png');
+  background-repeat: no-repeat;
+  background-position: var(--pet-pose-x) center;
+  background-size: 400% 100%;
+  filter: drop-shadow(0 6px 8px rgba(0, 0, 0, .62));
+}
 .nexus-pet-floor { fill: var(--pet-state-color); opacity: .22; filter: blur(2px); transform-box: fill-box; transform-origin: center; transform: scaleX(var(--pet-glow-scale)); transition: transform .25s ease, opacity .25s ease; animation: nexus-pet-glow 3.2s ease-in-out infinite; }
 .nexus-pet-avatar { transform-box: fill-box; transform-origin: center bottom; transform: translateX(var(--pet-body-x)) rotate(var(--pet-body-turn)); transition: transform .24s cubic-bezier(.2,.8,.2,1); }
 .nexus-pet-body > path:first-child { fill: #111318; stroke: #343944; stroke-width: 1.5; }
@@ -112,6 +125,11 @@
 /* Proximity is written directly to this root by requestAnimationFrame. It
    never enters React state, so a moving cursor cannot rerender the dashboard. */
 .nexus-pet-root[data-near="true"] .nexus-pet-floor { opacity: .3; }
+.nexus-pet-root[data-pet="sprig"][data-near="true"] { --pet-pose-x: 33.333%; }
+.nexus-pet-root[data-pet="sprig"][data-hovered="true"] { --pet-pose-x: 66.667%; }
+.nexus-pet-root[data-pet="sprig"][data-state="warning"],
+.nexus-pet-root[data-pet="sprig"][data-state="trade-loss"],
+.nexus-pet-root[data-pet="sprig"][data-state="error"] { --pet-pose-x: 100%; }
 .nexus-pet-root[data-near="true"] .nexus-pet-eyes rect { filter: drop-shadow(0 0 4px var(--pet-state-color)); }
 .nexus-pet-root[data-near="true"] .nexus-pet-laptop { opacity: .72; transform: translateX(-1px) scale(.98); }
 .nexus-pet-root[data-near="true"] .nexus-pet-typing-hands,

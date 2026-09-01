@@ -95,6 +95,9 @@ reported bot state.
 
 ## Implementation rule
 
-Generated sheets are concept and selector assets. The live footer pet remains
-code-native SVG/CSS so its state, accessibility, reduced-motion behaviour, and
-cursor interactions remain deterministic and auditable.
+The default Sprig footer pet uses the approved transparent production sprite
+sheet directly. CSS selects the working, aware, greeting, or warning pose from
+authoritative application state. The code-native SVG remains a fallback for
+roster members that do not yet have matching full-body pose sheets. State,
+accessibility, reduced-motion behaviour, and cursor interactions remain
+deterministic and auditable.
