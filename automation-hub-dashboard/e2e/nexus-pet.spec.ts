@@ -31,8 +31,13 @@ test("Nexus pet migrates legacy choices and exposes the premium companion roster
   await page.getByRole("button", { name: "Close pet settings" }).click();
 
   const sprig = page.getByRole("button", { name: /Sprig, Nexus pet:/ });
+  const productionSprite = sprig.locator(".nexus-pet-production-sprite");
+  await expect(productionSprite).toBeVisible();
+  await expect(productionSprite).toHaveCSS(
+    "background-image",
+    /sprig-production-poses-v3\.png/,
+  );
   await sprig.hover();
-  await expect(sprig.locator(".nexus-pet-smile")).toHaveCSS("opacity", "0.9");
   await expect(sprig.locator("xpath=ancestor::div[contains(@class, 'nexus-pet-root')]")).toHaveAttribute("data-hovered", "true");
 
   const stored = await page.evaluate((key) => window.localStorage.getItem(key), STORAGE_KEY);

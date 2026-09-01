@@ -183,7 +183,10 @@ export default function NexusBotPet() {
         onPointerLeave={settle}
       >
         <span className="nexus-pet-stage" aria-hidden="true">
-          <svg viewBox="0 0 64 74" role="presentation" focusable="false">
+          {appearance.pet === "sprig" ? (
+            <span className="nexus-pet-production-sprite" />
+          ) : (
+            <svg viewBox="0 0 64 74" role="presentation" focusable="false">
             <ellipse className="nexus-pet-floor" cx="32" cy="69" rx="20" ry="3.5" />
             <g className="nexus-pet-avatar">
               <g className="nexus-pet-body">
@@ -232,7 +235,8 @@ export default function NexusBotPet() {
                 <circle cx="31" cy="58" r="2.2" />
               </g>
             </g>
-          </svg>
+            </svg>
+          )}
         </span>
       </button>
     </div>
