@@ -11,15 +11,14 @@ export type NexusPetState =
   | "offline";
 
 export type NexusPetId =
-  | "codex"
-  | "dewey"
-  | "fireball"
-  | "hoots"
-  | "rocky"
-  | "seedy"
-  | "stacky"
-  | "bsod"
-  | "null-signal";
+  | "sprig"
+  | "pulse"
+  | "orbit"
+  | "glint"
+  | "echo"
+  | "nova"
+  | "volt"
+  | "kiro";
 
 export type NexusPetSize = "small" | "medium" | "large";
 

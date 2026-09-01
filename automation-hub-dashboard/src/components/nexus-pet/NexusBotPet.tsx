@@ -11,13 +11,26 @@ type Interaction = "idle" | "hover" | "click";
 const PET_STORAGE_KEY = "tradelogx:nexus-pet:v1";
 const PET_IDS = new Set<NexusPetId>(NEXUS_PETS.map((pet) => pet.id));
 const PET_SIZES = new Set<NexusPetSize>(["small", "medium", "large"]);
-const DEFAULT_APPEARANCE: NexusPetAppearance = { pet: "codex", size: "medium" };
+const DEFAULT_APPEARANCE: NexusPetAppearance = { pet: "sprig", size: "medium" };
+const LEGACY_PET_IDS: Record<string, NexusPetId> = {
+  codex: "sprig",
+  seedy: "sprig",
+  stacky: "pulse",
+  dewey: "orbit",
+  rocky: "glint",
+  hoots: "echo",
+  bsod: "nova",
+  fireball: "volt",
+  "null-signal": "kiro",
+};
 
 const loadAppearance = (): NexusPetAppearance => {
   try {
     const saved = JSON.parse(window.localStorage.getItem(PET_STORAGE_KEY) ?? "null") as Partial<NexusPetAppearance> | null;
+    const savedPet = String(saved?.pet ?? "");
+    const migratedPet = LEGACY_PET_IDS[savedPet] ?? savedPet;
     return {
-      pet: saved?.pet && PET_IDS.has(saved.pet) ? saved.pet : DEFAULT_APPEARANCE.pet,
+      pet: PET_IDS.has(migratedPet as NexusPetId) ? migratedPet as NexusPetId : DEFAULT_APPEARANCE.pet,
       size: saved?.size && PET_SIZES.has(saved.size) ? saved.size : DEFAULT_APPEARANCE.size,
     };
   } catch {
@@ -38,7 +51,7 @@ export default function NexusBotPet() {
   const [interaction, setInteraction] = useState<Interaction>("idle");
   const [appearance, setAppearance] = useState<NexusPetAppearance>(loadAppearance);
 
-  const petName = NEXUS_PETS.find((pet) => pet.id === appearance.pet)?.name ?? "Codex";
+  const petName = NEXUS_PETS.find((pet) => pet.id === appearance.pet)?.name ?? "Sprig";
 
   const updateAppearance = (next: NexusPetAppearance) => {
     setAppearance(next);
@@ -186,12 +199,13 @@ export default function NexusBotPet() {
                   <path d="M32 10c1-6 6-8 11-7-1 5-4 9-11 7Z" />
                   <path d="M32 10c-1-5-5-7-9-6 0 4 3 7 9 6Z" />
                 </g>
-                <g className="nexus-pet-dewey-mark"><circle cx="32" cy="7" r="3" /><circle cx="38" cy="11" r="1.5" /></g>
-                <path className="nexus-pet-fire" d="M27 13c-2-5 4-6 3-11 5 3 8 7 5 12 3-1 4-3 4-5 3 4 2 8-2 10H27c-4-2-5-7 0-10-1 2-1 3 0 4Z" />
-                <path className="nexus-pet-owl-ears" d="M15 23l2-11 9 7m23 4-2-11-9 7" />
-                <g className="nexus-pet-rock"><path d="M18 18l4-10 7 5 5-11 6 11 7-5 2 10Z" /></g>
-                <g className="nexus-pet-stack"><path d="M22 12h20M24 8h16M27 4h10" /></g>
-                <g className="nexus-pet-null-halo"><ellipse cx="32" cy="9" rx="13" ry="4" /><path d="M19 9h26" /></g>
+                <path className="nexus-pet-pulse-mark" d="M24 10h4l2-5 4 10 2-5h4" />
+                <g className="nexus-pet-orbit-mark"><ellipse cx="32" cy="9" rx="12" ry="4" /><circle cx="44" cy="8" r="1.6" /></g>
+                <path className="nexus-pet-glint-mark" d="M32 2l1.5 4.5L38 8l-4.5 1.5L32 14l-1.5-4.5L26 8l4.5-1.5L32 2Z" />
+                <path className="nexus-pet-echo-mark" d="M14 24v14m-4-11v8m44-11v14m4-11v8" />
+                <path className="nexus-pet-nova-mark" d="M25 14l3-7 4 4 4-8 4 8 4-4 2 7" />
+                <path className="nexus-pet-volt-mark" d="M37 2l-8 9h5l-3 8 9-11h-5l2-6Z" />
+                <path className="nexus-pet-kiro-mark" d="M27 5h10l-5 8-5-8Z" />
                 <rect className="nexus-pet-head-shell" x="10" y="15" width="44" height="36" rx="14" />
                 <rect className="nexus-pet-face" x="15" y="21" width="34" height="23" rx="9" />
                 <path className="nexus-pet-brow" d="M20 27h9M35 27h9" />
@@ -199,8 +213,6 @@ export default function NexusBotPet() {
                   <rect x="21" y="30" width="7" height="4" rx="2" />
                   <rect x="36" y="30" width="7" height="4" rx="2" />
                 </g>
-                <g className="nexus-pet-owl-rings"><circle cx="24.5" cy="32" r="6" /><circle cx="39.5" cy="32" r="6" /></g>
-                <path className="nexus-pet-bsod-glyph" d="M21 29h4m14 0h4M27 40c3-3 7-3 10 0" />
                 <path className="nexus-pet-mouth" d="M28 39h8" />
                 <path className="nexus-pet-smile" d="M27.5 38.5q4.5 3 9 0" />
                 <path className="nexus-pet-trim" d="M18 46c8 3 20 3 28 0" />
@@ -208,6 +220,16 @@ export default function NexusBotPet() {
               </g>
               <g className="nexus-pet-particles">
                 <circle cx="8" cy="45" r="1.2" /><circle cx="56" cy="43" r="1" /><circle cx="52" cy="52" r=".8" />
+              </g>
+            </g>
+            <g className="nexus-pet-laptop">
+              <path className="nexus-pet-laptop-shell" d="M3 49.5 29 52l-1.5 15L5 64.5 3 49.5Z" />
+              <path className="nexus-pet-laptop-screen" d="m6 52 20 2-1 9.5-17.5-2L6 52Z" />
+              <path className="nexus-pet-laptop-chart" d="m9 59 2.5-2 2 1 2.5-3 2 2 2-4 2.5 3" />
+              <path className="nexus-pet-laptop-base" d="m4.5 65 23 2 5 2.5-23.5-2L4.5 65Z" />
+              <g className="nexus-pet-typing-hands">
+                <circle cx="25" cy="56" r="2.2" />
+                <circle cx="31" cy="58" r="2.2" />
               </g>
             </g>
           </svg>
