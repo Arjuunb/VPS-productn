@@ -4,19 +4,17 @@ type PetOption = {
   id: NexusPetId;
   name: string;
   description: string;
-  glyph: string;
 };
 
 export const NEXUS_PETS: readonly PetOption[] = [
-  { id: "codex", name: "Codex", description: "The original Nexus companion.", glyph: "N" },
-  { id: "dewey", name: "Dewey", description: "Calm focus for measured market days.", glyph: "◉" },
-  { id: "fireball", name: "Fireball", description: "Hot-path energy for fast iteration.", glyph: "◆" },
-  { id: "hoots", name: "Hoots", description: "Sharp-eyed monitoring in a blink.", glyph: "◎" },
-  { id: "rocky", name: "Rocky", description: "Steady under pressure and large diffs.", glyph: "▲" },
-  { id: "seedy", name: "Seedy", description: "Small green shoots for new ideas.", glyph: "♧" },
-  { id: "stacky", name: "Stacky", description: "A balanced stack for deep work.", glyph: "≡" },
-  { id: "bsod", name: "BSOD", description: "A tiny blue-screen gremlin.", glyph: ":(" },
-  { id: "null-signal", name: "Null Signal", description: "A quiet signal from the void.", glyph: "Ø" },
+  { id: "sprig", name: "Sprig", description: "The signature Nexus companion—steady growth, quietly monitored." },
+  { id: "pulse", name: "Pulse", description: "Tracks market rhythm and keeps the operating heartbeat visible." },
+  { id: "orbit", name: "Orbit", description: "Keeps every instance, venue, and risk boundary in view." },
+  { id: "glint", name: "Glint", description: "Surfaces the small detail that deserves operator attention." },
+  { id: "echo", name: "Echo", description: "Listens for repeated signals without amplifying noise." },
+  { id: "nova", name: "Nova", description: "Bright, composed energy for important trading milestones." },
+  { id: "volt", name: "Volt", description: "Fast awareness for urgent—but controlled—market events." },
+  { id: "kiro", name: "Kiro", description: "A precise, minimal companion for focused execution." },
 ] as const;
 
 const PET_SIZES: readonly { id: NexusPetSize; label: string }[] = [
@@ -65,7 +63,7 @@ export default function NexusPetSettings({ appearance, onChange, onClose }: Prop
                 data-selected={selected}
                 onClick={() => choosePet(pet.id)}
               >
-                <span className="nexus-pet-choice-avatar" aria-hidden="true">{pet.glyph}</span>
+                <span className="nexus-pet-choice-avatar" aria-hidden="true" />
                 <span className="nexus-pet-choice-copy"><b>{pet.name}</b><small>{pet.description}</small></span>
                 <span className="nexus-pet-choice-check" aria-hidden="true">{selected ? "✓" : ""}</span>
               </button>

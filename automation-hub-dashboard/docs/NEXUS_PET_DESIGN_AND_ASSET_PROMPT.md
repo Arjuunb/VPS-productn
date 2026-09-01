@@ -1,0 +1,100 @@
+# Nexus Pet Design and Asset Prompt
+
+Use this prompt to extend the Nexus companion family without drifting from the
+dashboard's existing visual language.
+
+## Product role
+
+Design a small mascot system for the TradeLogX Nexus trading dashboard. Nexus
+pets are read-only operator companions: they monitor Trading Instances, reflect
+the authoritative worker state, and direct attention to blockers. They never
+imply that a trade was placed when execution was blocked.
+
+The result must feel smart, modern, calm, slightly futuristic, and appropriate
+for a serious fintech product. It may be warm and memorable, but must not feel
+childish, noisy, or toy-like.
+
+## Character family
+
+All pets share one compact robot architecture: a rounded graphite shell, dark
+face screen, restrained champagne-gold trim, two expressive light-based eyes,
+small articulated hands and feet, and a crisp silhouette at 48–96 px.
+
+The approved roster is:
+
+- **Sprig** — default companion; green eyes and a two-leaf sprout; represents
+  steady growth and calm monitoring.
+- **Pulse** — green pulse eyes; represents market rhythm and worker heartbeat.
+- **Orbit** — cyan eyes and a thin orbital motif; represents multi-instance
+  oversight and boundaries.
+- **Glint** — warm-white eyes and one restrained star glint; represents subtle
+  details that need attention.
+- **Echo** — violet eyes and small wave-like ear fins; represents repeated
+  signals without noise amplification.
+- **Nova** — blue-white eyes and a minimal light flare; represents important
+  milestones without celebration clutter.
+- **Volt** — amber eyes and a tiny lightning marker; represents urgent but
+  controlled events.
+- **Kiro** — teal eyes and a clean angular forehead inset; represents precise,
+  focused execution.
+
+Sprig is the default because the leaf is the most distinctive brand element
+and its growth metaphor works in healthy, waiting, and learning states.
+
+## Laptop behaviour
+
+The default non-interactive state is **working**, not standing idle. The pet
+sits or stands at a small graphite laptop with a minimal green candlestick
+chart. It types gently, blinks occasionally, and makes subtle head and leaf
+movements. This communicates that the bot is working in the background without
+claiming that an order is being executed.
+
+Interaction sequence:
+
+1. **Cursor far away — IDLE WORK:** type slowly, watch the chart, blink, and
+   breathe subtly.
+2. **Cursor nearby — AWARE:** stop typing, dim the laptop slightly, lift the
+   head, and look toward the pointer.
+3. **Direct hover — GREET:** show happy eyes, make one restrained wave, and
+   perform a tiny bounce. Keep the laptop nearby rather than making it vanish.
+4. **Click — STATUS:** open the factual status panel. Animation must remain
+   secondary to status readability.
+5. **Warning/error:** use amber/red state lighting and an explicit indicator;
+   never use a happy animation for unhealthy state.
+6. **Offline:** stop typing, dim the laptop and eyes, and remove the active
+   floor glow.
+
+Respect `prefers-reduced-motion`, pause animation when the document is hidden,
+and avoid React rerenders for continuous cursor tracking.
+
+## Raster asset-generation prompt
+
+```text
+Use case: stylized-concept
+Asset type: transparent production mascot assets for a premium dark fintech dashboard
+Primary request: Create a cohesive Nexus trading-companion robot family and interaction poses.
+Subject: compact rounded graphite robot, matte dark metal, minimal face screen,
+two luminous eyes, restrained champagne-gold trim, small articulated hands and
+feet. Sprig has a signature two-leaf sprout. Include a tiny graphite laptop with
+a simple green candlestick chart.
+Style: polished 2.5D UI mascot render, crisp silhouette, soft ambient occlusion,
+premium and charming but not childish.
+Interaction poses: idle typing at laptop; cursor-aware with typing stopped and
+head lifted; direct-hover wave with happy eyes; attentive amber alert pose.
+Composition: consistent three-quarter-front camera, identical proportions and
+lighting, isolated cells with generous gutters, readable at 48–96 px.
+Palette: graphite black, charcoal, restrained champagne gold, Nexus green;
+character-specific cyan, violet, blue-white, amber, or teal only as small light accents.
+Constraints: genuine transparent alpha; no painted checkerboard; no text,
+labels, logos, scenery, watermark, excessive props, duplicated limbs, or
+overlapping cells.
+Avoid: childish chibi exaggeration, glossy toy plastic, ornate gold, rainbow
+neon, cyberpunk clutter, human anatomy, or an expression that contradicts the
+reported bot state.
+```
+
+## Implementation rule
+
+Generated sheets are concept and selector assets. The live footer pet remains
+code-native SVG/CSS so its state, accessibility, reduced-motion behaviour, and
+cursor interactions remain deterministic and auditable.
