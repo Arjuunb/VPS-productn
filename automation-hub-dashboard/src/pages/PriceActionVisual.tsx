@@ -561,15 +561,15 @@ export default function PriceActionVisual() {
 
   return <div className="pa-lab">
     <header className="pa-titlebar">
-      <div><span className="pa-kicker">NATIVE RESEARCH TERMINAL</span><h1>Price Action Visual Lab</h1><p>One closed-candle engine · historical replay + live paper observation</p></div>
+      <div><span className="pa-kicker">ISOLATED FORWARD-PAPER</span><h1>Price Action Visual Lab</h1><p>Live Binance USD-M data · simulated orders · no exchange routing</p></div>
       <button type="button" className="pa-controls-toggle" onClick={() => setControlsOpen((open) => !open)} aria-expanded={controlsOpen}>Controls</button>
-      <div className="pa-safety"><b>PAPER ONLY</b><span>REAL ORDERS DISABLED</span></div>
+      <div className="pa-safety"><b>{paper?.session.operating_mode === "signals_only" ? "SIGNALS_ONLY" : "ISOLATED_FORWARD_PAPER"}</b><span>LIVE ROUTING DISABLED</span></div>
     </header>
     <div className={`pa-health-scope ${feedReliable ? "is-healthy" : "is-stale"}`}>
       <b>PRICE ACTION SESSION</b><span>Candles / quote / mark: {healthState}</span>
       <span>Decision readiness: {feedReliable ? "CLOSED-BAR ELIGIBLE" : "PAUSED · FAIL CLOSED"}</span>
       <span>Paper execution: {feedReliable ? "ELIGIBLE UNDER SAVED MODE" : "BLOCKED"}</span>
-      <small>The global footer reports the selected Trading Instance, not this independent Price Action session.</small>
+      <small>This page and footer report only the isolated Price Action account.</small>
     </div>
 
     <div className="pa-workspace">

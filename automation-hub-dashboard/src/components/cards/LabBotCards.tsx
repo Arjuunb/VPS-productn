@@ -57,7 +57,7 @@ function LabCard({ title, page, status, error }: {
           <p>{strategyLabel} · {status?.strategy?.version ?? "version unavailable"}</p>
         </div>
         <div className="lab-badges">
-          <span className="lab-badge paper">PAPER ONLY</span>
+          <span className="lab-badge paper">{status?.mode === "signals_only" ? "SIGNALS_ONLY" : "ISOLATED_FORWARD_PAPER"}</span>
           <span className={`lab-badge ${status?.feed?.reliable ? "ok" : "bad"}`}>{feedState}</span>
           <span className={`lab-badge ${ready ? "ok" : "bad"}`}>{status?.execution_state ?? "BLOCKED"}</span>
         </div>
