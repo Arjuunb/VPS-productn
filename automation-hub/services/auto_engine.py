@@ -1736,6 +1736,29 @@ class AutoStrategyEngine:
                     "blocker": getattr(result, "blocker", "GATE_REJECTED: PAUSED"),
                     "decision": decision, "verdict": v}
         if self.entry_mode == "limit" and pos is None and signal.stop_loss:
+            if getattr(self.paper, "deferred_entries", False):
+                res = self._route({**payload, "maker": True})
+                fill = (res.fill or {}) if res is not None else {}
+                if res is not None and res.accepted and fill.get("action") == "intent":
+                    self._finalize_decision(
+                        decision_id, final_state="PENDING_INTENT", stage="execution",
+                        reason="Limit intent awaits a post-decision Binance USD-M quote cross",
+                        blocker="GATE_REJECTED: ORDER_PENDING",
+                    )
+                    return {"kind": "pending", "fill": fill,
+                            "blocker": "GATE_REJECTED: ORDER_PENDING",
+                            "decision": decision, "verdict": v}
+                if res is not None and not res.accepted:
+                    self.stats["rejections"] += 1
+                    stage = str(res.stage or "execution")
+                    self.rejection_counts[stage] = self.rejection_counts.get(stage, 0) + 1
+                    self._finalize_decision(
+                        decision_id, final_state="GATE_REJECTED", stage=stage,
+                        reason=res.reason, blocker=getattr(res, "blocker", None),
+                    )
+                    return {"kind": "rejected", "stage": stage,
+                            "reason": res.reason, "decision": decision, "verdict": v}
+                return {"kind": "error", "reason": "forward-paper intent routing failed"}
             self._pending[sym] = {"side": side, "price": signal.entry,
                                   "target": signal.take_profit,
                                   "ttl": self.limit_ttl_bars, "payload": payload,
@@ -1754,6 +1777,14 @@ class AutoStrategyEngine:
                                     blocker="GATE_REJECTED: PIPELINE_ERROR")
             return {"kind": "error", "reason": "pipeline error (see engine log)"}
         fill = res.fill or {}
+        if res.accepted and fill.get("action") == "intent":
+            self._finalize_decision(
+                decision_id, final_state="PENDING_INTENT", stage="execution",
+                reason="Market intent awaits the next Binance USD-M public quote",
+                blocker="GATE_REJECTED: ORDER_PENDING",
+            )
+            return {"kind": "pending", "decision": decision, "verdict": v,
+                    "fill": fill, "blocker": "GATE_REJECTED: ORDER_PENDING"}
         if res.accepted and fill.get("action") == "opened":
             self.stats["accepted_signals"] += 1
             if decision_id is not None and self.decisions is not None:

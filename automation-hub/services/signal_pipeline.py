@@ -887,9 +887,36 @@ class SignalPipeline:
                                    "risk_pct_at_entry": eff_risk,
                                    "risk_amount_at_entry": abs(entry - stop) * size,
                                    "equity_before_trade": realized_equity,
+                                   "signal_timestamp": payload.get("timestamp"),
+                                   "decision_timestamp": payload.get("timestamp"),
+                                   "signal_price": entry,
+                                   "strategy": payload.get("strategy"),
+                                   "strategy_version": self.journal_context.get("strategy_version"),
+                                   "timeframe": payload.get("timeframe"),
+                                   "market_data_source": payload.get("market_data_source"),
+                                   "candle_id": payload.get("decision_identity"),
+                                   "account_id": (
+                                       f"instance:{self.journal_context.get('instance_id')}:"
+                                       f"{self.journal_context.get('simulation_session_id')}"),
+                                   "execution_engine": "INSTANCE",
                                })
         if fill.action == "rejected":
             return reject("execution", "Order rejected at fill (execution model)")
+        if fill.action == "intent":
+            self.ledger.insert_webhook_event(
+                alert_id=alert_id, symbol=symbol, side=side,
+                entry=entry, stop=stop, payload=payload, status="pending",
+            )
+            self.ledger.log(
+                level="info", stage="execution", symbol=symbol,
+                message=(f"{symbol} {side} paper intent accepted; waiting for "
+                         "the first Binance USD-M quote after decision time"),
+            )
+            steps.append(Step("execution", True, "forward-paper intent awaiting next quote"))
+            return PipelineResult(
+                True, "execution", "paper order intent awaiting next quote",
+                steps, fill.__dict__,
+            )
         entry, size = fill.price, fill.size          # actual filled price / size
         payload["journal_sizing"].update({
             "filled_entry": round(entry, 10),

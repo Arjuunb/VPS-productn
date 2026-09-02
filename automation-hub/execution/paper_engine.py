@@ -8,8 +8,10 @@ unrealized P&L is computed against supplied mark prices.
 from __future__ import annotations
 
 import json
+import threading
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 from data.ledger import Ledger
@@ -353,3 +355,153 @@ class PaperExecutionEngine:
         if risk <= 0:
             return 0.0
         return round(_gross_r(pos["entry"], exit_price, risk, pos["side"]), 3)
+
+
+class ForwardPaperExecutionEngine(PaperExecutionEngine):
+    """Paper executor whose entries fill only from a later public quote.
+
+    The strategy/risk pipeline remains synchronous, but an approved entry is
+    persisted in this adapter as an INTENT.  The shared Binance USD-M market
+    hub later calls :meth:`process_quote`; no exchange client exists on this
+    path. Protective closes continue to use the normal fail-safe close method.
+    """
+
+    deferred_entries = True
+
+    def __init__(self, *args, initial_intents: Optional[dict] = None,
+                 intents_listener=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._intent_lock = threading.RLock()
+        self._intents: dict[str, dict] = dict(initial_intents or {})
+        self.intents_listener = intents_listener
+
+    @staticmethod
+    def _utc(value: object) -> datetime:
+        try:
+            stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("forward-paper intent requires a UTC decision timestamp") from exc
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return stamp.astimezone(timezone.utc)
+
+    def _checkpoint_intents(self) -> None:
+        if self.intents_listener is not None:
+            self.intents_listener(self.pending_intents())
+
+    def pending_intents(self) -> dict:
+        with self._intent_lock:
+            return json.loads(json.dumps(self._intents))
+
+    def open(self, *, symbol: str, side: str, size: float, entry: float,
+             stop: Optional[float], target: Optional[float] = None,
+             alert_id: str = "", maker: bool = False,
+             sizing_context: Optional[dict] = None) -> FillResult:
+        context = dict(sizing_context or {})
+        decision_timestamp = context.get("decision_timestamp")
+        self._utc(decision_timestamp)
+        with self._intent_lock:
+            existing = self._intents.get(symbol)
+            if existing is not None:
+                return FillResult(
+                    "intent", symbol, _dir(existing["side"]),
+                    float(existing["size"]), float(existing["entry"]),
+                    execution_id=str(existing["alert_id"]),
+                )
+            self._intents[symbol] = {
+                "symbol": symbol, "side": side, "size": float(size),
+                "entry": float(entry), "stop": stop, "target": target,
+                "alert_id": alert_id, "maker": bool(maker),
+                "order_timestamp": datetime.now(timezone.utc).isoformat(),
+                "decision_timestamp": str(decision_timestamp),
+                "sizing_context": context,
+            }
+        self._checkpoint_intents()
+        return FillResult("intent", symbol, _dir(side), float(size), float(entry),
+                          execution_id=self._execution_id("INTENT", alert_id))
+
+    def process_quote(self, quote: dict) -> list[FillResult]:
+        """Fill eligible intents from the first complete later bid/ask/mark."""
+        try:
+            bid, ask, mark = (float(quote[key]) for key in ("bid", "ask", "mark"))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("forward-paper quote requires bid, ask and mark") from exc
+        if bid <= 0 or ask < bid or mark <= 0:
+            raise ValueError("forward-paper quote is invalid")
+        received = self._utc(quote.get("received_at"))
+        fills: list[FillResult] = []
+        recovered = False
+        with self._intent_lock:
+            for symbol, intent in list(self._intents.items()):
+                # Atomic ledger open may have committed just before a process
+                # crash and before the intent checkpoint cleared. Reconcile
+                # that durable position instead of ever opening it twice.
+                if self.open_position(symbol) is not None:
+                    self._intents.pop(symbol, None)
+                    recovered = True
+                    continue
+                if received <= self._utc(intent["decision_timestamp"]):
+                    continue
+                side = str(intent["side"]).upper()
+                reference = ask if side in ("BUY", "LONG") else bid
+                if intent["maker"]:
+                    limit = float(intent["entry"])
+                    crossed = (reference <= limit if side in ("BUY", "LONG")
+                               else reference >= limit)
+                    if not crossed:
+                        continue
+                    reference = limit
+                context = {
+                    **dict(intent.get("sizing_context") or {}),
+                    "fill_timestamp": received.isoformat(),
+                    "fill_bid": bid, "fill_ask": ask, "fill_mark": mark,
+                    "market_data_source": quote.get("market_data_source")
+                    or quote.get("source") or "Binance USD-M public WebSocket",
+                    "candle_id": quote.get("candle_id"),
+                }
+                fill = super().open(
+                    symbol=symbol, side=intent["side"], size=float(intent["size"]),
+                    entry=reference, stop=intent.get("stop"),
+                    target=intent.get("target"), alert_id=intent.get("alert_id", ""),
+                    maker=bool(intent.get("maker")), sizing_context=context,
+                )
+                if fill.action == "opened":
+                    commission = (self._fee_rate(maker=bool(intent.get("maker")))
+                                  * fill.size * fill.price)
+                    evidence = {
+                        **context,
+                        "signal_timestamp": context.get("signal_timestamp")
+                        or intent["decision_timestamp"],
+                        "decision_timestamp": intent["decision_timestamp"],
+                        "order_timestamp": intent.get("order_timestamp"),
+                        "fill_timestamp": received.isoformat(),
+                        "signal_price": context.get("signal_price") or intent["entry"],
+                        "requested_price": intent["entry"],
+                        "fill_price": fill.price,
+                        "spread": ask - bid,
+                        "slippage": abs(fill.price - reference),
+                        "commission": commission, "funding": 0.0,
+                        "stop_loss": intent.get("stop"),
+                        "take_profit": intent.get("target"),
+                        "risk_amount": (abs(fill.price - float(intent["stop"])) * fill.size
+                                        if intent.get("stop") is not None else None),
+                        "position_size": fill.size,
+                        "strategy": context.get("strategy") or self.strategy_id,
+                        "strategy_version": context.get("strategy_version"),
+                        "symbol": symbol, "timeframe": context.get("timeframe"),
+                        "account_id": context.get("account_id"),
+                        "execution_engine": "INSTANCE",
+                        "candle_id": context.get("candle_id") or quote.get("candle_id"),
+                        "blocker": "NONE", "paper_only": True,
+                        "real_execution_allowed": False,
+                    }
+                    self.ledger.insert_webhook_event(
+                        alert_id=f"{intent.get('alert_id', '')}:fill:{received.isoformat()}",
+                        symbol=symbol, side=intent["side"], entry=fill.price,
+                        stop=intent.get("stop"), payload=evidence, status="accepted",
+                    )
+                    self._intents.pop(symbol, None)
+                    fills.append(fill)
+        if fills or recovered:
+            self._checkpoint_intents()
+        return fills
