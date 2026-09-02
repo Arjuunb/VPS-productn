@@ -30,6 +30,7 @@ class PriceActionPublicStream:
                  stale_after_seconds: float = 15.0,
                  event_sink: Callable[[dict], None] | None = None,
                  bar_sink: Callable[[Bar], None] | None = None,
+                 quote_sink: Callable[[dict], None] | None = None,
                  clock: Callable[[], datetime] | None = None,
                  quote_mismatch_bps: float = 100.0):
         self.rest_loader = rest_loader
@@ -37,6 +38,7 @@ class PriceActionPublicStream:
         self.stale_after_seconds = stale_after_seconds
         self.event_sink = event_sink
         self.bar_sink = bar_sink
+        self.quote_sink = quote_sink
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.quote_mismatch_bps = float(quote_mismatch_bps)
         self.symbol = ""
@@ -114,6 +116,41 @@ class PriceActionPublicStream:
                     "kind": "persistence", "state": "PERSISTENCE_BLOCKED",
                     "reason": self.last_sink_error, "retryable": True,
                     "timestamp": self.clock().isoformat(), "symbol": self.symbol,
+                    "timeframe": self.timeframe,
+                })
+            return False
+
+    def _deliver_quote(self, event: str, received_at: datetime) -> bool:
+        """Publish one immutable public quote snapshot to paper consumers.
+
+        The callback runs only after the stream state has been updated.  It is
+        deliberately separate from ``bar_sink`` because paper fills require a
+        quote whose receipt time is strictly after the strategy decision.
+        """
+        if not self.quote_sink:
+            return True
+        with self._lock:
+            payload = {
+                **self._quote,
+                "event": event,
+                "source": "BINANCE_USDM_PUBLIC_WEBSOCKET",
+                "symbol": self.symbol,
+                "timeframe": self.timeframe,
+                "received_at": received_at.isoformat(),
+            }
+        try:
+            self.quote_sink(payload)
+            return True
+        except Exception as exc:
+            if getattr(exc, "code", None) != "PERSISTENCE_BLOCKED":
+                raise
+            self.persistence_blocked_events += 1
+            self.last_sink_error = str(exc)[:500]
+            if self.event_sink:
+                self.event_sink({
+                    "kind": "persistence", "state": "PERSISTENCE_BLOCKED",
+                    "reason": self.last_sink_error, "retryable": True,
+                    "timestamp": received_at.isoformat(), "symbol": self.symbol,
                     "timeframe": self.timeframe,
                 })
             return False
@@ -428,13 +465,15 @@ class PriceActionPublicStream:
             with self._lock:
                 self._quote.update({"bid": float(data["b"]), "ask": float(data["a"])})
                 self.last_quote_update = now
-            return {"accepted": True, "quote": True}
+            persisted = self._deliver_quote("bookTicker", now)
+            return {"accepted": True, "quote": True, "sink_persisted": persisted}
         if event == "markPriceUpdate":
             with self._lock:
                 self._quote.update({"mark": float(data["p"]), "funding_rate": float(data.get("r") or 0),
                                     "next_funding_time": datetime.fromtimestamp(int(data["T"]) / 1000, tz=timezone.utc).isoformat()})
                 self.last_mark_update = now
-            return {"accepted": True, "mark": True}
+            persisted = self._deliver_quote("markPriceUpdate", now)
+            return {"accepted": True, "mark": True, "sink_persisted": persisted}
         return {"accepted": False, "ignored": True}
 
     def status(self, *, now: datetime | None = None) -> dict:
