@@ -80,6 +80,7 @@ class ShadowResearchStore:
                 order_id TEXT PRIMARY KEY,
                 order_key TEXT NOT NULL UNIQUE,
                 decision_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
                 order_type TEXT NOT NULL,
                 side TEXT NOT NULL,
                 requested_price REAL,
@@ -147,6 +148,13 @@ class ShadowResearchStore:
               CREATE INDEX IF NOT EXISTS ix_shadow_decisions_candle
                 ON shadow_decisions(candle_id,engine);
             """)
+            order_columns = {row[1] for row in self._db.execute(
+                "PRAGMA table_info(shadow_orders)"
+            )}
+            if "symbol" not in order_columns:
+                self._db.execute(
+                    "ALTER TABLE shadow_orders ADD COLUMN symbol TEXT NOT NULL DEFAULT ''"
+                )
 
     @staticmethod
     def _shadow(execution_class: str) -> None:
@@ -183,7 +191,7 @@ class ShadowResearchStore:
             ).fetchone()
         return self._decode(row)
 
-    def record_order(self, decision_id: str, *, order_type: str, side: str,
+    def record_order(self, decision_id: str, *, symbol: str, order_type: str, side: str,
                      requested_price: float | None, stop_loss: float | None,
                      take_profit: float | None, quantity: float = 1,
                      status: str = "INTENT",
@@ -200,8 +208,10 @@ class ShadowResearchStore:
             order_key = key(decision["decision_key"], order_type, side)
             order_id = "shadow-order-" + hashlib.sha256(order_key.encode()).hexdigest()[:28]
             self._db.execute(
-                "INSERT OR IGNORE INTO shadow_orders VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (order_id, order_key, decision_id, order_type, side,
+                "INSERT OR IGNORE INTO shadow_orders(order_id,order_key,decision_id,symbol,"
+                "order_type,side,requested_price,stop_loss,take_profit,quantity,status,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (order_id, order_key, decision_id, symbol.upper().replace("/", ""), order_type, side,
                  requested_price, stop_loss, take_profit, float(quantity), status, iso()),
             )
             row = self._db.execute(
@@ -222,6 +232,8 @@ class ShadowResearchStore:
             ).fetchone()
             if prior:
                 prior_at = iso(prior["event_timestamp"])
+                if str(prior["quote_event_id"]) == quote_id:
+                    return True, quote_id
                 if event_at < prior_at or (event_at == prior_at and sequence <= int(prior["sequence"])):
                     return False, "OUT_OF_ORDER_QUOTE"
             self._db.execute(
@@ -259,6 +271,11 @@ class ShadowResearchStore:
         fill_key = key(order_id, quote_id)
         side = str(row["side"]).lower()
         executable = ask if side in {"buy", "long"} else bid
+        if str(row["order_type"]).lower() == "limit" and row["requested_price"] is not None:
+            limit = float(row["requested_price"])
+            if (side in {"buy", "long"} and ask > limit) or (
+                    side not in {"buy", "long"} and bid < limit):
+                return None
         slip = executable * max(0.0, float(slippage_bps)) / 10_000
         fill_price = executable + slip if side in {"buy", "long"} else executable - slip
         quantity = float(row["quantity"])
@@ -419,6 +436,18 @@ class ShadowResearchStore:
                 "LEFT JOIN shadow_mae_mfe m ON m.order_id=o.order_id "
                 "ORDER BY d.created_at DESC LIMIT ?", (max(1, int(limit)),),
             ).fetchall()
+        return [self._decode(row) for row in rows]
+
+    def open_orders(self, symbol: str | None = None) -> list[dict]:
+        sql = ("SELECT o.*,d.decision_timestamp,d.blocker,d.context_json "
+               "FROM shadow_orders o JOIN shadow_decisions d ON d.decision_id=o.decision_id "
+               "WHERE o.status IN ('INTENT','SHADOW_REJECTED_INTENT','FILLED')")
+        args: tuple = ()
+        if symbol:
+            sql += " AND o.symbol=?"
+            args = (symbol.upper().replace("/", ""),)
+        with self._lock:
+            rows = self._db.execute(sql + " ORDER BY o.created_at", args).fetchall()
         return [self._decode(row) for row in rows]
 
     @staticmethod
