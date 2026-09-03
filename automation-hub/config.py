@@ -144,6 +144,8 @@ class Settings:
         "HUB_SMC_PAPER_DB", str(DATA_DIR / "smc_strategy_paper.db")))
     price_action_research_db: str = field(default_factory=lambda: os.environ.get(
         "HUB_PRICE_ACTION_RESEARCH_DB", str(DATA_DIR / "price_action_research.db")))
+    shadow_research_db: str = field(default_factory=lambda: os.environ.get(
+        "HUB_SHADOW_RESEARCH_DB", str(DATA_DIR / "shadow_research.db")))
     # Decision-journal database (full explainable record of every trade)
     journal_db: str = field(default_factory=lambda: os.environ.get(
         "HUB_JOURNAL_DB", str(DATA_DIR / "journal.db")))

@@ -528,6 +528,7 @@ def _shutdown_all_runtimes() -> None:
     run("autonomous_engine_checkpoint", webhook_api.engine.flush_runtime_state)
     run("autonomous_engine", lambda: webhook_api.engine.stop("Process shutdown"))
     run("legacy_bot_runners", manager.emergency_stop_all)
+    run("research_observer", webhook_api.research_observer.stop)
     run("price_action_lab", webhook_api.price_action_runtime.stop)
     run("smc_lab", webhook_api.smc_runtime.stop)
     if errors:

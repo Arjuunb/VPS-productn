@@ -12,6 +12,7 @@ import NativeSMCChartOverlay, {
 } from "../components/chart/NativeSMCChartOverlay";
 import { useApp } from "../app-context";
 import { apiDownload, apiGet, apiPostJson, useLive } from "../lib/api";
+import ResearchComparisonPanel from "../components/research/ResearchComparisonPanel";
 
 type ChartFeed = "checkpoint" | "binance_usdm";
 type ChartPreset = "clean" | "structure" | "zones" | "strategy" | "trades" | "debug";
@@ -455,6 +456,7 @@ export default function SMCStrategyLabPage() {
           <nav>{TABS.map((row) => <button type="button" key={row} className={tab === row ? "active" : ""} onClick={() => setTab(row)}>{row}<em>{row === "positions" ? paper.data?.positions.length ?? 0 : row === "orders" ? paper.data?.orders.length ?? 0 : row === "trades" ? paper.data?.trades.length ?? 0 : row === "setups" ? paper.data?.candidates.length ?? 0 : row === "rejected" ? rejected.length : row === "journal" ? journal.data?.journal.length ?? 0 : ""}</em></button>)}</nav>
           <div className={`pa-bottom-body ${tab === "journal" || tab === "analysis" ? "is-governance" : ""}`}>{bottomContent}</div>
         </div>
+        <ResearchComparisonPanel engine="SMC" />
       </main>
     </div>
   </div>;

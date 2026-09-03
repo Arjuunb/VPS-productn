@@ -922,9 +922,28 @@ from execution.paper_broker_v2 import PaperBrokerV2  # noqa: E402
 from services.price_action_lab import PriceActionLabRuntime, PriceActionPaperAccount  # noqa: E402
 from services.smc_strategy_lab import SMCPaperAccount, SMCStrategyLabRuntime  # noqa: E402
 from services.forward_paper_hub import ForwardPaperMarketDataHub  # noqa: E402
+from services.research_observer import ResearchObservationRuntime  # noqa: E402
+from services.shadow_research import ShadowResearchStore  # noqa: E402
 from services.price_action_research import PriceActionExperimentRunner, PriceActionExperimentStore  # noqa: E402
 v2_market_data = MarketDataService(settings.market_data_v2_dir)
 forward_paper_market_hub = ForwardPaperMarketDataHub(v2_market_data.public_usdm_window)
+_shadow_path = _os.path.abspath(settings.shadow_research_db)
+_execution_paths = {
+    _os.path.abspath(path) for path in (
+        settings.paper_broker_v2_db, settings.price_action_paper_db,
+        settings.smc_paper_db, settings.price_action_research_db,
+    )
+}
+if _shadow_path in _execution_paths:
+    raise RuntimeError("HUB_SHADOW_RESEARCH_DB must be physically separate from every paper/research ledger")
+shadow_research_store = ShadowResearchStore(settings.shadow_research_db)
+research_observer = ResearchObservationRuntime(
+    forward_paper_market_hub, shadow_research_store,
+    symbol=settings.auto_symbols[0] if settings.auto_symbols else "BTCUSDT",
+    timeframe="5m",
+)
+if "PYTEST_CURRENT_TEST" not in _os.environ:
+    research_observer.start()
 # Trading Instances are constructed before the research services for legacy
 # import compatibility. Bind their production data/rules authority here so PA,
 # SMC and instances all consume the same Binance USD-M hub.
@@ -1207,6 +1226,7 @@ import routers.instances  # noqa: E402
 import routers.forward_validation  # noqa: E402
 import routers.native_smc  # noqa: E402
 import routers.price_action  # noqa: E402
+import routers.research_observatory  # noqa: E402
 import routers.factory_reset  # noqa: E402
 router.include_router(routers.analytics.router)
 router.include_router(routers.bots.router)
@@ -1225,6 +1245,7 @@ router.include_router(routers.instances.router)
 router.include_router(routers.forward_validation.router)
 router.include_router(routers.native_smc.router)
 router.include_router(routers.price_action.router)
+router.include_router(routers.research_observatory.router)
 router.include_router(routers.factory_reset.router)
 
 
