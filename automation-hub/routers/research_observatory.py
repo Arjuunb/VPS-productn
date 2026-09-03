@@ -28,3 +28,8 @@ def measurements(limit: int = Query(500, ge=1, le=5000)):
         "rows": _runtime().store.measurements(limit=limit),
     }
 
+
+@router.get("/comparison")
+def comparison():
+    from services.research_analytics import ResearchComparison
+    return ResearchComparison(_runtime().store).report()

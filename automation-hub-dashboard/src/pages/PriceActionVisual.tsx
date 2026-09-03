@@ -5,6 +5,7 @@ import NativeSMCChartOverlay, {
 import { apiDownload, apiGet, apiPostJson } from "../lib/api";
 import { useApp } from "../app-context";
 import Modal from "../components/common/Modal";
+import ResearchComparisonPanel from "../components/research/ResearchComparisonPanel";
 
 type Mode = "live" | "replay";
 type BottomTab = "positions" | "orders" | "trades" | "setups" | "rejected" | "journal" | "learning" | "session" | "connection";
@@ -617,6 +618,7 @@ export default function PriceActionVisual() {
             {tab === "connection" ? <div className="pa-session"><span>Exchange<b>Binance USDⓈ-M Futures</b></span><span>Overall health<b>{healthState}</b></span><span>Transport<b>{state?.live_display?.transport_state ?? (mode === "replay" ? "ISOLATED" : "CONNECTING")}</b></span><span>Candle stream<b>{age(state?.live_display?.candle_age_seconds)}</b></span><span>Bid / ask stream<b>{age(state?.live_display?.quote_age_seconds)}</b></span><span>Mark stream<b>{age(state?.live_display?.mark_age_seconds)}</b></span><span>Failing dependency<b>{state?.live_display?.failing_dependency ?? "None"}</b></span><span>Last successful event<b>{state?.live_display?.last_successful_event ? `${state.live_display.last_successful_event.kind} · ${state.live_display.last_successful_event.at}` : "—"}</b></span><span>Retry state<b>{state?.live_display?.retry_state?.automatic_retry ? `automatic · attempt ${state.live_display.retry_state.attempt ?? 0}` : "—"}</b></span><span>Reconciliation<b>{state?.live_display?.health_reason ?? "—"}</b></span><span>New entries<b>{state?.live_display?.new_entries_paused ? "PAUSED · FAIL CLOSED" : "CLOSED BARS ONLY"}</b></span><span>Real execution<b>DISABLED</b></span></div> : null}
           </div>
         </div>
+        <ResearchComparisonPanel engine="PA" />
       </main>
     </div>
     <Modal open={Boolean(remediationSymbol)} title="Close legacy PAPER position?" onClose={() => {
