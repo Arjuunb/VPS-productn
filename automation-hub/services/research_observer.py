@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import asdict
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from bot.data.indicators import atr
 from bot.types import Bar
@@ -47,7 +47,9 @@ class ResearchObservationRuntime:
         self._lock = threading.RLock()
         self._last_observation: dict = {}
         self._last_error = ""
-        self._market_data_fresh = True
+        self._market_data_fresh = False
+        self._next_funding_at: datetime | None = None
+        self._next_funding_rate = 0.0
         self._subscriptions = [
             market_hub.subscription(
                 f"research:{self.symbol}:{self.timeframe}:decision",
@@ -65,7 +67,10 @@ class ResearchObservationRuntime:
         started = self._subscriptions[0].start(self.symbol, self.timeframe)
         htf_started = self._subscriptions[1].start(self.symbol, "1h")
         htf4_started = self._subscriptions[2].start(self.symbol, "4h")
-        return bool(started and htf_started and htf4_started)
+        ready = bool(started and htf_started and htf4_started)
+        if not ready:
+            self.stop()
+        return ready
 
     def stop(self) -> None:
         for subscription in self._subscriptions:
@@ -73,8 +78,19 @@ class ResearchObservationRuntime:
 
     def _on_event(self, event: dict) -> None:
         state = str(event.get("state") or "")
-        if event.get("kind") in {"market_data_health", "connection"}:
-            self._market_data_fresh = state in {"SYNCHRONIZED", "CONNECTED"}
+        if event.get("kind") == "market_data_health":
+            self._market_data_fresh = state == "SYNCHRONIZED"
+        elif event.get("kind") == "connection" and state != "CONNECTED":
+            self._market_data_fresh = False
+
+    def _feed_reliable(self) -> bool:
+        """Resolve freshness from the authoritative decision-feed status."""
+        try:
+            reliable = bool(self._subscriptions[0].status().get("reliable"))
+        except Exception:
+            reliable = False
+        self._market_data_fresh = reliable
+        return reliable
 
     def _on_htf(self, timeframe: str, bar: Bar) -> None:
         try:
@@ -116,6 +132,10 @@ class ResearchObservationRuntime:
         flip = next((row for (strategy, _), row in traces.items()
                      if strategy == "PA3_FLIP_RETEST" and row.state == "ORDER_PENDING"), None)
         fvg_on_bar = any(gap.created_at == bar.timestamp for gap in self.smc.fvgs.values())
+        closed_structure = [
+            self.smc.events[ident] for ident in smc_snapshot.event_ids
+            if ident in self.smc.events and hasattr(self.smc.events[ident], "event_type")
+        ]
         entry = stop = target = None
         if proposal is not None:
             entry, stop, target = proposal.entry, proposal.stop, proposal.target
@@ -130,6 +150,40 @@ class ResearchObservationRuntime:
                 target = (entry + risk * self.smc.config.rr_ratio
                           if direction == "bullish" else
                           entry - risk * self.smc.config.rr_ratio)
+        exit_tags: dict[str, object] = {}
+        if entry is not None and stop is not None and direction in {"bullish", "bearish"}:
+            risk = abs(float(entry) - float(stop))
+            sign = 1 if direction == "bullish" else -1
+            beyond = [
+                float(row["price"]) for row in liquidity
+                if row["side"] == ("HIGH" if direction == "bullish" else "LOW")
+                and row.get("invalidated_at") is None
+                and ((float(row["price"]) > float(entry)) if sign > 0
+                     else (float(row["price"]) < float(entry)))
+            ]
+            session_levels = [
+                float(row["price"]) for row in liquidity
+                if row["type"] in {
+                    f"{name}_{'HIGH' if sign > 0 else 'LOW'}" for name in (
+                        "ASIA", "LONDON", "LONDON_NY_OVERLAP", "NEW_YORK",
+                    )
+                }
+                and row.get("invalidated_at") is None
+            ]
+            exit_tags = {
+                "2R": float(entry) + sign * risk * 2,
+                "2.5R": float(entry) + sign * risk * 2.5,
+                "opposing_liquidity": (min(beyond, key=lambda value: abs(value - float(entry)))
+                                        if beyond else None),
+                "session_high_low": (min(session_levels,
+                                           key=lambda value: abs(value - float(entry)))
+                                     if session_levels else None),
+                "1R_runner_break_even": {
+                    "activation": float(entry) + sign * risk,
+                    "runner_stop": float(entry),
+                },
+                "execution_class": "SHADOW",
+            }
         return {
             "symbol": self.symbol, "timeframe": self.timeframe,
             "candle_open": bar.timestamp.isoformat(),
@@ -144,6 +198,12 @@ class ResearchObservationRuntime:
             "displacement": fvg_on_bar,
             "fresh_liquidity": bool(relevant_liquidity),
             "liquidity": liquidity,
+            "relevant_liquidity_types": sorted({
+                row["type"] for row in relevant_liquidity
+            }),
+            "fvg": fvg_on_bar,
+            "choch": any(row.event_type == "CHOCH" for row in closed_structure),
+            "bos": any(row.event_type == "BOS" for row in closed_structure),
             "session": session_tag(bar.timestamp),
             "htf": htf, "htf_aligned": htf_aligned,
             "full_smc_ready": bool(smc_snapshot.proposal_ids),
@@ -153,16 +213,65 @@ class ResearchObservationRuntime:
             "pa_snapshot_id": pa_snapshot.id,
             "smc_snapshot_id": smc_snapshot.id,
             "entry": entry, "stop_loss": stop, "take_profit": target,
+            "research_exit_tags": exit_tags,
             "order_type": "market",
         }
+
+    def _collect_pa_zones(self) -> None:
+        """Project native PA zones as measurements without changing PA rules."""
+        current_atr = atr(self.pa.bars, 14)
+        existing = self.liquidity.snapshot(self.symbol, self.timeframe)
+        for zone in self.pa.zones.values():
+            midpoint = (float(zone.low) + float(zone.high)) / 2
+            opposing = [
+                abs(float(row["price"]) - midpoint) for row in existing
+                if row["side"] == ("HIGH" if zone.role == "support" else "LOW")
+                and row.get("invalidated_at") is None
+            ]
+            since = [row for row in self.pa.bars if row.timestamp >= zone.confirmed_at]
+            departure = None
+            if current_atr > 0 and since:
+                favourable = (max(row.high for row in since) - midpoint
+                              if zone.role == "support" else
+                              midpoint - min(row.low for row in since))
+                departure = max(0.0, favourable) / current_atr
+            source_bar = next(
+                (row for row in self.pa.bars if row.timestamp == zone.created_at), None
+            )
+            if source_bar is None:
+                continue
+            related_events = [
+                row for row in self.pa.events.values() if row.zone_id == zone.id
+            ]
+            self.liquidity.add_zone(
+                self.symbol, self.timeframe, price=midpoint, role=zone.role,
+                created_at=zone.created_at,
+                source_candle_id=candle_id(self.symbol, self.timeframe, source_bar),
+                flipped=zone.flipped,
+                atr_width=((float(zone.high) - float(zone.low)) / current_atr
+                           if current_atr > 0 else None),
+                departure_strength_atr=departure,
+                # Displacement is retained only when the existing SMC engine
+                # observed an FVG after this zone; it is not a new PA gate.
+                displacement=any(
+                    gap.created_at >= zone.confirmed_at for gap in self.smc.fvgs.values()
+                ),
+                structure_break=any(
+                    row.event_type == "confirmed_breakout" for row in related_events
+                ),
+                distance_to_opposing_liquidity=(min(opposing) if opposing else None),
+            )
 
     def _on_closed_bar(self, bar: Bar) -> None:
         try:
             cid = candle_id(self.symbol, self.timeframe, bar)
-            liquidity = self.liquidity.ingest(self.symbol, self.timeframe, bar, cid)
+            self._feed_reliable()
+            self.liquidity.ingest(self.symbol, self.timeframe, bar, cid)
             pa_snapshot = self.pa.process_closed_bar(
                 bar, market_data_health=("SYNCHRONIZED" if self._market_data_fresh else "STALE_CANDLES"))
             smc_snapshot = self.smc.process_closed_bar(bar)
+            self._collect_pa_zones()
+            liquidity = self.liquidity.snapshot(self.symbol, self.timeframe)
             features = self._feature_projection(bar, pa_snapshot, smc_snapshot, liquidity)
             lineage = stable_hash(features)
             decisions = self.variants.evaluate(
@@ -179,9 +288,13 @@ class ResearchObservationRuntime:
                 self._last_error = f"research observation failed closed: {exc}"
 
     def _on_quote(self, quote: dict) -> None:
-        if not self._market_data_fresh:
+        if not self._feed_reliable():
             return
         try:
+            accepted, _quote_id = self.store.accept_quote(self.symbol, quote)
+            if not accepted:
+                return
+            self._attribute_due_funding(quote)
             for order in self.store.open_orders(self.symbol):
                 if order["status"] in {"INTENT", "SHADOW_REJECTED_INTENT"}:
                     self.store.record_fill(
@@ -203,23 +316,62 @@ class ResearchObservationRuntime:
                         exit_reason="STOP" if stop_hit else "TARGET",
                         slippage_bps=float(self.research_config.get("slippage_bps", 3.0)),
                         commission_bps=float(self.research_config.get("commission_bps", 4.0)),
+                        funding=self.store.funding_total(
+                            account_id=order["account_id"],
+                            position_id=order["order_id"],
+                        ),
                     )
                 _ = excursion
         except Exception as exc:
             with self._lock:
                 self._last_error = f"research quote observation failed closed: {exc}"
 
+    @staticmethod
+    def _timestamp(value: object) -> datetime:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _attribute_due_funding(self, quote: dict) -> None:
+        """Attribute one public funding event once its announced time passes."""
+        event_at = self._timestamp(quote.get("event_timestamp") or quote.get("received_at"))
+        if self._next_funding_at is not None and event_at >= self._next_funding_at:
+            mark = float(quote.get("mark") or 0)
+            if mark <= 0:
+                raise ValueError("funding attribution requires a positive public mark")
+            for order in self.store.open_orders(self.symbol):
+                if order["status"] != "FILLED":
+                    continue
+                direction = 1 if str(order["side"]).lower() in {"buy", "long"} else -1
+                amount = (mark * float(order["quantity"]) * self._next_funding_rate
+                          * direction)
+                self.store.record_funding(
+                    account_id=order["account_id"], position_id=order["order_id"],
+                    funding_timestamp=self._next_funding_at, amount=amount,
+                )
+            self._next_funding_at = None
+        announced = quote.get("next_funding_time")
+        if announced:
+            announced_at = self._timestamp(announced)
+            if announced_at > event_at and (
+                    self._next_funding_at is None or announced_at != self._next_funding_at):
+                self._next_funding_at = announced_at
+                self._next_funding_rate = float(quote.get("funding_rate") or 0)
+
     def status(self) -> dict:
         with self._lock:
             observation = dict(self._last_observation)
             error = self._last_error
+        feed = self._subscriptions[0].status()
+        self._market_data_fresh = bool(feed.get("reliable"))
         return {
-            "state": "ERROR" if error else "OBSERVING",
+            "state": "ERROR" if error else ("OBSERVING" if self._market_data_fresh else "BLOCKED"),
             "error": error or None,
             "execution_class": "SHADOW", "real_execution_allowed": False,
             "symbol": self.symbol, "timeframe": self.timeframe,
+            "market_data": feed,
             "last_observation": observation,
             "table_counts": self.store.table_counts(),
             "registry": self.variants.registry,
         }
-

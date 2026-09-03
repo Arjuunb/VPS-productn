@@ -524,7 +524,7 @@ class PaperBrokerV2:
                 decision = self._timestamp(
                     order.get("decision_timestamp") or order.get("created_at")
                 )
-                if received <= decision:
+                if received <= decision or event_at <= decision:
                     continue
                 side, typ = order["side"], order["type"]
                 price = ask if side == "buy" else bid

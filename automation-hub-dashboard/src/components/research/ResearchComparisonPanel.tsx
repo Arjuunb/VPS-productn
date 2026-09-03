@@ -8,7 +8,19 @@ interface VariantRow {
   profit_factor: number | null;
   max_drawdown_r: number;
   stability: number;
+  mean_mae_r: number | null;
+  mean_mfe_r: number | null;
+  target_hits: number;
+  stop_hits: number;
+  slices: Record<string, SliceRow[]>;
   validation_state: "INSUFFICIENT_SAMPLE" | "PROMISING" | "NO NET EDGE" | "HARMFUL";
+}
+
+interface SliceRow {
+  name: string;
+  sample_size: number;
+  expectancy_r: number;
+  profit_factor: number | null;
 }
 
 interface Contribution {
@@ -40,6 +52,11 @@ interface ObservatoryStatus {
 const number = (value: number | null | undefined, digits = 2) =>
   value == null || !Number.isFinite(value) ? "—" : value.toFixed(digits);
 
+const sliceSummary = (rows: SliceRow[] | undefined) => (rows ?? [])
+  .filter((row) => row.sample_size > 0)
+  .sort((a, b) => b.expectancy_r - a.expectancy_r)
+  .slice(0, 4);
+
 export default function ResearchComparisonPanel({ engine }: { engine: "PA" | "SMC" }) {
   const comparison = useLive<Comparison>("/research/observatory/comparison", 10_000);
   const status = useLive<ObservatoryStatus>("/research/observatory/status", 5_000);
@@ -59,6 +76,10 @@ export default function ResearchComparisonPanel({ engine }: { engine: "PA" | "SM
       <span>{best ? `${number(best.expectancy_r)}R expectancy · n=${best.sample_size} · ${best.validation_state}` : `Minimum validation sample ${comparison.data?.minimum_validation_sample ?? 100}`}</span>
       <small>Ranking uses expectancy, profit factor, drawdown, stability and sample size—not win rate.</small>
     </div>
+    {best ? <div className="research-evidence-grid">
+      <article><b>Excursion vs exits</b><span>Mean MFE {number(best.mean_mfe_r)}R · MAE {number(best.mean_mae_r)}R</span><span>Targets {best.target_hits} · Stops {best.stop_hits}</span></article>
+      {(["liquidity_type", "session", "htf_bias", "fvg", "choch", "bos"] as const).map((dimension) => <article key={dimension}><b>{dimension.replace(/_/g, " ")}</b>{sliceSummary(best.slices?.[dimension]).map((row) => <span key={row.name}>{row.name}: {number(row.expectancy_r)}R · n={row.sample_size} · PF {number(row.profit_factor)}</span>)}{!sliceSummary(best.slices?.[dimension]).length ? <span>No closed outcomes</span> : null}</article>)}
+    </div> : null}
     {status.data?.error ? <div className="research-error">{status.data.error}</div> : null}
     <div className="research-table-wrap"><table><thead><tr><th>Rank</th><th>Variant</th><th>n</th><th>Net expectancy</th><th>PF</th><th>DD</th><th>Stability</th><th>Validation</th></tr></thead><tbody>
       {rows.map((row) => <tr key={row.strategy_id}><td>{row.rank}</td><td>{row.strategy_id}</td><td>{row.sample_size}</td><td>{number(row.expectancy_r)}R</td><td>{number(row.profit_factor)}</td><td>{number(row.max_drawdown_r)}R</td><td>{number(row.stability * 100, 0)}%</td><td><b className={`research-verdict ${row.validation_state.toLowerCase().replace(/_/g, "-")}`}>{row.validation_state}</b></td></tr>)}

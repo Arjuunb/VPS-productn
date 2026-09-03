@@ -927,6 +927,15 @@ from services.shadow_research import ShadowResearchStore  # noqa: E402
 from services.price_action_research import PriceActionExperimentRunner, PriceActionExperimentStore  # noqa: E402
 v2_market_data = MarketDataService(settings.market_data_v2_dir)
 forward_paper_market_hub = ForwardPaperMarketDataHub(v2_market_data.public_usdm_window)
+_shadow_path = _os.path.abspath(settings.shadow_research_db)
+_execution_paths = {
+    _os.path.abspath(path) for path in (
+        settings.paper_broker_v2_db, settings.price_action_paper_db,
+        settings.smc_paper_db, settings.price_action_research_db,
+    )
+}
+if _shadow_path in _execution_paths:
+    raise RuntimeError("HUB_SHADOW_RESEARCH_DB must be physically separate from every paper/research ledger")
 shadow_research_store = ShadowResearchStore(settings.shadow_research_db)
 research_observer = ResearchObservationRuntime(
     forward_paper_market_hub, shadow_research_store,

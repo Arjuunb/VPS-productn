@@ -180,7 +180,7 @@ class ShadowResearchStore:
         decision_id = "shadow-decision-" + hashlib.sha256(decision_key.encode()).hexdigest()[:28]
         with self._lock, self._db:
             self._db.execute(
-                "INSERT OR IGNORE INTO shadow_decisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR IGNORE INTO shadow_decisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (decision_id, decision_key, engine, account_id, strategy_id,
                  strategy_version, config_hash, candle_id, action_class,
                  direction, EXECUTION_CLASS, blocker, iso(decision_timestamp),
@@ -263,9 +263,13 @@ class ShadowResearchStore:
         if not row:
             raise KeyError(order_id)
         event_at = iso(quote.get("event_timestamp") or quote.get("received_at"))
-        if event_at <= iso(row["decision_timestamp"]):
+        received_at = iso(quote.get("received_at") or quote.get("event_timestamp"))
+        if event_at <= iso(row["decision_timestamp"]) or received_at <= iso(row["decision_timestamp"]):
             return None
-        accepted, quote_id = self.accept_quote(str(quote.get("symbol") or "UNKNOWN"), quote)
+        quote_symbol = str(quote.get("symbol") or row["symbol"]).upper().replace("/", "")
+        if quote_symbol != str(row["symbol"]):
+            raise ValueError("shadow quote symbol does not match the order")
+        accepted, quote_id = self.accept_quote(quote_symbol, quote)
         if not accepted:
             return None
         fill_key = key(order_id, quote_id)
@@ -310,6 +314,16 @@ class ShadowResearchStore:
                 "SELECT * FROM shadow_funding WHERE funding_key=?", (funding_key,)
             ).fetchone()
         return self._decode(row)
+
+    def funding_total(self, *, account_id: str, position_id: str) -> float:
+        """Return immutable funding attribution for one shadow position."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COALESCE(SUM(amount),0) FROM shadow_funding "
+                "WHERE account_id=? AND position_id=?",
+                (account_id, position_id),
+            ).fetchone()
+        return float(row[0])
 
     def observe_mae_mfe(self, order_id: str, quote: dict,
                         *, execution_class: str = EXECUTION_CLASS) -> dict:
@@ -428,7 +442,7 @@ class ShadowResearchStore:
     def measurements(self, *, limit: int = 1000) -> list[dict]:
         with self._lock:
             rows = self._db.execute(
-                "SELECT d.engine,d.strategy_id,d.strategy_version,d.config_hash,"
+                "SELECT d.engine,d.strategy_id,d.strategy_version,d.config_hash,d.execution_class,"
                 "d.candle_id,d.snapshot_lineage,d.blocker,d.context_json,o.*,f.*,x.*,m.* "
                 "FROM shadow_decisions d LEFT JOIN shadow_orders o ON o.decision_id=d.decision_id "
                 "LEFT JOIN shadow_fills f ON f.order_id=o.order_id "
@@ -439,7 +453,7 @@ class ShadowResearchStore:
         return [self._decode(row) for row in rows]
 
     def open_orders(self, symbol: str | None = None) -> list[dict]:
-        sql = ("SELECT o.*,d.decision_timestamp,d.blocker,d.context_json "
+        sql = ("SELECT o.*,d.account_id,d.decision_timestamp,d.blocker,d.context_json "
                "FROM shadow_orders o JOIN shadow_decisions d ON d.decision_id=o.decision_id "
                "WHERE o.status IN ('INTENT','SHADOW_REJECTED_INTENT','FILLED')")
         args: tuple = ()

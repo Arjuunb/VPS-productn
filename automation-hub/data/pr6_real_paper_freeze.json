@@ -1,0 +1,10 @@
+{
+  "baseline_commit": "5b351e9",
+  "purpose": "Prove the PA/SMC research upgrade did not alter PR #6 real-paper strategy behavior.",
+  "sha256": {
+    "services/price_action_lab.py": "ead7d27ec5af4de2468043a35a658177d109cef3773e545e584638d27737af75",
+    "services/smc_strategy_lab.py": "e31cd8eeca4616c8519075b19908908be2c1ba4b152b935412d6dcf4bc0e6596",
+    "services/native_price_action.py": "9f67b877d943d831a8e234c5f09be955f9a917d2b4e0b7a5a19457a4422e2259",
+    "services/native_smc.py": "741d8018cf53de53ed84a4cedd5513748e16a1b33e70e2058ccc28ebdbe3a389"
+  }
+}

@@ -72,6 +72,11 @@ class LiquidityReference:
     freshness: str = "FRESH"
     invalidated_at: str | None = None
     age_bars: int = 0
+    atr_width: float | None = None
+    departure_strength_atr: float | None = None
+    displacement: bool | None = None
+    structure_break: bool | None = None
+    distance_to_opposing_liquidity: float | None = None
 
     def payload(self) -> dict:
         return asdict(self)
@@ -105,9 +110,12 @@ class CausalHTFContext:
         rows = self._rows.setdefault(key, [])
         if any(existing_id == candle_id for _, _, existing_id in rows):
             return
-        if rows and opened <= utc(rows[-1][1].timestamp):
-            raise ValueError("HTF candles must be chronological")
         rows.append((closed, bar, candle_id))
+        rows.sort(key=lambda row: (row[0], row[2]))
+        timestamps = [utc(row[1].timestamp) for row in rows]
+        if len(timestamps) != len(set(timestamps)):
+            rows.remove((closed, bar, candle_id))
+            raise ValueError("conflicting HTF candle identity for one open timestamp")
 
     def at(self, symbol: str, decision_time: datetime) -> dict[str, dict | None]:
         decision = utc(decision_time)
@@ -155,7 +163,7 @@ class NamedLiquidityBook:
         self.equal_tolerance_atr = equal_tolerance_atr
         self._bars: dict[tuple[str, str], list[tuple[Bar, str]]] = {}
         self._references: dict[tuple[str, str], dict[str, LiquidityReference]] = {}
-        self._periods: dict[tuple[str, str, str], tuple[object, float, float, str, datetime]] = {}
+        self._periods: dict[tuple[str, str, str], dict] = {}
 
     @property
     def config_hash(self) -> str:
@@ -168,26 +176,40 @@ class NamedLiquidityBook:
 
     @staticmethod
     def _add(refs: dict[str, LiquidityReference], *, kind: str, price: float,
-             created_at: datetime, timeframe: str, candle_id: str, side: str) -> None:
+             created_at: datetime, timeframe: str, candle_id: str,
+             side: str) -> LiquidityReference:
         ident = "liq-" + stable_hash({
             "type": kind, "price": float(price), "created_at": utc(created_at).isoformat(),
             "timeframe": timeframe, "candle_id": candle_id,
         })[:24]
-        refs.setdefault(ident, LiquidityReference(
+        row = refs.setdefault(ident, LiquidityReference(
             id=ident, type=kind, price=float(price),
             created_at=utc(created_at).isoformat(), source_timeframe=timeframe,
             source_candle_id=candle_id, side=side,
         ))
+        return row
 
     def add_zone(self, symbol: str, timeframe: str, *, price: float, role: str,
-                 created_at: datetime, source_candle_id: str, flipped: bool = False) -> None:
+                 created_at: datetime, source_candle_id: str, flipped: bool = False,
+                 atr_width: float | None = None,
+                 departure_strength_atr: float | None = None,
+                 displacement: bool | None = None,
+                 structure_break: bool | None = None,
+                 distance_to_opposing_liquidity: float | None = None) -> None:
         kind = (("FLIPPED_RESISTANCE" if role == "support" else "FLIPPED_SUPPORT")
                 if flipped else ("SUPPORT_ZONE" if role == "support" else "RESISTANCE_ZONE"))
         key = (symbol.upper().replace("/", ""), timeframe)
-        self._add(self._references.setdefault(key, {}), kind=kind, price=price,
-                  created_at=created_at, timeframe=timeframe,
-                  candle_id=source_candle_id,
-                  side="LOW" if role == "support" else "HIGH")
+        row = self._add(
+            self._references.setdefault(key, {}), kind=kind, price=price,
+            created_at=created_at, timeframe=timeframe,
+            candle_id=source_candle_id,
+            side="LOW" if role == "support" else "HIGH",
+        )
+        row.atr_width = atr_width
+        row.departure_strength_atr = departure_strength_atr
+        row.displacement = displacement
+        row.structure_break = structure_break
+        row.distance_to_opposing_liquidity = distance_to_opposing_liquidity
 
     @staticmethod
     def _atr(rows: Iterable[Bar], length: int = 14) -> float | None:
@@ -203,20 +225,37 @@ class NamedLiquidityBook:
                      bar: Bar, candle_id: str, high_type: str, low_type: str) -> None:
         state_key = (*key, period_type)
         current = self._periods.get(state_key)
-        if current and current[0] != period_key:
-            _, high, low, source_id, started = current
+        if current and current["period_key"] != period_key:
             refs = self._references.setdefault(key, {})
-            self._add(refs, kind=high_type, price=high, created_at=started,
-                      timeframe=key[1], candle_id=source_id, side="HIGH")
-            self._add(refs, kind=low_type, price=low, created_at=started,
-                      timeframe=key[1], candle_id=source_id, side="LOW")
+            # Use the completed period's own labels and the exact candles that
+            # established each extreme. The next session/day must never rename
+            # prior evidence or inherit the first candle as false provenance.
+            self._add(
+                refs, kind=current["high_type"], price=current["high"],
+                created_at=current["high_at"], timeframe=key[1],
+                candle_id=current["high_candle_id"], side="HIGH",
+            )
+            self._add(
+                refs, kind=current["low_type"], price=current["low"],
+                created_at=current["low_at"], timeframe=key[1],
+                candle_id=current["low_candle_id"], side="LOW",
+            )
             current = None
         if current is None:
-            self._periods[state_key] = (period_key, bar.high, bar.low,
-                                        candle_id, utc(bar.timestamp))
+            self._periods[state_key] = {
+                "period_key": period_key,
+                "high": bar.high, "low": bar.low,
+                "high_candle_id": candle_id, "low_candle_id": candle_id,
+                "high_at": utc(bar.timestamp), "low_at": utc(bar.timestamp),
+                "high_type": high_type, "low_type": low_type,
+            }
         else:
-            self._periods[state_key] = (period_key, max(current[1], bar.high),
-                                        min(current[2], bar.low), current[3], current[4])
+            if bar.high > current["high"]:
+                current.update(high=bar.high, high_candle_id=candle_id,
+                               high_at=utc(bar.timestamp))
+            if bar.low < current["low"]:
+                current.update(low=bar.low, low_candle_id=candle_id,
+                               low_at=utc(bar.timestamp))
 
     def ingest(self, symbol: str, timeframe: str, bar: Bar, candle_id: str) -> list[dict]:
         if not candle_id:
@@ -291,4 +330,3 @@ class NamedLiquidityBook:
             self._references.get(key, {}).values(),
             key=lambda item: (item.created_at, item.type, item.id),
         )]
-

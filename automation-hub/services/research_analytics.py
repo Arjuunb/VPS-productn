@@ -22,6 +22,10 @@ def metrics(rows: list[dict]) -> dict:
         drawdown = max(drawdown, peak - equity)
     profit_factor = (sum(wins) / abs(sum(losses)) if losses else
                      (None if wins else 0.0))
+    mae = [float(row["mae_r"]) for row in closed if row.get("mae_r") is not None]
+    mfe = [float(row["mfe_r"]) for row in closed if row.get("mfe_r") is not None]
+    target_hits = sum(row.get("exit_reason") == "TARGET" for row in closed)
+    stop_hits = sum(row.get("exit_reason") == "STOP" for row in closed)
     return {
         "sample_size": len(net),
         "expectancy_r": sum(net) / len(net) if net else 0.0,
@@ -30,6 +34,9 @@ def metrics(rows: list[dict]) -> dict:
         "max_drawdown_r": drawdown,
         "wins": len(wins), "losses": len(losses),
         "net_r": sum(net), "gross_r": sum(gross),
+        "mean_mae_r": sum(mae) / len(mae) if mae else None,
+        "mean_mfe_r": sum(mfe) / len(mfe) if mfe else None,
+        "target_hits": target_hits, "stop_hits": stop_hits,
     }
 
 
@@ -66,6 +73,9 @@ class ResearchComparison:
             "session": defaultdict(list),
             "liquidity_type": defaultdict(list),
             "htf_bias": defaultdict(list),
+            "fvg": defaultdict(list),
+            "choch": defaultdict(list),
+            "bos": defaultdict(list),
         }
         for row in rows:
             features = (row.get("context") or {}).get("features") or {}
@@ -73,10 +83,11 @@ class ResearchComparison:
             htf = features.get("htf") or {}
             selected = htf.get("4h") or htf.get("1h") or {}
             dimensions["htf_bias"][str(selected.get("bias") or "UNAVAILABLE")].append(row)
-            liquidity = features.get("liquidity") or []
-            names = sorted({str(item.get("type")) for item in liquidity if item.get("type")}) or ["NONE"]
+            names = list(features.get("relevant_liquidity_types") or []) or ["NONE"]
             for name in names:
                 dimensions["liquidity_type"][name].append(row)
+            for name in ("fvg", "choch", "bos"):
+                dimensions[name]["PRESENT" if features.get(name) else "ABSENT"].append(row)
         return {dimension: [
             {"name": name, **metrics(items)} for name, items in sorted(groups.items())
         ] for dimension, groups in dimensions.items()}
@@ -144,4 +155,3 @@ class ResearchComparison:
             "allowed_validation_states": ["INSUFFICIENT_SAMPLE", "PROMISING",
                                           "NO NET EDGE", "HARMFUL"],
         }
-
