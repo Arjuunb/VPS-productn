@@ -65,6 +65,7 @@ class PriceActionPublicStream:
         self._forming: Bar | None = None
         self._quote = {"last": None, "bid": None, "ask": None, "mark": None,
                        "funding_rate": None, "next_funding_time": None}
+        self._quote_sequence = 0
         self._seen_events: set[tuple] = set()
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -120,7 +121,9 @@ class PriceActionPublicStream:
                 })
             return False
 
-    def _deliver_quote(self, event: str, received_at: datetime) -> bool:
+    def _deliver_quote(self, event: str, received_at: datetime, *,
+                       event_timestamp: datetime | None = None,
+                       sequence: int | None = None) -> bool:
         """Publish one immutable public quote snapshot to paper consumers.
 
         The callback runs only after the stream state has been updated.  It is
@@ -130,6 +133,7 @@ class PriceActionPublicStream:
         if not self.quote_sink:
             return True
         with self._lock:
+            self._quote_sequence += 1
             payload = {
                 **self._quote,
                 "event": event,
@@ -137,6 +141,8 @@ class PriceActionPublicStream:
                 "symbol": self.symbol,
                 "timeframe": self.timeframe,
                 "received_at": received_at.isoformat(),
+                "event_timestamp": (event_timestamp or received_at).isoformat(),
+                "sequence": int(sequence if sequence is not None else self._quote_sequence),
             }
         try:
             self.quote_sink(payload)
@@ -465,14 +471,26 @@ class PriceActionPublicStream:
             with self._lock:
                 self._quote.update({"bid": float(data["b"]), "ask": float(data["a"])})
                 self.last_quote_update = now
-            persisted = self._deliver_quote("bookTicker", now)
+            event_at = datetime.fromtimestamp(int(data.get("E") or data.get("T") or
+                                                   int(now.timestamp() * 1000)) / 1000,
+                                              tz=timezone.utc)
+            persisted = self._deliver_quote(
+                "bookTicker", now, event_timestamp=event_at,
+                sequence=int(data.get("u") or data.get("U") or 0) or None,
+            )
             return {"accepted": True, "quote": True, "sink_persisted": persisted}
         if event == "markPriceUpdate":
             with self._lock:
                 self._quote.update({"mark": float(data["p"]), "funding_rate": float(data.get("r") or 0),
                                     "next_funding_time": datetime.fromtimestamp(int(data["T"]) / 1000, tz=timezone.utc).isoformat()})
                 self.last_mark_update = now
-            persisted = self._deliver_quote("markPriceUpdate", now)
+            event_at = datetime.fromtimestamp(int(data.get("E") or
+                                                   int(now.timestamp() * 1000)) / 1000,
+                                              tz=timezone.utc)
+            persisted = self._deliver_quote(
+                "markPriceUpdate", now, event_timestamp=event_at,
+                sequence=int(data.get("E") or 0) or None,
+            )
             return {"accepted": True, "mark": True, "sink_persisted": persisted}
         return {"accepted": False, "ignored": True}
 

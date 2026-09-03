@@ -6,6 +6,8 @@ accounts, orders, positions, risk state, pause state, or strategy state.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -39,6 +41,7 @@ class _Channel:
     stream: PriceActionPublicStream
     consumers: dict[str, _Consumer] = field(default_factory=dict)
     last_candle_id: str | None = None
+    quote_sequence: int = 0
 
 
 class ForwardPaperMarketDataHub:
@@ -87,11 +90,28 @@ class ForwardPaperMarketDataHub:
             def on_quote(quote: dict) -> None:
                 with self._lock:
                     channel = holder["channel"]
+                    channel.quote_sequence += 1
                     consumers = list(channel.consumers.values())
                     cid = channel.last_candle_id
+                    sequence = int(quote.get("sequence") or channel.quote_sequence)
+                    event_timestamp = str(quote.get("event_timestamp") or
+                                          quote.get("received_at") or "")
+                    identity = {
+                        "source": "BINANCE_USDM_PUBLIC_WEBSOCKET",
+                        "symbol": symbol, "timeframe": timeframe,
+                        "event_timestamp": event_timestamp, "sequence": sequence,
+                        "bid": quote.get("bid"), "ask": quote.get("ask"),
+                        "mark": quote.get("mark"),
+                    }
+                    quote_event_id = "quote-" + hashlib.sha256(json.dumps(
+                        identity, sort_keys=True, separators=(",", ":")
+                    ).encode()).hexdigest()[:32]
                 snapshot = {
                     **quote,
                     "candle_id": cid,
+                    "event_timestamp": event_timestamp,
+                    "sequence": sequence,
+                    "quote_event_id": quote_event_id,
                     "market_data_source": "Binance USD-M public WebSocket",
                 }
                 for consumer in consumers:
@@ -232,4 +252,3 @@ class ForwardPaperSubscription:
                 raise RuntimeError("Binance USD-M hub has no closed candles")
             return list(bars[-max(1, int(limit)):]), "live (binance_usdm_hub)"
         return fetch
-
