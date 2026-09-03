@@ -417,15 +417,15 @@ export default function SMCStrategyLabPage() {
 
   return <div className="pa-lab smc-strategy-lab">
     <header className="pa-titlebar">
-      <div><span className="pa-kicker">NATIVE RESEARCH TERMINAL</span><h1>SMC Strategy Lab</h1><p>One closed-candle SMC engine · historical review + live paper observation</p></div>
+      <div><span className="pa-kicker">ISOLATED FORWARD-PAPER</span><h1>SMC Strategy Lab</h1><p>Live Binance USD-M data · simulated orders · no exchange routing</p></div>
       <button type="button" className="pa-controls-toggle" onClick={() => setControlsOpen((open) => !open)} aria-expanded={controlsOpen}>Controls</button>
-      <div className="pa-safety"><b>PAPER ONLY</b><span>REAL ORDERS DISABLED</span></div>
+      <div className="pa-safety"><b>{paper.data?.session.operating_mode === "signals_only" ? "SIGNALS_ONLY" : "ISOLATED_FORWARD_PAPER"}</b><span>LIVE ROUTING DISABLED</span></div>
     </header>
     <div className={`pa-health-scope ${feedReliable ? "is-healthy" : "is-stale"}`}>
       <b>SMC STRATEGY SESSION</b><span>Candles / quote / mark: {healthState}</span>
       <span>Decision readiness: {feedReliable && chartFeed !== "checkpoint" ? "CLOSED-BAR ELIGIBLE" : "PAUSED · FAIL CLOSED"}</span>
       <span>Paper execution: {feedReliable && chartFeed !== "checkpoint" ? "ELIGIBLE UNDER SAVED MODE" : "BLOCKED"}</span>
-      <small>The global footer reports the selected Trading Instance, not this independent SMC session.</small>
+      <small>This page and footer report only the isolated SMC account.</small>
     </div>
 
     <div className="pa-workspace">

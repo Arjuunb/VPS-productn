@@ -78,7 +78,10 @@ class PriceActionPaperAccount:
     def __init__(self, path: str | Path, *, starting_balance: float = 10_000.0):
         self.path = str(path)
         self.starting_balance = float(starting_balance)
-        self.broker = PaperBrokerV2(self.path, starting_balance=self.starting_balance)
+        self.broker = PaperBrokerV2(
+            self.path, starting_balance=self.starting_balance,
+            account_type="PA_LAB", execution_engine="PA_LAB",
+        )
         self._lock = threading.RLock()
         # Metadata and the broker share one SQLite file but use separate
         # connections. Autocommit prevents a metadata write lock from being
@@ -1189,7 +1192,16 @@ class PriceActionPaperAccount:
                                    quantity=quantity, stop_price=entry, market_open=True,
                                    protection_stop_loss=stop, protection_take_profit=target,
                                    protection_target_r=config.target_r,
-                                   protection_tick_size=tick or None)
+                                   protection_tick_size=tick or None,
+                                   signal_timestamp=str(proposal.get("_decision_timestamp") or proposal.get("created_at") or _iso()),
+                                   decision_timestamp=str(proposal.get("_decision_timestamp") or proposal.get("created_at") or _iso()),
+                                   signal_price=float(proposal.get("entry") or entry),
+                                   requested_price=entry,
+                                   strategy=proposal["strategy_id"],
+                                   strategy_version=PRICE_ACTION_STRATEGY_VERSION,
+                                   timeframe=current.get("timeframe") or "",
+                                   market_data_source="Binance USD-M public WebSocket",
+                                   candle_id=str(idempotency_key or ""))
         now = _iso()
         self._db.execute(
             "INSERT INTO pa_order_meta(order_id,session_id,proposal_id,setup_id,zone_id,direction,strategy_id,config_json,status,reason,created_at,updated_at,valid_until_index) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -1210,7 +1222,8 @@ class PriceActionPaperAccount:
     def synchronize_strategy(self, visual_state: dict, *, contract_rules: dict,
                              candle: Bar, feed_reliable: bool = True,
                              feed_status: dict | None = None,
-                             execution_quote: dict | None = None) -> dict:
+                             execution_quote: dict | None = None,
+                             allow_candle_fills: bool = True) -> dict:
         """Advance broker state and consume newly eligible proposals exactly once."""
         config = self._execution_config()
         current = self.session()
@@ -1255,10 +1268,12 @@ class PriceActionPaperAccount:
                 }
             result = (self.broker.process_candle(
                 current.get("symbol", "BTCUSDT"), candle, protections=protections)
-                if feed_reliable else {
+                if feed_reliable and allow_candle_fills else {
                     "symbol": current.get("symbol", "BTCUSDT"), "events": [],
                     "account": self.broker.account(), "paused": True,
-                    "reason": "unreliable market data; no fills or exits inferred",
+                    "reason": ("waiting for the next public quote after decision"
+                               if feed_reliable else
+                               "unreliable market data; no fills or exits inferred"),
                 })
             quote_evidence = None
             if feed_reliable and (feed_status or {}).get("state") == "SYNCHRONIZED":
@@ -1353,6 +1368,11 @@ class PriceActionPaperAccount:
                                     correlation_id=correlation, idempotency_key=idempotency)
                 elif config.operating_mode == "automatic":
                     try:
+                        decision_time = (
+                            candle.timestamp + timedelta(
+                                milliseconds=TF_MS[current.get("timeframe") or "5m"])
+                        ).isoformat()
+                        proposal = {**proposal, "_decision_timestamp": decision_time}
                         placed = self._place_proposal(
                             proposal, setup, contract_rules, config, source="automatic",
                             correlation_id=correlation, idempotency_key=idempotency)
@@ -1396,6 +1416,99 @@ class PriceActionPaperAccount:
                 "journal_persistence": persistence,
                 "operating_mode": config.operating_mode, "feed_reliable": feed_reliable,
                 "real_execution_allowed": False}
+
+    def process_quote(self, symbol: str, quote: dict, *, feed_reliable: bool) -> dict:
+        """Advance this isolated account from a strictly post-decision quote.
+
+        Closed candles create paper intents; they never fill them in the live
+        runtime.  The shared public-feed hub invokes this method with the next
+        reconciled bid/ask/mark snapshot.  Account and metadata writes remain
+        scoped to the Price Action database.
+        """
+        current = self.session()
+        if not current:
+            raise ValueError("no active Price Action session")
+        if not feed_reliable:
+            return {"events": [], "paused": True,
+                    "reason": "market data is not synchronized",
+                    "real_execution_allowed": False}
+        with self._lock:
+            rows = [dict(row) for row in self._db.execute(
+                "SELECT * FROM pa_order_meta WHERE session_id=? "
+                "AND status IN ('ORDER_PENDING','PARTIALLY_FILLED','ENTERED')",
+                (current["id"],),
+            )]
+            protections = {}
+            for row in rows:
+                config = json.loads(row["config_json"] or "{}")
+                protections[row["order_id"]] = {
+                    "stop_loss": config.get("stop"),
+                    "take_profit": config.get("target"),
+                    "target_r": config.get("target_r", 2.5),
+                    "tick_size": (config.get("contract_rules") or {}).get("tick_size"),
+                }
+        result = self.broker.process_tick(symbol, quote, protections=protections)
+        for event in result["events"]:
+            with self._lock:
+                meta = self._db.execute(
+                    "SELECT * FROM pa_order_meta WHERE order_id=?",
+                    (event.get("order_id"),),
+                ).fetchone()
+                if meta:
+                    config = json.loads(meta["config_json"] or "{}")
+                    order = self.broker.order(meta["order_id"])
+                    status = "ENTERED" if order["status"] == "filled" else "PARTIALLY_FILLED"
+                    self._db.execute(
+                        "UPDATE pa_order_meta SET status=?,reason=?,updated_at=? WHERE order_id=?",
+                        (status, "paper fill simulated from post-decision public quote",
+                         _iso(), meta["order_id"]),
+                    )
+                    self._audit(
+                        "paper_order_filled", strategy_id=meta["strategy_id"],
+                        object_id=meta["order_id"],
+                        payload={**event, "execution_quote": quote,
+                                 "correlation_id": config.get("correlation_id")},
+                    )
+                    self._advance_evaluation(
+                        config.get("correlation_id"), "FILLED",
+                        "paper order filled from a strictly post-decision public quote",
+                        order_id=meta["order_id"], fill=event,
+                    )
+                    if status == "ENTERED":
+                        self._advance_evaluation(
+                            config.get("correlation_id"), "POSITION_OPEN",
+                            "protected Price Action paper position opened",
+                            order_id=meta["order_id"], fill=event,
+                        )
+                elif str(event.get("order_id", "")).startswith("protective-"):
+                    owner = self._db.execute(
+                        "SELECT order_id,strategy_id,config_json FROM pa_order_meta "
+                        "WHERE session_id=? AND status='ENTERED' "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (current["id"],),
+                    ).fetchone()
+                    owner_config = json.loads(owner["config_json"] or "{}") if owner else {}
+                    self._audit(
+                        "paper_position_completed",
+                        strategy_id=owner["strategy_id"] if owner else "",
+                        object_id=owner["order_id"] if owner else event["order_id"],
+                        payload={**event, "execution_quote": quote,
+                                 "broker_event_order_id": event["order_id"]},
+                    )
+                    self._advance_evaluation(
+                        owner_config.get("correlation_id"), "EXITED",
+                        "protective paper exit completed from public quote",
+                        broker_event_order_id=event["order_id"], fill=event,
+                    )
+                    self._db.execute(
+                        "UPDATE pa_order_meta SET status='COMPLETED',reason=?,updated_at=? "
+                        "WHERE session_id=? AND status='ENTERED'",
+                        ("protective stop or target completed the paper position",
+                         _iso(), current["id"]),
+                    )
+        if result["events"]:
+            self._snapshot_current()
+        return {**result, "paper_only": True, "real_execution_allowed": False}
 
     def approve_candidate(self, proposal_id: str) -> dict:
         with self._lock, self._db:
@@ -1558,7 +1671,8 @@ class PriceActionLabRuntime:
     """One durable public-data/engine/executor owner for the Visual Lab."""
 
     def __init__(self, market: MarketDataService, account: PriceActionPaperAccount, *,
-                 poll_seconds: float = 5.0, autostart: bool = False):
+                 poll_seconds: float = 5.0, autostart: bool = False,
+                 market_hub=None):
         self.market, self.account = market, account
         self.poll_seconds = max(1.0, float(poll_seconds))
         self._lock = threading.RLock()
@@ -1568,9 +1682,16 @@ class PriceActionLabRuntime:
         self.identity: tuple[str, str] | None = None
         self.config_signature = ""
         self._shadow_runs: dict[str, dict] = {}
-        self.stream = PriceActionPublicStream(
-            market.public_usdm_window, event_sink=account.record_external_event,
-            bar_sink=self._on_closed_bar,
+        self.stream = (
+            market_hub.subscription(
+                "PA_LAB", event_sink=account.record_external_event,
+                bar_sink=self._on_closed_bar, quote_sink=self._on_quote,
+            )
+            if market_hub is not None else
+            PriceActionPublicStream(
+                market.public_usdm_window, event_sink=account.record_external_event,
+                bar_sink=self._on_closed_bar, quote_sink=self._on_quote,
+            )
         )
         if autostart:
             self._supervisor_thread = threading.Thread(
@@ -1657,6 +1778,22 @@ class PriceActionLabRuntime:
         return PriceActionConfig(symbol=symbol, timeframe=timeframe,
                                  **{key: value for key, value in raw.items() if key in allowed})
 
+    def _on_quote(self, quote: dict) -> None:
+        with self._lock:
+            if self.identity is None:
+                return
+            session = self.account.session()
+            if not session or session.get("mode") != "LIVE_PAPER":
+                return
+            if (normalize_symbol(session.get("symbol") or ""),
+                    session.get("timeframe")) != self.identity:
+                return
+            status = self.stream.status()
+            self.account.process_quote(
+                self.identity[0], quote,
+                feed_reliable=bool(status.get("reliable")),
+            )
+
     def _on_closed_bar(self, bar: Bar) -> None:
         with self._lock:
             if self.engine is None:
@@ -1702,7 +1839,8 @@ class PriceActionLabRuntime:
                     self.account.synchronize_strategy(
                         state, contract_rules=rules, candle=bar,
                         feed_reliable=bool(status["reliable"]),
-                        feed_status=status, execution_quote=quote)
+                        feed_status=status, execution_quote=quote,
+                        allow_candle_fills=False)
                 except PersistenceBlocked as exc:
                     self.account._mark_persistence_blocked(exc)
                     return

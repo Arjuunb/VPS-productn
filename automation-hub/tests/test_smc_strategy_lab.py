@@ -190,10 +190,10 @@ def test_restart_does_not_create_new_session_over_ended_session_exposure(tmp_pat
     assert resumed["positions"][0]["symbol"] == "BTCUSDT"
 
 
-def test_automatic_paper_is_default_and_live_execution_is_impossible(tmp_path):
+def test_signals_only_is_default_and_live_execution_is_impossible(tmp_path):
     account = SMCPaperAccount(tmp_path / "smc.db")
     state = account.state()
-    assert state["session"]["operating_mode"] == "automatic"
+    assert state["session"]["operating_mode"] == "signals_only"
     assert state["execution_mode"] == "PAPER"
     assert state["real_execution_allowed"] is False
     assert not hasattr(SMCPaperAccount, "enable_live")
@@ -202,8 +202,8 @@ def test_automatic_paper_is_default_and_live_execution_is_impossible(tmp_path):
         evaluation, rules=RULES,
         reference_price=evaluation["trade_plan"]["entry"], feed_reliable=True,
     )
-    assert result["candidate_status"] == "APPROVED_AUTOMATIC"
-    assert account.broker.orders()
+    assert result["candidate_status"] == "SIGNAL_ONLY"
+    assert account.broker.orders() == []
 
 
 @pytest.mark.parametrize("mode,expected,orders", [

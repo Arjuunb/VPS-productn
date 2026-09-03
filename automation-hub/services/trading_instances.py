@@ -19,7 +19,7 @@ from typing import Callable, Optional
 
 from data.ledger import Ledger, SqliteLedger, remote_call_with_retry
 from data.tenant_scope import ensure_column
-from execution.paper_engine import FillResult, PaperExecutionEngine
+from execution.paper_engine import FillResult, ForwardPaperExecutionEngine, PaperExecutionEngine
 from services.auto_engine import AutoStrategyEngine
 from services.controls import TradingControl
 from services.performance import summarize
@@ -692,6 +692,7 @@ class InstanceStore:
                     SET symbol=:symbol, strategy_key=:strategy_key, strategy_label=:strategy_label,
                         strategy_version=:strategy_version, timeframe=:timeframe,
                         risk_per_trade_pct=:risk_per_trade_pct, capital_allocation=:capital_allocation,
+                        exchange=:exchange, instrument_type=:instrument_type,
                         max_open_positions=:max_open_positions,
                         sizing_mode=:sizing_mode, fixed_position_size=:fixed_position_size,
                         fixed_quantity=:fixed_quantity, profit_reinvestment=:profit_reinvestment,
@@ -892,7 +893,8 @@ class TradingInstanceManager:
                  max_consecutive_losses: int = 0, cooldown_after_loss_min: int = 0,
                  session_start: int = 0, session_end: int = 24,
                  max_weekly_loss_pct: float = 0.0, max_trades_per_day: int = 0,
-                 trading_days_mask: int = 127, full_reboot_timeout_s: float | None = None):
+                 trading_days_mask: int = 127, full_reboot_timeout_s: float | None = None,
+                 market_hub=None, symbol_rules_provider=None):
         self.ledger, self.store = ledger, InstanceStore(ledger)
         self.strategy_factory, self.live, self.live_poll_s, self.fetcher = strategy_factory, live, live_poll_s, fetcher
         self.decision_store = decision_store
@@ -900,6 +902,8 @@ class TradingInstanceManager:
         self.trade_memory = trade_memory
         self.skipped_store = skipped_store
         self.cycle_store = cycle_store
+        self.market_hub = market_hub
+        self.symbol_rules_provider = symbol_rules_provider
         # Instance workers own their positions, but production risk policy is
         # supplied by the server and applied to every isolated pipeline. These
         # values were previously omitted, silently disabling several configured
@@ -1033,10 +1037,19 @@ class TradingInstanceManager:
             from services.fill_model import normalize_fill_model
             fill_model = normalize_fill_model(fill_model)
             exchange = str(exchange or "inherit").strip().lower()
+            if self.market_hub is not None and mode == "trading":
+                if exchange not in ("inherit", "binance", "binance_usdm"):
+                    raise ValueError(
+                        "Forward-paper comparison instances require Binance USD-M market data")
+                exchange = "binance_usdm"
+                instrument_type = "perpetual"
             if exchange not in ("inherit", "binance", "kraken", "coinbase", "bybit"):
-                raise ValueError("exchange must be one of inherit, binance, kraken, coinbase, bybit")
+                if exchange != "binance_usdm":
+                    raise ValueError("exchange must be Binance USD-M for forward paper")
             instrument_type = str(instrument_type or "spot").strip().lower()
-            if instrument_type != "spot":
+            if self.market_hub is not None and mode == "trading":
+                instrument_type = "perpetual"
+            elif instrument_type != "spot":
                 raise ValueError("Only spot instrument parity is currently supported for paper-forward instances")
             if not 1 <= int(max_open_positions) <= 50:
                 raise ValueError("max_open_positions must be between 1 and 50")
@@ -1186,10 +1199,39 @@ class TradingInstanceManager:
             controls = TradingControl()
             if entry_gate_closed:
                 controls.pause_all()
-            engine_type = ResearchExecutionEngine if inst.mode == "research" else PaperExecutionEngine
+            forward = inst.mode == "trading"
+            market = self.store.market_state(instance_id) if forward else {}
+            raw_pending = dict(market.get("pending_orders_json") or {})
+            namespaced_pending = "forward_paper_intents" in raw_pending
+            pending_state = {
+                "forward_paper_intents": dict(
+                    raw_pending.get("forward_paper_intents") or {}),
+                "strategy_limit_intents": dict(
+                    raw_pending.get("strategy_limit_intents") or
+                    ({} if namespaced_pending else raw_pending)),
+            }
+
+            def save_forward_intents(pending: dict) -> None:
+                pending_state["forward_paper_intents"] = dict(pending)
+                self.store.save_pending_orders(instance_id, dict(pending_state))
+
+            def save_strategy_intents(pending: dict) -> None:
+                pending_state["strategy_limit_intents"] = dict(pending)
+                self.store.save_pending_orders(instance_id, dict(pending_state))
+
+            engine_type = (ResearchExecutionEngine if inst.mode == "research" else
+                           ForwardPaperExecutionEngine if self.market_hub is not None else
+                           PaperExecutionEngine)
             from services.fill_model import from_name as fill_model_from_name
-            paper = engine_type(scoped, inst.starting_equity,
-                                fill_model=fill_model_from_name(inst.fill_model))
+            engine_kwargs = {}
+            if engine_type is ForwardPaperExecutionEngine:
+                engine_kwargs = {
+                    "initial_intents": pending_state["forward_paper_intents"],
+                    "intents_listener": save_forward_intents,
+                }
+            paper = engine_type(
+                scoped, inst.starting_equity,
+                fill_model=fill_model_from_name(inst.fill_model), **engine_kwargs)
             inst.current_realized_equity = paper.current_realized_equity()
             def persist_realized_equity(value: float) -> None:
                 inst.current_realized_equity = float(value)
@@ -1246,12 +1288,25 @@ class TradingInstanceManager:
                 "exchange": inst.exchange,
                 "instrument_type": inst.instrument_type,
             }
-            forward = inst.mode == "trading"
-            exchange = (inst.exchange if inst.exchange != "inherit"
-                        else (os.environ.get("HUB_EXCHANGE", "binance").strip() or "binance"))
+            exchange = ("binance_usdm" if self.market_hub is not None and forward else
+                        inst.exchange if inst.exchange != "inherit" else
+                        (os.environ.get("HUB_EXCHANGE", "binance").strip() or "binance"))
+            pipeline.journal_context.update({
+                "market_data_mode": ("forward_paper" if self.market_hub is not None and forward
+                                     else "live" if forward else "replay"),
+                "market_data_source": ("Binance USD-M public WebSocket"
+                                       if self.market_hub is not None and forward else None),
+                "exchange": exchange,
+                "instrument_type": ("perpetual"
+                                    if self.market_hub is not None and forward
+                                    else inst.instrument_type),
+            })
             if forward:
-                from data.forward_market_data import fetch_forward_symbol_rules
-                pipeline.symbol_rules_provider = lambda symbol: fetch_forward_symbol_rules(symbol, exchange)
+                if self.symbol_rules_provider is not None:
+                    pipeline.symbol_rules_provider = self.symbol_rules_provider
+                else:
+                    from data.forward_market_data import fetch_forward_symbol_rules
+                    pipeline.symbol_rules_provider = lambda symbol: fetch_forward_symbol_rules(symbol, exchange)
             fetch_parameters = inspect.signature(self.forward_fetcher).parameters if forward else {}
             supports_exchange = "exchange" in fetch_parameters
             supports_since = "since_ms" in fetch_parameters
@@ -1265,12 +1320,33 @@ class TradingInstanceManager:
             ws_feed = None
             runtime_fetcher = instance_forward_fetcher
             if forward:
-                from data.ws_feed import WebSocketFeed
-                ws_feed = WebSocketFeed([inst.symbol], timeframe=inst.timeframe,
-                                        exchange=exchange, max_bars=1000)
-                ws_feed.start()  # false is honest: REST remains authoritative
-                runtime_fetcher = ws_feed.make_fetcher(instance_forward_fetcher)
-            market = self.store.market_state(instance_id) if forward else {}
+                if self.market_hub is not None:
+                    holder = {}
+
+                    def on_quote(quote: dict) -> None:
+                        subscription = holder.get("subscription")
+                        if subscription is None or not subscription.status().get("reliable"):
+                            return
+                        fills = paper.process_quote(quote)
+                        for fill in fills:
+                            self.store.append_engine_log(
+                                instance_id, level="info", symbol=fill.symbol,
+                                message=(f"forward-paper fill {fill.side} {fill.size:.8f} "
+                                         f"@ {fill.price:.8f} from Binance USD-M quote"),
+                            )
+
+                    ws_feed = self.market_hub.subscription(
+                        f"INSTANCE:{instance_id}", quote_sink=on_quote)
+                    holder["subscription"] = ws_feed
+                    if not ws_feed.start(inst.symbol, inst.timeframe):
+                        raise RuntimeError("Binance USD-M market-data hub failed to start")
+                    runtime_fetcher = ws_feed.make_fetcher()
+                else:
+                    from data.ws_feed import WebSocketFeed
+                    ws_feed = WebSocketFeed([inst.symbol], timeframe=inst.timeframe,
+                                            exchange=exchange, max_bars=1000)
+                    ws_feed.start()  # false is honest: REST remains authoritative
+                    runtime_fetcher = ws_feed.make_fetcher(instance_forward_fetcher)
             if forward:
                 self.store.save_market_state(instance_id,
                     last_processed_candle_timestamp=market.get("last_processed_candle_timestamp"),
@@ -1347,8 +1423,9 @@ class TradingInstanceManager:
                                         fetcher=runtime_fetcher if forward else self.fetcher,
                                         initial_last_processed_candle=market.get("last_processed_candle_timestamp"),
                                         candle_checkpoint=checkpoint if forward else None,
-                                        initial_pending_orders=market.get("pending_orders_json") if forward else None,
-                                        pending_orders_checkpoint=(lambda pending: self.store.save_pending_orders(instance_id, pending)) if forward else None,
+                                        initial_pending_orders=(pending_state["strategy_limit_intents"]
+                                                                if forward else None),
+                                        pending_orders_checkpoint=(save_strategy_intents if forward else None),
                                         entry_mode=inst.entry_mode, instance_id=instance_id,
                                         lifecycle_callback=lifecycle)
             engine_ref["engine"] = engine
@@ -1871,14 +1948,27 @@ class TradingInstanceManager:
                     and candidate_fill != inst.fill_model):
                 raise ValueError("Fill model is immutable after the first trade; create a new instance")
             candidate_exchange = str(exchange if exchange is not None else inst.exchange).strip().lower()
-            if candidate_exchange not in ("inherit", "binance", "kraken", "coinbase", "bybit"):
+            if self.market_hub is not None and inst.mode == "trading":
+                if candidate_exchange not in ("inherit", "binance", "binance_usdm"):
+                    raise ValueError(
+                        "Forward-paper comparison instances require Binance USD-M market data")
+                candidate_exchange = "binance_usdm"
+            elif candidate_exchange not in ("inherit", "binance", "kraken", "coinbase", "bybit"):
                 raise ValueError("exchange must be one of inherit, binance, kraken, coinbase, bybit")
             candidate_instrument = str(instrument_type if instrument_type is not None
                                        else inst.instrument_type).strip().lower()
-            if candidate_instrument != "spot":
+            if self.market_hub is not None and inst.mode == "trading":
+                candidate_instrument = "perpetual"
+            elif candidate_instrument != "spot":
                 raise ValueError("Only spot instrument parity is currently supported")
-            if trade_history and (candidate_exchange != inst.exchange
-                                  or candidate_instrument != inst.instrument_type):
+            previous_exchange = ("binance_usdm"
+                                 if self.market_hub is not None and inst.mode == "trading"
+                                 else inst.exchange)
+            previous_instrument = ("perpetual"
+                                   if self.market_hub is not None and inst.mode == "trading"
+                                   else inst.instrument_type)
+            if trade_history and (candidate_exchange != previous_exchange
+                                  or candidate_instrument != previous_instrument):
                 raise ValueError("Venue and instrument type are immutable after the first trade; create a new instance")
             candidate_max = int(max_open_positions if max_open_positions is not None else inst.max_open_positions)
             if not 1 <= candidate_max <= 50:
@@ -2353,7 +2443,12 @@ class TradingInstanceManager:
                 execution["available_capital"] = metrics.get("balance")
                 execution["unrealized_pnl"] = 0.0
             pending = market.get("pending_orders_json") if isinstance(market, dict) else None
-            execution["pending_orders"] = len(pending) if isinstance(pending, dict) else None
+            if isinstance(pending, dict) and "forward_paper_intents" in pending:
+                execution["pending_orders"] = (
+                    len(pending.get("forward_paper_intents") or {}) +
+                    len(pending.get("strategy_limit_intents") or {}))
+            else:
+                execution["pending_orders"] = len(pending) if isinstance(pending, dict) else None
         accounting_changed = False
         observed_realized = execution.get("current_realized_equity")
         if observed_realized is not None and abs(inst.current_realized_equity - float(observed_realized)) > 0.0000001:
@@ -2368,6 +2463,8 @@ class TradingInstanceManager:
             maximum_risk_amount=inst.maximum_risk_amount,
         )
         execution.update({
+            "account_id": f"instance:{inst.id}:{inst.simulation_session_id}",
+            "account_type": "INSTANCE",
             "risk_basis": round(basis, 2),
             "next_trade_risk_amount": round(next_risk, 2),
             "next_trade_quantity": inst.fixed_quantity if inst.sizing_mode == FIXED_QUANTITY else None,
@@ -2433,9 +2530,12 @@ class TradingInstanceManager:
             "entry_mode": inst.entry_mode, "fill_model": inst.fill_model,
             "execution_mode": inst.execution_mode, "market_data_mode": inst.market_data_mode,
         }
-        effective_exchange = (inst.exchange if inst.exchange != "inherit"
+        effective_exchange = ("binance_usdm" if self.market_hub is not None and inst.mode == "trading" else
+                              inst.exchange if inst.exchange != "inherit"
                               else (os.environ.get("HUB_EXCHANGE", "binance").strip() or "binance"))
         return {**inst.to_dict(), "effective_exchange": effective_exchange,
+                "effective_instrument_type": ("perpetual" if effective_exchange == "binance_usdm"
+                                              else inst.instrument_type),
                 "state": state, "engine": engine,
                 "configuration": configuration, "execution": execution,
                 "risk": risk, "market_data": market, "current_position": current_position,

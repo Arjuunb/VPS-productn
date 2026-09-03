@@ -921,8 +921,15 @@ from data.market_data_v2 import MarketDataService, MarketDataUpdateJob  # noqa: 
 from execution.paper_broker_v2 import PaperBrokerV2  # noqa: E402
 from services.price_action_lab import PriceActionLabRuntime, PriceActionPaperAccount  # noqa: E402
 from services.smc_strategy_lab import SMCPaperAccount, SMCStrategyLabRuntime  # noqa: E402
+from services.forward_paper_hub import ForwardPaperMarketDataHub  # noqa: E402
 from services.price_action_research import PriceActionExperimentRunner, PriceActionExperimentStore  # noqa: E402
 v2_market_data = MarketDataService(settings.market_data_v2_dir)
+forward_paper_market_hub = ForwardPaperMarketDataHub(v2_market_data.public_usdm_window)
+# Trading Instances are constructed before the research services for legacy
+# import compatibility. Bind their production data/rules authority here so PA,
+# SMC and instances all consume the same Binance USD-M hub.
+instance_manager.market_hub = forward_paper_market_hub
+instance_manager.symbol_rules_provider = v2_market_data.usdm_contract_rules
 paper_broker_v2 = PaperBrokerV2(settings.paper_broker_v2_db,
                                 starting_balance=settings.starting_cash)
 price_action_paper = PriceActionPaperAccount(settings.price_action_paper_db,
@@ -930,12 +937,14 @@ price_action_paper = PriceActionPaperAccount(settings.price_action_paper_db,
 if _os.path.abspath(settings.smc_paper_db) == _os.path.abspath(settings.price_action_paper_db):
     raise RuntimeError("HUB_SMC_PAPER_DB must not share the Price Action paper database")
 smc_paper = SMCPaperAccount(settings.smc_paper_db, starting_balance=10_000.0)
-smc_runtime = SMCStrategyLabRuntime(v2_market_data, smc_paper)
+smc_runtime = SMCStrategyLabRuntime(
+    v2_market_data, smc_paper, market_hub=forward_paper_market_hub)
 # Price Action must remain autonomous after a server restart even when no
 # browser has opened the lab page. The supervisor owns stream initialization;
 # UI requests are read-only observers of the same server-side runtime.
 price_action_runtime = PriceActionLabRuntime(
-    v2_market_data, price_action_paper, autostart=True)
+    v2_market_data, price_action_paper, autostart=True,
+    market_hub=forward_paper_market_hub)
 price_action_experiments = PriceActionExperimentStore(settings.price_action_research_db)
 price_action_research = PriceActionExperimentRunner(price_action_experiments)
 v2_market_update_job = MarketDataUpdateJob(v2_market_data)

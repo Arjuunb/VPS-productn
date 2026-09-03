@@ -41,7 +41,10 @@ class PaperBrokerV2:
     def __init__(self, path: str | Path, *, starting_balance: float = 10_000.0,
                  leverage: float = 1.0, fee_rate: float = 0.0004,
                  spread_bps: float = 2.0, slippage_bps: float = 3.0,
-                 participation_rate: float = 0.02):
+                 participation_rate: float = 0.02,
+                 account_id: str | None = None,
+                 account_type: str = "PAPER",
+                 execution_engine: str = "PAPER"):
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self.leverage = max(1.0, float(leverage))
@@ -49,6 +52,9 @@ class PaperBrokerV2:
         self.spread_bps = max(0.0, float(spread_bps))
         self.slippage_bps = max(0.0, float(slippage_bps))
         self.participation_rate = min(1.0, max(0.0, float(participation_rate)))
+        self.requested_account_id = str(account_id or "").strip()
+        self.account_type = str(account_type or "PAPER").strip().upper()
+        self.execution_engine = str(execution_engine or "PAPER").strip().upper()
         self._lock = threading.RLock()
         self._c = runtime_connection(self.path)
         self._schema(starting_balance)
@@ -59,7 +65,9 @@ class PaperBrokerV2:
               CREATE TABLE IF NOT EXISTS v2_account(
                 id INTEGER PRIMARY KEY CHECK(id=1), starting_balance REAL NOT NULL,
                 balance REAL NOT NULL, fees_paid REAL NOT NULL DEFAULT 0,
-                funding_paid REAL NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
+                funding_paid REAL NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
+                account_id TEXT NOT NULL DEFAULT '',
+                account_type TEXT NOT NULL DEFAULT 'PAPER');
               CREATE TABLE IF NOT EXISTS v2_positions(
                 symbol TEXT PRIMARY KEY, side TEXT NOT NULL, size REAL NOT NULL,
                 entry_price REAL NOT NULL, stop_loss REAL, take_profit REAL,
@@ -70,11 +78,24 @@ class PaperBrokerV2:
                 filled REAL NOT NULL DEFAULT 0, average_price REAL, limit_price REAL,
                 stop_price REAL, trailing_offset REAL, reduce_only INTEGER NOT NULL,
                 status TEXT NOT NULL, reason TEXT, created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL, triggered_at TEXT);
+                updated_at TEXT NOT NULL, triggered_at TEXT,
+                signal_timestamp TEXT, decision_timestamp TEXT,
+                signal_price REAL, requested_price REAL,
+                strategy TEXT, strategy_version TEXT, timeframe TEXT,
+                market_data_source TEXT, account_id TEXT,
+                execution_engine TEXT, candle_id TEXT);
               CREATE TABLE IF NOT EXISTS v2_fills(
                 id TEXT PRIMARY KEY, order_id TEXT NOT NULL, symbol TEXT NOT NULL,
                 side TEXT NOT NULL, quantity REAL NOT NULL, price REAL NOT NULL,
-                fee REAL NOT NULL, realized_pnl REAL NOT NULL, timestamp TEXT NOT NULL);
+                fee REAL NOT NULL, realized_pnl REAL NOT NULL, timestamp TEXT NOT NULL,
+                signal_timestamp TEXT, decision_timestamp TEXT,
+                order_timestamp TEXT, fill_timestamp TEXT,
+                signal_price REAL, requested_price REAL,
+                spread REAL, slippage REAL, commission REAL, funding REAL,
+                stop_loss REAL, take_profit REAL, risk_amount REAL,
+                position_size REAL, strategy TEXT, strategy_version TEXT,
+                timeframe TEXT, market_data_source TEXT, account_id TEXT,
+                execution_engine TEXT, candle_id TEXT, blocker TEXT);
               CREATE INDEX IF NOT EXISTS idx_v2_orders_open ON v2_orders(symbol,status);
             """)
             self._c.execute("INSERT OR IGNORE INTO v2_account(id,starting_balance,balance,updated_at) VALUES (1,?,?,?)",
@@ -84,6 +105,9 @@ class PaperBrokerV2:
                 ("realized_pnl", "REAL NOT NULL DEFAULT 0"),
                 ("peak_equity", "REAL NOT NULL DEFAULT 0"),
                 ("max_drawdown", "REAL NOT NULL DEFAULT 0"),
+                ("account_id", "TEXT NOT NULL DEFAULT ''"),
+                ("account_type", "TEXT NOT NULL DEFAULT 'PAPER'"),
+                ("created_at", "TEXT NOT NULL DEFAULT ''"),
             ):
                 if name not in columns:
                     self._c.execute(f"ALTER TABLE v2_account ADD COLUMN {name} {ddl}")
@@ -94,6 +118,46 @@ class PaperBrokerV2:
             ):
                 if name not in order_columns:
                     self._c.execute(f"ALTER TABLE v2_orders ADD COLUMN {name} REAL")
+            for name, ddl in (
+                ("signal_timestamp", "TEXT"), ("decision_timestamp", "TEXT"),
+                ("signal_price", "REAL"), ("requested_price", "REAL"),
+                ("strategy", "TEXT"), ("strategy_version", "TEXT"),
+                ("timeframe", "TEXT"), ("market_data_source", "TEXT"),
+                ("account_id", "TEXT"), ("execution_engine", "TEXT"),
+                ("candle_id", "TEXT"),
+            ):
+                if name not in order_columns:
+                    self._c.execute(f"ALTER TABLE v2_orders ADD COLUMN {name} {ddl}")
+            fill_columns = {row[1] for row in self._c.execute("PRAGMA table_info(v2_fills)")}
+            for name, ddl in (
+                ("signal_timestamp", "TEXT"), ("decision_timestamp", "TEXT"),
+                ("order_timestamp", "TEXT"), ("fill_timestamp", "TEXT"),
+                ("signal_price", "REAL"), ("requested_price", "REAL"),
+                ("spread", "REAL"), ("slippage", "REAL"),
+                ("commission", "REAL"), ("funding", "REAL"),
+                ("stop_loss", "REAL"), ("take_profit", "REAL"),
+                ("risk_amount", "REAL"), ("position_size", "REAL"),
+                ("strategy", "TEXT"), ("strategy_version", "TEXT"),
+                ("timeframe", "TEXT"), ("market_data_source", "TEXT"),
+                ("account_id", "TEXT"), ("execution_engine", "TEXT"),
+                ("candle_id", "TEXT"), ("blocker", "TEXT"),
+            ):
+                if name not in fill_columns:
+                    self._c.execute(f"ALTER TABLE v2_fills ADD COLUMN {name} {ddl}")
+            identity = self._c.execute(
+                "SELECT account_id,account_type FROM v2_account WHERE id=1"
+            ).fetchone()
+            persisted_id = str(identity["account_id"] or "")
+            if self.requested_account_id and persisted_id and persisted_id != self.requested_account_id:
+                raise RuntimeError("paper account_id does not match the durable ledger identity")
+            resolved_id = persisted_id or self.requested_account_id or f"paper:{uuid.uuid4().hex}"
+            persisted_type = str(identity["account_type"] or "PAPER").upper()
+            resolved_type = self.account_type if persisted_type in {"", "PAPER"} else persisted_type
+            self._c.execute(
+                "UPDATE v2_account SET account_id=?,account_type=?,"
+                "created_at=CASE WHEN created_at='' THEN updated_at ELSE created_at END WHERE id=1",
+                (resolved_id, resolved_type),
+            )
             self._c.execute(
                 "UPDATE v2_account SET peak_equity=CASE WHEN peak_equity<=0 THEN balance ELSE peak_equity END WHERE id=1"
             )
@@ -126,6 +190,15 @@ class PaperBrokerV2:
     def _account_row(self):
         return self._c.execute("SELECT * FROM v2_account WHERE id=1").fetchone()
 
+    def _free_margin_without_commit(self) -> float:
+        """Return the conservative durable free margin inside a transaction."""
+        account = self._account_row()
+        used = sum(
+            float(row["entry_price"]) * float(row["size"]) / self.leverage
+            for row in self._c.execute("SELECT entry_price,size FROM v2_positions")
+        )
+        return float(account["balance"]) - used
+
     def account(self, marks: Optional[dict[str, float]] = None) -> dict:
         with self._lock:
             a = self._account_row()
@@ -143,14 +216,24 @@ class PaperBrokerV2:
         with self._lock:
             self._c.execute("UPDATE v2_account SET peak_equity=?,max_drawdown=? WHERE id=1", (peak, drawdown))
             self._c.commit()
-        return {"starting_balance": a["starting_balance"], "balance": round(a["balance"], 8),
+        open_orders = len([row for row in self.orders() if row["status"] in OPEN_STATUSES])
+        completed_orders = len([row for row in self.orders() if row["status"] not in OPEN_STATUSES])
+        return {"account_id": a["account_id"], "account_type": a["account_type"],
+                "created_at": a["created_at"], "last_updated": a["updated_at"],
+                "initial_balance": a["starting_balance"],
+                "starting_balance": a["starting_balance"], "balance": round(a["balance"], 8),
                 "equity": round(equity, 8), "unrealized_pnl": round(unrealized, 8),
                 "realized_pnl": round(float(a["realized_pnl"]), 8),
                 "used_margin": round(used, 8), "margin": round(used, 8),
-                "free_margin": round(equity - used, 8), "buying_power": round(max(0.0, equity - used) * self.leverage, 8),
+                "free_margin": round(equity - used, 8),
+                "available_balance": round(equity - used, 8),
+                "buying_power": round(max(0.0, equity - used) * self.leverage, 8),
                 "fees_paid": round(a["fees_paid"], 8), "funding_paid": round(a["funding_paid"], 8),
                 "peak_equity": round(peak, 8), "max_drawdown": round(drawdown, 8),
-                "leverage": self.leverage, "positions": len(positions)}
+                "daily_pnl": round(float(a["realized_pnl"]), 8),
+                "leverage": self.leverage, "positions": len(positions),
+                "open_positions": len(positions), "open_orders": open_orders,
+                "completed_orders": completed_orders}
 
     def positions(self) -> list[dict]:
         with self._lock:
@@ -205,7 +288,14 @@ class PaperBrokerV2:
                protection_stop_loss: Optional[float] = None,
                protection_take_profit: Optional[float] = None,
                protection_target_r: Optional[float] = None,
-               protection_tick_size: Optional[float] = None) -> dict:
+               protection_tick_size: Optional[float] = None,
+               signal_timestamp: str | None = None,
+               decision_timestamp: str | None = None,
+               signal_price: float | None = None,
+               requested_price: float | None = None,
+               strategy: str = "", strategy_version: str = "",
+               timeframe: str = "", market_data_source: str = "",
+               candle_id: str = "") -> dict:
         symbol = (symbol or "").upper().replace("/", "")
         side, order_type = self._norm_side(side), (order_type or "").lower()
         if order_type not in ORDER_TYPES:
@@ -237,12 +327,22 @@ class PaperBrokerV2:
                     if needed > self.account()["free_margin"]:
                         raise ValueError("insufficient free margin")
             oid, now = _id(), _now()
+            decision_timestamp = str(decision_timestamp or signal_timestamp or now)
+            signal_timestamp = str(signal_timestamp or decision_timestamp)
+            requested_price = float(requested_price if requested_price is not None
+                                    else limit_price if limit_price is not None
+                                    else stop_price if stop_price is not None else 0.0)
             self._c.execute(
-                "INSERT INTO v2_orders(id,symbol,side,type,quantity,remaining,filled,average_price,limit_price,stop_price,trailing_offset,reduce_only,status,reason,created_at,updated_at,triggered_at,protection_stop_loss,protection_take_profit,protection_target_r,protection_tick_size) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO v2_orders(id,symbol,side,type,quantity,remaining,filled,average_price,limit_price,stop_price,trailing_offset,reduce_only,status,reason,created_at,updated_at,triggered_at,protection_stop_loss,protection_take_profit,protection_target_r,protection_tick_size,signal_timestamp,decision_timestamp,signal_price,requested_price,strategy,strategy_version,timeframe,market_data_source,account_id,execution_engine,candle_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (oid, symbol, side, order_type, float(quantity), float(quantity), 0.0, None,
                  limit_price, stop_price, trailing_offset, int(reduce_only), "open", None, now, now, None,
                  protection_stop_loss, protection_take_profit,
-                 protection_target_r, protection_tick_size),
+                 protection_target_r, protection_tick_size,
+                 signal_timestamp, decision_timestamp,
+                 float(signal_price) if signal_price is not None else None,
+                 requested_price, strategy, strategy_version, timeframe,
+                 market_data_source, self._account_row()["account_id"],
+                 self.execution_engine, candle_id),
             )
             self._c.commit()
         return self.order(oid)
@@ -311,6 +411,149 @@ class PaperBrokerV2:
                 return max(bar["open"], limit)
             return None
         return None
+
+    @staticmethod
+    def _timestamp(value: object) -> datetime:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("a valid UTC quote received_at timestamp is required") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def process_tick(self, symbol: str, quote: dict, *,
+                     protections: Optional[dict[str, dict]] = None) -> dict:
+        """Fill intents only from a complete public quote after decision time."""
+        symbol = (symbol or "").upper().replace("/", "")
+        try:
+            bid, ask, mark = (float(quote[key]) for key in ("bid", "ask", "mark"))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("bid, ask and mark are required for a paper fill") from exc
+        if bid <= 0 or ask < bid or mark <= 0:
+            raise ValueError("paper fill quote is invalid")
+        received = self._timestamp(quote.get("received_at"))
+        events: list[dict] = []
+        with self._lock:
+            rows = self._c.execute(
+                "SELECT * FROM v2_orders WHERE symbol=? AND status IN ('open','partially_filled','triggered')",
+                (symbol,),
+            ).fetchall()
+            for raw in rows:
+                order = dict(raw)
+                decision = self._timestamp(
+                    order.get("decision_timestamp") or order.get("created_at")
+                )
+                if received <= decision:
+                    continue
+                side, typ = order["side"], order["type"]
+                price = ask if side == "buy" else bid
+                if typ == "limit":
+                    limit = float(order["limit_price"])
+                    if (side == "buy" and ask > limit) or (side == "sell" and bid < limit):
+                        continue
+                    price = min(ask, limit) if side == "buy" else max(bid, limit)
+                elif typ in {"stop", "stop_limit"}:
+                    stop = float(order["stop_price"])
+                    triggered = ((side == "buy" and ask >= stop)
+                                 or (side == "sell" and bid <= stop))
+                    if not triggered and order["status"] != "triggered":
+                        continue
+                    if typ == "stop_limit":
+                        limit = float(order["limit_price"])
+                        if (side == "buy" and ask > limit) or (side == "sell" and bid < limit):
+                            self._c.execute(
+                                "UPDATE v2_orders SET status='triggered',triggered_at=?,updated_at=? WHERE id=?",
+                                (received.isoformat(), received.isoformat(), order["id"]),
+                            )
+                            continue
+                    price = max(ask, stop) if side == "buy" else min(bid, stop)
+                elif typ == "trailing_stop":
+                    continue
+                protection = (protections or {}).get(order["id"])
+                if not protection and order.get("protection_stop_loss") is not None:
+                    protection = {
+                        "stop_loss": order.get("protection_stop_loss"),
+                        "take_profit": order.get("protection_take_profit"),
+                        "target_r": order.get("protection_target_r"),
+                        "tick_size": order.get("protection_tick_size"),
+                    }
+                simulated = self._price(side, price)
+                stop_loss = protection.get("stop_loss") if protection else None
+                if not order["reduce_only"] and stop_loss is not None and (
+                    (side == "buy" and simulated <= float(stop_loss))
+                    or (side == "sell" and simulated >= float(stop_loss))
+                ):
+                    self._c.execute(
+                        "UPDATE v2_orders SET status='rejected',reason=?,updated_at=? WHERE id=?",
+                        ("post-decision quote crossed the protective stop; entry rejected fail-closed",
+                         received.isoformat(), order["id"]),
+                    )
+                    continue
+                volume = max(float(order["remaining"]) / max(self.participation_rate, 1e-9),
+                             float(order["remaining"]))
+                before = len(events)
+                self._fill(
+                    order, side, price,
+                    {"open": mark, "high": max(ask, mark), "low": min(bid, mark),
+                     "close": mark, "volume": volume, "timestamp": received.isoformat(),
+                     "bid": bid, "ask": ask},
+                    events, bool(order["reduce_only"]), fill_timestamp=received.isoformat(),
+                )
+                if protection and len(events) > before:
+                    position = self._c.execute(
+                        "SELECT * FROM v2_positions WHERE symbol=?", (symbol,)
+                    ).fetchone()
+                    resolved = self._resolved_protection(
+                        dict(position) if position else None, protection
+                    )
+                    self._c.execute(
+                        "UPDATE v2_positions SET stop_loss=?,take_profit=? WHERE symbol=?",
+                        (*resolved, symbol),
+                    )
+                    events[-1].update({"stop_loss": resolved[0], "take_profit": resolved[1]})
+
+            position = self._c.execute(
+                "SELECT * FROM v2_positions WHERE symbol=?", (symbol,)
+            ).fetchone()
+            if position:
+                pos = dict(position)
+                stop, target = pos.get("stop_loss"), pos.get("take_profit")
+                hit_stop = stop is not None and (
+                    bid <= float(stop) if pos["side"] == "long" else ask >= float(stop)
+                )
+                hit_target = target is not None and (
+                    bid >= float(target) if pos["side"] == "long" else ask <= float(target)
+                )
+                if hit_stop or hit_target:
+                    side = "sell" if pos["side"] == "long" else "buy"
+                    reference = (float(stop) if hit_stop else float(target))
+                    reference = min(bid, reference) if side == "sell" else max(ask, reference)
+                    volume = max(pos["size"] / max(self.participation_rate, 1e-9), pos["size"])
+                    protective = {
+                        "id": "protective-" + _id(), "symbol": symbol,
+                        "remaining": pos["size"], "filled": 0.0,
+                        "quantity": pos["size"], "reduce_only": 1,
+                        "type": "stop", "side": side,
+                        "decision_timestamp": received.isoformat(),
+                        "created_at": received.isoformat(),
+                        "account_id": self._account_row()["account_id"],
+                        "execution_engine": self.execution_engine,
+                    }
+                    self._fill(
+                        protective, side, reference,
+                        {"open": mark, "high": max(ask, mark), "low": min(bid, mark),
+                         "close": mark, "volume": volume, "timestamp": received.isoformat(),
+                         "bid": bid, "ask": ask},
+                        events, True, persisted=False,
+                        fill_timestamp=received.isoformat(),
+                    )
+            self._c.commit()
+        return {
+            "symbol": symbol, "events": events,
+            "account": self.account({symbol: mark}),
+            "quote": {**quote, "bid": bid, "ask": ask, "mark": mark},
+        }
 
     def process_candle(self, symbol: str, candle, *, protections: Optional[dict[str, dict]] = None) -> dict:
         """Advance open orders and protective stops using one verified candle."""
@@ -428,7 +671,9 @@ class PaperBrokerV2:
             self._fill(order, exit_side, raw, bar, events, True, persisted=False)
         return events
 
-    def _fill(self, order: dict, side: str, raw_price: float, bar: dict, events: list, reduce_only: bool, *, persisted: bool = True) -> None:
+    def _fill(self, order: dict, side: str, raw_price: float, bar: dict, events: list,
+              reduce_only: bool, *, persisted: bool = True,
+              fill_timestamp: str | None = None) -> None:
         quantity = min(float(order["remaining"]), max(0.0, bar["volume"] * self.participation_rate))
         if quantity <= 0:
             return
@@ -441,7 +686,8 @@ class PaperBrokerV2:
             quantity = min(quantity, float(pos["size"]))
         price = self._price(side, raw_price)
         fee = quantity * price * self.fee_rate
-        if not reduce_only and quantity * price / self.leverage + fee > self.account()["free_margin"]:
+        if (not reduce_only and
+                quantity * price / self.leverage + fee > self._free_margin_without_commit()):
             if persisted:
                 self._c.execute("UPDATE v2_orders SET status='rejected',reason=?,updated_at=? WHERE id=?", ("insufficient free margin at fill", _now(), order["id"]))
             return
@@ -451,8 +697,29 @@ class PaperBrokerV2:
                         (account["balance"] + pnl - fee, account["fees_paid"] + fee,
                          account["realized_pnl"] + pnl, _now()))
         fid = _id()
-        self._c.execute("INSERT INTO v2_fills VALUES (?,?,?,?,?,?,?,?,?)",
-                        (fid, order["id"], order["symbol"], side, quantity, price, fee, pnl, _now()))
+        filled_at = str(fill_timestamp or _now())
+        signal_price = order.get("signal_price")
+        requested_price = order.get("requested_price")
+        spread = (abs(float(bar["ask"]) - float(bar["bid"]))
+                  if bar.get("ask") is not None and bar.get("bid") is not None
+                  else None)
+        slippage = abs(float(price) - float(raw_price))
+        stop_loss = order.get("protection_stop_loss")
+        take_profit = order.get("protection_take_profit")
+        risk_amount = (abs(float(price) - float(stop_loss)) * quantity
+                       if stop_loss is not None else None)
+        self._c.execute(
+            "INSERT INTO v2_fills(id,order_id,symbol,side,quantity,price,fee,realized_pnl,timestamp,signal_timestamp,decision_timestamp,order_timestamp,fill_timestamp,signal_price,requested_price,spread,slippage,commission,funding,stop_loss,take_profit,risk_amount,position_size,strategy,strategy_version,timeframe,market_data_source,account_id,execution_engine,candle_id,blocker) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (fid, order["id"], order["symbol"], side, quantity, price, fee, pnl,
+             filled_at, order.get("signal_timestamp"), order.get("decision_timestamp"),
+             order.get("created_at"), filled_at, signal_price, requested_price,
+             spread, slippage, fee, 0.0, stop_loss, take_profit, risk_amount,
+             quantity, order.get("strategy"), order.get("strategy_version"),
+             order.get("timeframe"), order.get("market_data_source"),
+             order.get("account_id") or self._account_row()["account_id"],
+             order.get("execution_engine") or self.execution_engine,
+             order.get("candle_id"), "NONE"),
+        )
         if persisted:
             filled, remaining = float(order["filled"]) + quantity, float(order["remaining"]) - quantity
             status = "filled" if remaining <= 1e-12 else "partially_filled"
@@ -460,7 +727,15 @@ class PaperBrokerV2:
             self._c.execute("UPDATE v2_orders SET filled=?,remaining=?,average_price=?,status=?,updated_at=? WHERE id=?",
                             (filled, max(0.0, remaining), avg, status, _now(), order["id"]))
         events.append({"type": "fill", "order_id": order["id"], "symbol": order["symbol"], "side": side,
-                       "quantity": quantity, "price": price, "fee": fee, "realized_pnl": pnl})
+                       "quantity": quantity, "price": price, "fee": fee, "realized_pnl": pnl,
+                       "signal_timestamp": order.get("signal_timestamp"),
+                       "decision_timestamp": order.get("decision_timestamp"),
+                       "order_timestamp": order.get("created_at"), "fill_timestamp": filled_at,
+                       "signal_price": signal_price, "requested_price": requested_price,
+                       "market_data_source": order.get("market_data_source"),
+                       "account_id": order.get("account_id") or self._account_row()["account_id"],
+                       "execution_engine": order.get("execution_engine") or self.execution_engine,
+                       "candle_id": order.get("candle_id"), "blocker": "NONE"})
 
     def _apply_position(self, symbol: str, side: str, qty: float, price: float, reduce_only: bool) -> float:
         pos = self._c.execute("SELECT * FROM v2_positions WHERE symbol=?", (symbol,)).fetchone()
@@ -648,14 +923,26 @@ class PaperBrokerV2:
                             "average_price", "limit_price", "stop_price", "trailing_offset", "reduce_only",
                             "status", "reason", "created_at", "updated_at", "triggered_at",
                             "protection_stop_loss", "protection_take_profit",
-                            "protection_target_r", "protection_tick_size")
+                            "protection_target_r", "protection_tick_size", "signal_timestamp",
+                            "decision_timestamp", "signal_price", "requested_price", "strategy",
+                            "strategy_version", "timeframe", "market_data_source", "account_id",
+                            "execution_engine", "candle_id")
                     self._c.execute(
-                        "INSERT INTO v2_orders(id,symbol,side,type,quantity,remaining,filled,average_price,limit_price,stop_price,trailing_offset,reduce_only,status,reason,created_at,updated_at,triggered_at,protection_stop_loss,protection_take_profit,protection_target_r,protection_tick_size) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        f"INSERT INTO v2_orders({','.join(keys)}) VALUES ({','.join('?' for _ in keys)})",
                         tuple(row.get(k) for k in keys),
                     )
                 for row in snapshot["fills"]:
-                    keys = ("id", "order_id", "symbol", "side", "quantity", "price", "fee", "realized_pnl", "timestamp")
-                    self._c.execute("INSERT INTO v2_fills VALUES (?,?,?,?,?,?,?,?,?)", tuple(row.get(k) for k in keys))
+                    keys = ("id", "order_id", "symbol", "side", "quantity", "price", "fee",
+                            "realized_pnl", "timestamp", "signal_timestamp", "decision_timestamp",
+                            "order_timestamp", "fill_timestamp", "signal_price", "requested_price",
+                            "spread", "slippage", "commission", "funding", "stop_loss",
+                            "take_profit", "risk_amount", "position_size", "strategy",
+                            "strategy_version", "timeframe", "market_data_source", "account_id",
+                            "execution_engine", "candle_id", "blocker")
+                    self._c.execute(
+                        f"INSERT INTO v2_fills({','.join(keys)}) VALUES ({','.join('?' for _ in keys)})",
+                        tuple(row.get(k) for k in keys),
+                    )
                 self.leverage = max(1.0, float(snapshot.get("leverage", 1)))
                 self._c.commit()
             except Exception:

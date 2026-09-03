@@ -161,7 +161,7 @@ export default function App() {
               </Suspense>
             </ErrorBoundary>
           </div>
-          <TickerBar />
+          <TickerBar surface={active} />
         </div>
       </div>
     </AppContext.Provider>
