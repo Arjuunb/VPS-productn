@@ -294,6 +294,133 @@ class ShadowResearchStore:
             ).fetchone()
         return self._decode(row)
 
+    def observe_mae_mfe(self, order_id: str, quote: dict,
+                        *, execution_class: str = EXECUTION_CLASS) -> dict:
+        """Update excursion against the executable exit side of a public quote."""
+        self._shadow(execution_class)
+        try:
+            bid, ask = float(quote["bid"]), float(quote["ask"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("MAE/MFE requires public bid and ask") from exc
+        with self._lock, self._db:
+            row = self._db.execute(
+                "SELECT o.side,o.stop_loss,f.executable_side_price,f.quantity "
+                "FROM shadow_orders o JOIN shadow_fills f ON f.order_id=o.order_id "
+                "WHERE o.order_id=?", (order_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError(order_id)
+            side = str(row["side"]).lower()
+            entry = float(row["executable_side_price"])
+            exit_side = bid if side in {"buy", "long"} else ask
+            signed = exit_side - entry if side in {"buy", "long"} else entry - exit_side
+            adverse, favorable = max(0.0, -signed), max(0.0, signed)
+            risk = abs(entry - float(row["stop_loss"])) if row["stop_loss"] is not None else 0
+            prior = self._db.execute(
+                "SELECT * FROM shadow_mae_mfe WHERE order_id=?", (order_id,)
+            ).fetchone()
+            mae = max(float(prior["mae_price"]) if prior else 0, adverse)
+            mfe = max(float(prior["mfe_price"]) if prior else 0, favorable)
+            values = (
+                order_id, mae, mfe, mae / entry * 100, mfe / entry * 100,
+                mae / risk if risk else 0, mfe / risk if risk else 0, iso(),
+            )
+            self._db.execute(
+                "INSERT INTO shadow_mae_mfe VALUES (?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(order_id) DO UPDATE SET mae_price=excluded.mae_price,"
+                "mfe_price=excluded.mfe_price,mae_pct=excluded.mae_pct,"
+                "mfe_pct=excluded.mfe_pct,mae_r=excluded.mae_r,"
+                "mfe_r=excluded.mfe_r,updated_at=excluded.updated_at", values,
+            )
+            result = self._db.execute(
+                "SELECT * FROM shadow_mae_mfe WHERE order_id=?", (order_id,)
+            ).fetchone()
+        return self._decode(result)
+
+    def observe_open_orders(self, quote: dict,
+                            *, execution_class: str = EXECUTION_CLASS) -> list[dict]:
+        self._shadow(execution_class)
+        with self._lock:
+            order_ids = [row[0] for row in self._db.execute(
+                "SELECT o.order_id FROM shadow_orders o "
+                "JOIN shadow_fills f ON f.order_id=o.order_id "
+                "LEFT JOIN shadow_outcomes x ON x.order_id=o.order_id "
+                "WHERE o.status='FILLED' AND x.order_id IS NULL"
+            ).fetchall()]
+        return [self.observe_mae_mfe(order_id, quote) for order_id in order_ids]
+
+    def record_outcome(self, order_id: str, quote: dict, *, exit_reason: str,
+                       slippage_bps: float, commission_bps: float,
+                       funding: float = 0.0,
+                       execution_class: str = EXECUTION_CLASS) -> dict:
+        """Close one shadow observation with cost-adjusted, no-double-spread P&L."""
+        self._shadow(execution_class)
+        try:
+            bid, ask = float(quote["bid"]), float(quote["ask"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("shadow outcome requires public bid and ask") from exc
+        with self._lock, self._db:
+            row = self._db.execute(
+                "SELECT o.*,f.executable_side_price,f.slippage AS entry_slippage,"
+                "f.commission AS entry_commission FROM shadow_orders o "
+                "JOIN shadow_fills f ON f.order_id=o.order_id WHERE o.order_id=?",
+                (order_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError(order_id)
+            existing = self._db.execute(
+                "SELECT * FROM shadow_outcomes WHERE order_id=?", (order_id,)
+            ).fetchone()
+            if existing:
+                return self._decode(existing)
+            side = str(row["side"]).lower()
+            long = side in {"buy", "long"}
+            entry_reference = float(row["executable_side_price"])
+            exit_reference = bid if long else ask
+            quantity = float(row["quantity"])
+            exit_slip_unit = exit_reference * max(0.0, float(slippage_bps)) / 10_000
+            exit_price = exit_reference - exit_slip_unit if long else exit_reference + exit_slip_unit
+            # Gross uses executable-side references. Their bid/ask difference
+            # already contains spread, so spread is never subtracted again.
+            gross_pnl = ((exit_reference - entry_reference) if long else
+                         (entry_reference - exit_reference)) * quantity
+            exit_commission = exit_price * quantity * max(0.0, float(commission_bps)) / 10_000
+            commission = float(row["entry_commission"]) + exit_commission
+            slippage = float(row["entry_slippage"]) + exit_slip_unit * quantity
+            net_pnl = gross_pnl - commission - slippage - float(funding)
+            risk = (abs(entry_reference - float(row["stop_loss"])) * quantity
+                    if row["stop_loss"] is not None else 0)
+            gross_r = gross_pnl / risk if risk else 0
+            net_r = net_pnl / risk if risk else 0
+            outcome_id = "shadow-outcome-" + hashlib.sha256(order_id.encode()).hexdigest()[:28]
+            self._db.execute(
+                "INSERT INTO shadow_outcomes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (outcome_id, order_id, exit_reason, exit_price, gross_pnl,
+                 commission, slippage, float(funding), net_pnl, gross_r, net_r,
+                 iso(quote.get("event_timestamp") or quote.get("received_at")),
+                 "INSUFFICIENT_SAMPLE"),
+            )
+            self._db.execute(
+                "UPDATE shadow_orders SET status='CLOSED' WHERE order_id=?", (order_id,)
+            )
+            result = self._db.execute(
+                "SELECT * FROM shadow_outcomes WHERE order_id=?", (order_id,)
+            ).fetchone()
+        return self._decode(result)
+
+    def measurements(self, *, limit: int = 1000) -> list[dict]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT d.engine,d.strategy_id,d.strategy_version,d.config_hash,"
+                "d.candle_id,d.snapshot_lineage,d.blocker,d.context_json,o.*,f.*,x.*,m.* "
+                "FROM shadow_decisions d LEFT JOIN shadow_orders o ON o.decision_id=d.decision_id "
+                "LEFT JOIN shadow_fills f ON f.order_id=o.order_id "
+                "LEFT JOIN shadow_outcomes x ON x.order_id=o.order_id "
+                "LEFT JOIN shadow_mae_mfe m ON m.order_id=o.order_id "
+                "ORDER BY d.created_at DESC LIMIT ?", (max(1, int(limit)),),
+            ).fetchall()
+        return [self._decode(row) for row in rows]
+
     @staticmethod
     def _decode(row) -> dict:
         value = dict(row)
@@ -316,4 +443,3 @@ class ShadowResearchStore:
                 (max(1, int(limit)),),
             ).fetchall()
         return [self._decode(row) for row in rows]
-
